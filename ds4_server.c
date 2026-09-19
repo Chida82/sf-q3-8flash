@@ -984,9 +984,7 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
     r->kind = kind;
     r->api = API_OPENAI;
-    /* Parsers start from the legacy neutral test syntax; live requests replace
-     * it from the Qwen-only engine before rendering. */
-    r->model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
+    r->model_syntax = SERVER_MODEL_SYNTAX_QWEN;
     r->model = xstrdup("qwen3.8-flash-next");
     r->max_tokens = max_tokens;
     r->top_k = 0;
@@ -20387,11 +20385,10 @@ static void test_thinking_checkpoint_remember_gate(void) {
     TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
 
     r.prompt_preserves_reasoning = true;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
     r.prompt_preserves_reasoning = false;
     r.has_tools = true;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
-    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
     r.prompt_preserves_reasoning = true;
     TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));

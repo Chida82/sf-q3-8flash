@@ -38674,8 +38674,6 @@ typedef struct {
 
 typedef enum {
     DS4_VISION_NONE = 0,
-    DS4_VISION_GLM53,
-    DS4_VISION_DEEPSEEK4,
     DS4_VISION_QWEN4,
 } ds4_vision_kind;
 
@@ -67728,9 +67726,8 @@ int ds4_chat_append_multimodal_message(
         ds4_chat_append_message(e, tokens, role, text_parts[0]);
         return 1;
     }
-    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA &&
-        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN4_EXP &&
-        e->vision_kind != DS4_VISION_DEEPSEEK4) {
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN4_EXP ||
+        e->vision_kind != DS4_VISION_QWEN4) {
         if (error && error_cap)
             snprintf(error, error_cap, "model does not support image messages");
         return 0;
@@ -67744,21 +67741,13 @@ int ds4_chat_append_multimodal_message(
 
     const int old_len = tokens->len;
     ds4_vocab *vocab = &e->vocab;
-    const bool glm_tool = tool && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
-    if (glm_tool) {
-        if (vocab->observation_id >= 0) token_vec_push(tokens, vocab->observation_id);
-        tokenize_rendered_chat_vocab(vocab, "<tool_response>", tokens);
-    } else {
-        token_vec_push(tokens, vocab->user_id);
-        if (tool) bpe_tokenize_text(vocab, "<tool_result>", tokens);
-    }
+    token_vec_push(tokens, vocab->user_id);
+    if (tool) bpe_tokenize_text(vocab, "<tool_result>", tokens);
 
     size_t moved = 0;
     for (size_t i = 0; i <= image_count; i++) {
         const char *text = text_parts[i] ? text_parts[i] : "";
-        if (glm_tool)
-            bpe_tokenize_tool_response_text(vocab, text, tokens);
-        else if (tool)
+        if (tool)
             bpe_tokenize_tool_result_text(vocab, text, tokens);
         else
             bpe_tokenize_text(vocab, text, tokens);
@@ -67774,10 +67763,7 @@ int ds4_chat_append_multimodal_message(
         }
         moved++;
     }
-    if (glm_tool)
-        tokenize_rendered_chat_vocab(vocab, "</tool_response>", tokens);
-    else if (tool)
-        bpe_tokenize_text(vocab, "</tool_result>", tokens);
+    if (tool) bpe_tokenize_text(vocab, "</tool_result>", tokens);
     return 1;
 }
 
@@ -70686,25 +70672,11 @@ int ds4_session_sync_multimodal(
             snprintf(err, errlen, "invalid or overlapping image token span");
             return 1;
         }
-        if (s->engine->vision_kind == DS4_VISION_DEEPSEEK4 && !ds4_session_is_ds41(s)) {
-            uint32_t cursor = 0, block_start = 0, image_start = 0,
-                     image_end = 0;
-            const int parsed = ds4_deepseek4_next_image_span(
-                prompt->v + span->token_start, span->embedding.token_count,
-                DS4_N_VOCAB, &cursor, &block_start, &image_start, &image_end);
-            if (parsed != 1 || block_start != 0 || image_end + 1u != cursor ||
-                cursor != span->embedding.token_count) {
+        for (uint64_t token = span->token_start; token < end; token++) {
+            if (prompt->v[token] != s->engine->vision_image_token) {
                 snprintf(err, errlen,
-                         "image span does not cover one complete DeepSeek image block");
+                         "image span does not cover image placeholder tokens");
                 return 1;
-            }
-        } else {
-            for (uint64_t token = span->token_start; token < end; token++) {
-                if (prompt->v[token] != s->engine->vision_image_token) {
-                    snprintf(err, errlen,
-                             "image span does not cover image placeholder tokens");
-                    return 1;
-                }
             }
         }
         previous_end = end;
