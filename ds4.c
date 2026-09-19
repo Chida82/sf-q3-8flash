@@ -39862,49 +39862,13 @@ static void vocab_free(ds4_vocab *vocab) {
 static void chat_push_bos_sequence(const ds4_vocab *vocab, token_vec *out) {
     if (vocab->bos_id < 0) return;
     token_vec_push(out, vocab->bos_id);
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && vocab->sop_id >= 0)
-        token_vec_push(out, vocab->sop_id);
-}
-
-const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
-    switch (mode) {
-    case DS4_THINK_LOW:
-    case DS4_THINK_MEDIUM:
-    case DS4_THINK_HIGH: return "Reasoning Effort: High";
-    case DS4_THINK_MAX:  return "Reasoning Effort: Max";
-    case DS4_THINK_NONE: return NULL;
-    }
-    return NULL;
-}
-
-const char *ds4_deepseek41_reasoning_effort_text(ds4_think_mode mode) {
-    int level = ds4_think_mode_level(mode);
-    if (mode == DS4_THINK_HIGH) level = 75;
-    if (mode == DS4_THINK_MAX) level = 100;
-    if (level <= 0) return NULL;
-    static __thread char text[128];
-    snprintf(text, sizeof(text), "Reasoning Effort: %d (range 1-100, the higher the value, the more thorough the reasoning)\n\n", level);
-    return text;
 }
 
 static void chat_push_think_prefix(const ds4_vocab *vocab,
                                    ds4_think_mode   think_mode,
                                    token_vec       *out) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
-        const char *effort = ds4_glm_reasoning_effort_text(think_mode);
-        if (effort) {
-            token_vec_push(out, vocab->system_id);
-            bpe_tokenize_text(vocab, effort, out);
-        }
-    } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
-        const char *effort = ds4_deepseek41_reasoning_effort_text(think_mode);
-        if (effort) {
-            token_vec_push(out, vocab->system_id);
-            bpe_tokenize_text(vocab, effort, out);
-        }
-    } else if (think_mode == DS4_THINK_MAX) {
+    if (think_mode == DS4_THINK_MAX)
         bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out);
-    }
 }
 
 /* Qwen3.8 ChatML.  Thinking on renders the template's reasoning instruction
@@ -62630,14 +62594,7 @@ static int glm_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
 }
 #endif
 
-static bool engine_legacy_graph_test_supported(ds4_engine *e) {
-    if (!ds4_engine_is_deepseek41(e)) return true;
-    fprintf(stderr, "ds4: legacy graph diagnostics do not implement DeepSeek V4.1; use session logits instead\n");
-    return false;
-}
-
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
-    if (!engine_legacy_graph_test_supported(e)) return 1;
 #ifndef DS4_NO_GPU
     if (!e->metal_ready) {
         fprintf(stderr, "ds4: %s graph test requested but backend is unavailable\n",
@@ -62657,7 +62614,6 @@ int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
 }
 
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt) {
-    if (!engine_legacy_graph_test_supported(e)) return 1;
 #ifndef DS4_NO_GPU
     if (!e->metal_ready) {
         fprintf(stderr, "ds4: %s full graph test requested but backend is unavailable\n",
@@ -62674,7 +62630,6 @@ int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt) {
 }
 
 int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, int ctx_size) {
-    if (!engine_legacy_graph_test_supported(e)) return 1;
 #ifndef DS4_NO_GPU
     if (!e->metal_ready) {
         fprintf(stderr, "ds4: %s prompt graph test requested but backend is unavailable\n",
@@ -62692,7 +62647,6 @@ int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, 
 }
 
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
-    if (!engine_legacy_graph_test_supported(e)) return 1;
     if (!prompt || prompt->len <= 0) {
         fprintf(stderr, "ds4: head test requires a non-empty prompt\n");
         return 1;
@@ -63799,7 +63753,6 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
 }
 
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
-    if (!engine_legacy_graph_test_supported(e)) return 1;
     if (!prompt || prompt->len <= 0) {
         fprintf(stderr, "ds4: first-token test requires a non-empty prompt\n");
         return 1;
@@ -68847,11 +68800,6 @@ bool ds4_session_is_distributed(ds4_session *s) {
 
 int ds4_session_set_power(ds4_session *s, int power_percent) {
     if (!s || !s->engine || power_percent < 1 || power_percent > 100) return 1;
-    if (ds4_engine_is_deepseek41(s->engine)) {
-        if (power_percent == 100) return 0;
-        fprintf(stderr, "ds4: session power throttling is not supported for DeepSeek V4.1\n");
-        return 1;
-    }
 #ifndef DS4_NO_GPU
     if (ds4_session_is_glm(s) && power_percent != 100) {
         fprintf(stderr, "ds4: session power throttling is not supported for GLM 5.2 yet\n");

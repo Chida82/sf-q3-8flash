@@ -4616,16 +4616,6 @@ static bool dist_kv_layer_tensor_bytes(
         uint32_t n_index_comp,
         uint64_t *out) {
     if (!layout || !out) return false;
-    if (ds4_engine_is_glm_dsa(engine)) {
-        return ds4_engine_glm_layer_payload_bytes(engine,
-                                                  layer,
-                                                  layout->raw_live,
-                                                  layout->head_dim,
-                                                  layout->indexer_head_dim,
-                                                  n_comp,
-                                                  n_index_comp,
-                                                  out);
-    }
     uint64_t bytes = 0;
     uint64_t tmp = 0;
     if (!dist_u64_mul(layout->raw_live, layout->head_dim, &tmp) ||
@@ -4682,10 +4672,7 @@ static bool dist_kv_raw_live_valid(ds4_engine *engine, const ds4_dist_kv_layout 
     if (!layout || layout->raw_window == 0 || layout->raw_cap == 0) return false;
     const uint32_t max_live =
         layout->token_count < layout->raw_window ? layout->token_count : layout->raw_window;
-    if (ds4_engine_is_glm_dsa(engine)) {
-        return layout->raw_live <= max_live &&
-               layout->raw_live <= layout->raw_cap;
-    }
+    (void)engine;
     return layout->raw_live == max_live && layout->raw_live <= layout->raw_cap;
 }
 

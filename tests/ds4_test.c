@@ -522,12 +522,7 @@ static void test_session_snapshot_roundtrip(void) {
     int reference_counts[GLM_MTP_SNAPSHOT_CYCLES] = {0};
     int reference_total = 0;
     const bool test_glm_mtp = test_env_bool("DS4_TEST_GLM_MTP");
-#ifdef DS4_ROCM_BUILD
-    const float continued_logit_tolerance =
-        ds4_engine_is_glm53(engine) ? 1e-5f : 1e-6f;
-#else
     const float continued_logit_tolerance = 1e-6f;
-#endif
 
     uint32_t ctx = test_env_u32("DS4_TEST_SNAPSHOT_CTX");
     if (ctx == 0) ctx = 1024;
@@ -5298,98 +5293,6 @@ static bool test_top_tokens_overlap(
     return a0_in_b && b0_in_a;
 }
 
-static void test_glm53_continued_prefill(void) {
-    ds4_engine *engine = test_get_engine(false);
-    if (!engine || !ds4_engine_is_glm53(engine)) {
-        fprintf(stderr,
-                "ds4-test: glm53-continued-prefill skipped (GLM 5.3 model required)\n");
-        return;
-    }
-
-    const int base_len = 64;
-    uint32_t large_add = test_env_u32("DS4_TEST_CONTINUED_PREFILL_TOKENS");
-    if (large_add == 0) large_add = 256;
-    uint32_t large_steps = test_env_u32("DS4_TEST_CONTINUED_PREFILL_STEPS");
-    if (large_steps == 0) large_steps = 1;
-    const uint64_t final_len64 = (uint64_t)base_len + 4u +
-                                 (uint64_t)large_add * large_steps;
-    TEST_ASSERT(final_len64 < INT_MAX - 128);
-    if (final_len64 >= INT_MAX - 128) return;
-    const int final_len = (int)final_len64;
-    int ctx_size = final_len + 128;
-    if (ctx_size < 4096) ctx_size = 4096;
-
-    ds4_tokens pattern = {0};
-    ds4_tokens prompt = {0};
-    ds4_session *resumed = NULL;
-    ds4_session *cold = NULL;
-    ds4_token_score resumed_top[8] = {0};
-    ds4_token_score cold_top[8] = {0};
-    char err[160] = {0};
-    ds4_tokenize_text(engine,
-                      " continued prefill checks latency throughput and progress",
-                      &pattern);
-    TEST_ASSERT(pattern.len > 0);
-    if (pattern.len == 0) goto cleanup;
-    ds4_chat_begin(engine, &prompt);
-    while (prompt.len < final_len) {
-        ds4_tokens_push(&prompt, pattern.v[prompt.len % pattern.len]);
-    }
-
-    TEST_ASSERT(ds4_session_create(&resumed, engine, ctx_size) == 0);
-    if (!resumed) goto cleanup;
-
-    prompt.len = base_len;
-    TEST_ASSERT(ds4_session_sync(resumed, &prompt, err, sizeof(err)) == 0);
-    if (!test_sync_continued_prefill_stage(resumed, &prompt,
-                                           base_len, base_len + 1, NULL)) {
-        goto cleanup;
-    }
-    if (!test_sync_continued_prefill_stage(resumed, &prompt,
-                                           base_len + 1, base_len + 4, NULL)) {
-        goto cleanup;
-    }
-    int previous_len = base_len + 4;
-    for (uint32_t step = 0; step < large_steps; step++) {
-        const int next_len = previous_len + (int)large_add;
-        if (!test_sync_continued_prefill_stage(resumed, &prompt,
-                                               previous_len, next_len, NULL)) {
-            goto cleanup;
-        }
-        previous_len = next_len;
-    }
-    TEST_ASSERT(ds4_session_top_logprobs(resumed, resumed_top, 8) == 8);
-    ds4_session_free(resumed);
-    resumed = NULL;
-
-    TEST_ASSERT(ds4_session_create(&cold, engine, ctx_size) == 0);
-    if (!cold) goto cleanup;
-    prompt.len = final_len;
-    TEST_ASSERT(ds4_session_sync(cold, &prompt, err, sizeof(err)) == 0);
-    TEST_ASSERT(ds4_session_top_logprobs(cold, cold_top, 8) == 8);
-    int same_rank = 0;
-    float max_same_rank_delta = 0.0f;
-    for (int i = 0; i < 8; i++) {
-        if (resumed_top[i].id != cold_top[i].id) continue;
-        same_rank++;
-        const float delta = fabsf(resumed_top[i].logit - cold_top[i].logit);
-        if (delta > max_same_rank_delta) max_same_rank_delta = delta;
-    }
-    fprintf(stderr,
-            "ds4-test: continued/cold final top token %d/%d, "
-            "same-rank top8=%d, max same-rank logit delta=%.6g\n",
-            resumed_top[0].id, cold_top[0].id,
-            same_rank, max_same_rank_delta);
-    TEST_ASSERT(resumed_top[0].id == cold_top[0].id);
-    TEST_ASSERT(test_top_tokens_overlap(resumed_top, cold_top, 8));
-
-cleanup:
-    ds4_session_free(cold);
-    ds4_session_free(resumed);
-    ds4_tokens_free(&prompt);
-    ds4_tokens_free(&pattern);
-}
-
 static char *test_read_file(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return NULL;
@@ -6716,11 +6619,9 @@ static char *test_tool_result_request_json(const char *assistant_content,
 static void test_think_tool_recovery(void) {
     const char *generated =
         "The user wants a directory listing.\n\n"
-        DS4_TOOL_CALLS_START "\n"
-        DS4_INVOKE_START " name=\"list_files\">\n"
-        DS4_PARAM_START " name=\"path\" string=\"true\">." DS4_PARAM_END "\n"
-        DS4_INVOKE_END "\n"
-        DS4_TOOL_CALLS_END;
+        "<tool_call>\n<function=list_files>\n"
+        "<parameter=path>\n.\n</parameter>\n"
+        "</function>\n</tool_call>";
 
     buf text = {0};
     size_t scan_from = 0;
@@ -6728,7 +6629,7 @@ static void test_think_tool_recovery(void) {
     for (size_t i = 0; generated[i]; i++) {
         buf_append(&text, generated + i, 1);
         complete = complete_tool_call_inside_thinking(
-            SERVER_MODEL_SYNTAX_DEEPSEEK, text.ptr, text.len, &scan_from);
+            SERVER_MODEL_SYNTAX_QWEN, text.ptr, text.len, &scan_from);
         TEST_ASSERT(complete == (generated[i + 1] == '\0'));
     }
     TEST_ASSERT(complete);
@@ -7219,7 +7120,6 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-ssd-streaming-cache-pressure", "metal-ssd-streaming-cache-pressure", "Metal SSD-streaming layer-batched decode cache-pressure repro for issue #384", test_metal_ssd_streaming_cache_pressure},
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors},
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
-    {"--glm53-continued-prefill", "glm53-continued-prefill", "GLM 5.3 resumed prefill latency, throughput, progress, and cold-path agreement", test_glm53_continued_prefill},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
@@ -7292,23 +7192,6 @@ static void test_run_entry(const ds4_test_entry *entry) {
 }
 
 int main(int argc, char **argv) {
-    if (argc == 4 && (!strcmp(argv[1], "--ds41-render") ||
-                      !strcmp(argv[1], "--ds41-render-anthropic"))) {
-        ds4_think_mode mode;
-        if (!ds4_think_mode_parse_level(argv[2], &mode)) return 2;
-        const char *json = argv[3];
-        chat_msgs msgs = {0};
-        const bool anthropic = !strcmp(argv[1], "--ds41-render-anthropic");
-        if (!(anthropic ? parse_anthropic_messages(&json, &msgs) : parse_messages(&json, &msgs))) {
-            chat_msgs_free(&msgs);
-            return 2;
-        }
-        char *text = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_DEEPSEEK41,
-                                                       &msgs, NULL, NULL, mode);
-        fputs(text, stdout);
-        free(text); chat_msgs_free(&msgs);
-        return 0;
-    }
     bool run_all = argc == 1;
     bool selected[sizeof(test_entries) / sizeof(test_entries[0])] = {0};
 

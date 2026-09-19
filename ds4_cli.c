@@ -479,16 +479,6 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
     }
 }
 
-static void cli_apply_model_sampling_defaults(
-        ds4_engine             *engine,
-        cli_generation_options *gen) {
-    if (!engine || !gen || !ds4_engine_is_glm_dsa(engine)) return;
-
-    if (!gen->temperature_set) gen->temperature = 1.0f;
-    if (!gen->top_p_set) gen->top_p = 0.95f;
-    if (!gen->min_p_set) gen->min_p = 0.0f;
-}
-
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
@@ -1357,9 +1347,6 @@ static bool repl_chat_apply_think_prefix(ds4_engine *engine,
                                          ds4_think_mode mode) {
     ds4_tokens prefix = {0};
     repl_chat_build_think_prefix(engine, mode, &prefix);
-    if (ds4_engine_is_deepseek41(engine) && chat->initial_system_text && !prefix.len)
-        ds4_chat_append_message(engine, &prefix, "system", "");
-
     bool same = chat->think_prefix_tokens == prefix.len;
     if (same && prefix.len > 0) {
         same = !memcmp(chat->transcript.v + chat->think_prefix_pos,
@@ -1462,7 +1449,8 @@ static int repl_chat_set_ctx(ds4_engine *engine, repl_chat *chat, int ctx_size) 
 }
 
 static bool repl_chat_assistant_turn_uses_eos(ds4_engine *engine) {
-    return !ds4_engine_is_glm_dsa(engine);
+    (void)engine;
+    return true;
 }
 
 /* Run one interactive turn.  The transcript is tentatively extended with user
@@ -1708,9 +1696,8 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                    (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
             const char *arg = trim_inplace(cmd + 6);
             ds4_think_mode mode = DS4_THINK_HIGH;
-            if (arg[0] && (!ds4_engine_is_deepseek41(engine) ||
-                           !ds4_think_mode_parse_level(arg, &mode))) {
-                fprintf(stderr, "ds4: /think N requires V4.1 and a level from 0 to 100\n");
+            if (arg[0] && !ds4_think_mode_parse_level(arg, &mode)) {
+                fprintf(stderr, "ds4: /think N requires a level from 0 to 100\n");
             } else if (repl_chat_apply_think_prefix(engine, &chat, mode)) {
                 cfg->gen.think_mode = mode;
                 printf("Thinking mode: %s.\n", ds4_think_mode_name(mode));
@@ -2224,15 +2211,7 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return 1;
     }
-    if (ds4_think_mode_level(cfg.gen.think_mode) >= 0 && !ds4_engine_is_deepseek41(engine)) {
-        fprintf(stderr, "ds4: --think-level requires a DeepSeek V4.1 model\n");
-        ds4_engine_close(engine);
-        ds4_dist_options_free(cfg.dist);
-        ds4_prompt_prefix_free(&cfg.gen.prefix);
-        free(cfg.prompt_owned);
-        return 2;
-    }
-    cli_apply_model_sampling_defaults(engine, &cfg.gen);
+
     if (cfg.engine.tp.role == DS4_TP_WORKER) {
         int rc = ds4_tp_worker_run(engine, &cfg.engine.tp);
         ds4_engine_close(engine);
