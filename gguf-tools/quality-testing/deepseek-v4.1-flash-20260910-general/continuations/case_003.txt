@@ -1,3 +1,0 @@
-# Deriving RMSNorm: Why Sum-of-Squares and a Scaling Pass?
-
-RMSNorm (Zhang & Sennrich, 2019) is defined as

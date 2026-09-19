@@ -1,1 +1,0 @@
-La differenza fondamentale tra un **mutex** (Mutual Exclusion) e un **contatore atomico** (

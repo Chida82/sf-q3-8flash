@@ -1,1 +1,0 @@
-Scrivi un progetto conciso per un server TCP echo con client lenti.

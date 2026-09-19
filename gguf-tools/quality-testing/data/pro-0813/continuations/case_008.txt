@@ -1,1 +1,0 @@
-To understand why a GPU’s **prefill** phase is often much faster than **single-token decode** on

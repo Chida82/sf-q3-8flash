@@ -13,7 +13,7 @@ from generate_long_context_story_prompt import FACTS, make_story
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", default="http://127.0.0.1:8080")
+    parser.add_argument("--url", default="http://127.0.0.1:8004")
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()

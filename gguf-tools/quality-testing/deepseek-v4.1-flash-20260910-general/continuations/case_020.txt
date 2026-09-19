@@ -1,3 +1,0 @@
-# Binary Search for Insertion Point
-
-Binary search finds the insertion point by repeatedly halving the search range until it converges on the correct index where a new value

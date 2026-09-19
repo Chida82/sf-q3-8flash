@@ -1,4 +1,0 @@
-# Progetto: Server TCP Echo con Client Lenti
-
-## Obiettivo
-Implementare un server TCP echo che gest

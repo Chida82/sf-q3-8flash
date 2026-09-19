@@ -169,7 +169,7 @@ def comparable(result):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--url", default="http://127.0.0.1:8000")
+    parser.add_argument("--url", default="http://127.0.0.1:8004")
     parser.add_argument("--model", default="deepseek-chat")
     parser.add_argument("--pairs", type=int, default=4)
     parser.add_argument("--workers", type=int, default=0)

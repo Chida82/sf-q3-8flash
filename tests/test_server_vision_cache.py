@@ -15,8 +15,8 @@ import urllib.request
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", default="http://127.0.0.1:8080")
-    parser.add_argument("--model", default="deepseek-v4-flash")
+    parser.add_argument("--url", default="http://127.0.0.1:8004")
+    parser.add_argument("--model", default="qwen3.8-flash-next")
     parser.add_argument("--archive-lines", type=int, default=320)
     parser.add_argument("--append-only", action="store_true",
                         help="only run the long-prefix image append sequence")
@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    fixtures = Path(__file__).resolve().parent / "vision-fixtures/glm53"
+    fixtures = Path(__file__).resolve().parent / "vision-fixtures/qwen38"
     results = []
     results_lock = Lock()
 
@@ -69,30 +69,30 @@ def main():
     def thinking_replay():
         history = [{"role": "user", "content": [
             {"type": "text", "text": "What is the access code in this image? Reply with just the code."},
-            image("text.png")]}]
+            image("orbit.png")]}]
         answer = ask("thinking-image", history, thinking=True)
-        assert "MINT-731" in answer.get("content", "")
+        assert "ORBIT 4729" in answer.get("content", "")
         # These clients replay the visible answer, not its hidden reasoning.
         history.append({"role": "assistant", "content": answer["content"]})
         history.append({"role": "user", "content": "Give just the train number from that image."})
         answer = ask("thinking-replay", history, True, thinking=True)
-        assert "482" in answer.get("content", "")
+        assert "4729" in answer.get("content", "")
         history.append({"role": "assistant", "content": answer["content"]})
         history.append({"role": "user", "content": [
             {"type": "text", "text": "How many shapes in this image? Reply with just a number."},
-            image("spatial.png")]})
+            image("maple.png")]})
         answer = ask("thinking-new-image", history, True, thinking=True)
-        assert "3" in answer.get("content", "") or "three" in answer.get("content", "").lower()
+        assert "MAPLE 8153" in answer.get("content", "")
         history.append({"role": "assistant", "content": answer["content"]})
         history.append({"role": "user", "content": "Give just the access code from the first image."})
         answer = ask("thinking-two-images", history, True, thinking=True)
-        assert "MINT-731" in answer.get("content", "")
+        assert "ORBIT 4729" in answer.get("content", "")
         history.append({"role": "assistant", "content": answer["content"]})
         history.append({"role": "user", "content": "Give just the train number from the first image."})
         answer = ask("thinking-replay-again", history, True, thinking=True)
-        assert "482" in answer.get("content", "")
+        assert "4729" in answer.get("content", "")
         changed = copy.deepcopy(history)
-        changed[0]["content"][1] = image("spatial.png")
+        changed[0]["content"][1] = image("maple.png")
         ask("thinking-changed-image", changed, False, thinking=True)
 
     if args.thinking_only:
@@ -109,13 +109,13 @@ def main():
     history.append(ask("text-append", history, True))
     history.append({"role": "user", "content": [
         {"type": "text", "text": "Read the text in this picture. Reply briefly."},
-        image("text.png")]})
+        image("orbit.png")]})
     history.append(ask("first-image", history, True))
     history.append({"role": "user", "content": "Repeat only the text in the image."})
     history.append(ask("same-image", history, True))
     history.append({"role": "user", "content": [
         {"type": "text", "text": "Describe the shapes in this second image briefly."},
-        image("spatial.png")]})
+        image("maple.png")]})
     history.append(ask("second-image", history, True))
     history.append({"role": "user", "content": "Reply with exactly FINISHED."})
     history.append(ask("two-images", history, True))
@@ -125,7 +125,7 @@ def main():
 
     # The text/token placeholders can stay identical while pixels change.
     changed = copy.deepcopy(history[:-1])
-    changed[5]["content"][1] = image("spatial.png")
+    changed[5]["content"][1] = image("maple.png")
     ask("changed-old-image", changed, False)
     removed = copy.deepcopy(changed)
     removed[5]["content"] = [{"type": "text", "text": "No image was supplied."}]
@@ -143,7 +143,7 @@ def main():
     history = [{"role": "system", "content": "Use record when asked to record image text."},
                {"role": "user", "content": [
                    {"type": "text", "text": "Record the text in this image using the record tool."},
-                   image("text.png")]}]
+                   image("orbit.png")]}]
     answer = ask("tool-image", history, tools=tools)
     assert answer.get("tool_calls"), "model did not produce the required tool call"
     history.append(answer)
@@ -156,14 +156,14 @@ def main():
     history.append(ask("tool-result", history, True, tools=tools))
     history.append({"role": "user", "content": [
         {"type": "text", "text": "Now describe this second image. Do not call tools."},
-        image("spatial.png")]})
+        image("maple.png")]})
     history.append(ask("tool-new-image", history, True, tools=tools))
     history.append({"role": "user", "content": "Reply with exactly DONE."})
     ask("tool-final", history, True, tools=tools)
     probes = [
         [{"role": "user", "content": [
             {"type": "text", "text": "Read the text in the image. Be brief."}, image(name)]}]
-        for name in ("text.png", "spatial.png")
+        for name in ("orbit.png", "maple.png")
     ]
     controls = [ask("control-" + str(i), probe) for i, probe in enumerate(probes)]
     with ThreadPoolExecutor(max_workers=2) as pool:

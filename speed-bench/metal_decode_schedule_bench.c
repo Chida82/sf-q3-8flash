@@ -42,7 +42,7 @@ static void usage(FILE *fp, const char *argv0) {
     fprintf(fp,
             "usage: %s [options]\n"
             "\n"
-            "  -m, --model PATH       GGUF path (default: ds4flash.gguf)\n"
+            "  -m, --model PATH       GGUF path (default: qwen3.8-flash-next.gguf)\n"
             "  --prompt-file PATH     token source (default: ds4.c)\n"
             "  --prefix-tokens N      prefill length (default: 2048)\n"
             "  --ctx N                session allocation (default: 4096)\n"
@@ -84,7 +84,7 @@ static int parse_int_arg(const char *value, const char *opt, int minimum) {
 
 static bench_config parse_options(int argc, char **argv) {
     bench_config cfg = {
-        .model_path = "ds4flash.gguf",
+        .model_path = "qwen3.8-flash-next.gguf",
         .prompt_path = "ds4.c",
         .candidate_env = NULL,
         .prefix_tokens = DEFAULT_PREFIX_TOKENS,

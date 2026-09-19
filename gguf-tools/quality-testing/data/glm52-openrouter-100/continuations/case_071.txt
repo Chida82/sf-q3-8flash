@@ -1,1 +1,0 @@
-Un array ordinato rende molto più veloce la ricerca di appartenenza (verificare se un elemento è

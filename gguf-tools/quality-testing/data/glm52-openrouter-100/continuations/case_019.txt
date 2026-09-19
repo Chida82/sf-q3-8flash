@@ -1,1 +1,0 @@
-Ecco tre invarianti per una tabella (o struttura dati) che gestisce "token speciali" (ad

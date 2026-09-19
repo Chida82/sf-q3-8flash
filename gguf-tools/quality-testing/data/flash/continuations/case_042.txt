@@ -1,1 +1,0 @@
-To understand **online softmax**, let's first look at the problem it solves, then break it down with simple variables

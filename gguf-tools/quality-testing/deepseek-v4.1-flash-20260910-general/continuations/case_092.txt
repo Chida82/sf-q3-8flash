@@ -1,8 +1,0 @@
-# SQL Query: Count Rows per Category
-
-Here's a simple SQL query that counts rows grouped by category:
-
-```sql
-SELECT 
-    category,
-   

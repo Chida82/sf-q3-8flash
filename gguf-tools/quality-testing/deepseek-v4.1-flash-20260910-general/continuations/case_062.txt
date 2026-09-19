@@ -1,1 +1,0 @@
-**Eventual consistency** is a consistency model used in distributed systems where, if no new updates are made to a data item, all replicas will *event

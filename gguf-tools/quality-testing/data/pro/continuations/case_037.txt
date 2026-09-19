@@ -1,1 +1,0 @@
-Nella quantizzazione low-bit, una **matrice di importanza** (o *importance matrix*) è una matrice

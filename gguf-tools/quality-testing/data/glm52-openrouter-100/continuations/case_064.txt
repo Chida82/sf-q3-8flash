@@ -1,3 +1,0 @@
-The easiest way to understand the difference between latency and throughput is to use a real-world analogy. 
-
-Imagine you are driving

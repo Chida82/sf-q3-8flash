@@ -1,1 +1,0 @@
-Write a short C function that returns the largest of three integers.

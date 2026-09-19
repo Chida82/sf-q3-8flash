@@ -1,1 +1,0 @@
-A hash table handles collisions—when two different keys map to the same array index—using one of several strategies. The

@@ -15,7 +15,7 @@
 typedef ds4_distributed_options ds4_dist_options;
 typedef struct ds4_dist_session ds4_dist_session;
 
-/* Options used by standalone `./ds4 --role coordinator -p ...` generation.
+/* Options used by standalone `./sf-q3-8flash --role coordinator -p ...` generation.
  * Interactive tools and the server go through the normal ds4_session API.
  */
 typedef struct {
@@ -118,7 +118,7 @@ int ds4_dist_session_load_payload(
         size_t errlen);
 
 /* Standalone distributed mode. Workers stay in this loop; coordinator one-shot
- * mode uses it for `./ds4 --role coordinator -p ...`.
+ * mode uses it for `./sf-q3-8flash --role coordinator -p ...`.
  */
 int ds4_dist_run(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist_generation_options *gen);
 

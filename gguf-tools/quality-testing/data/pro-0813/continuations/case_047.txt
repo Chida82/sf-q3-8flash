@@ -1,1 +1,0 @@
-In transformer-based language models, the **KV cache** stores the Key (K) and Value (V) tensors

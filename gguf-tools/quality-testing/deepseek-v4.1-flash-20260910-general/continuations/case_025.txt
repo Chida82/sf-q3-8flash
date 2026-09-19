@@ -1,3 +1,0 @@
-# Ring Buffers: Wrapping and Preventing Data Loss
-
-A **ring buffer** (circular buffer) is a fixed-size array used as a FIFO

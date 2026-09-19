@@ -1,1 +1,0 @@
-La differenza tra la dimensione della memoria virtuale e la memoria residenza (RSS - *Resident Set

@@ -1,1 +1,0 @@
-Fai un breve esempio di race condition in C.

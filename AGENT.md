@@ -1,56 +1,53 @@
-# Agent Notes
+# Engineering notes
 
-`ds4.c` is a DeepSeek V4 Flash specific inference engine. It is not a generic
-GGUF runner. The goal is a small, readable, high-performance C codebase with
-Objective-C only where Metal requires it and Metal kernels under `metal/`.
+`sf-q3-8flash` is a focused Qwen3.8 Flash Next inference engine for Apple
+Metal. It is not a general GGUF runner. Keep the C implementation readable,
+use Objective-C only at the Metal boundary, and keep kernels under `metal/`.
 
 ## Goals
 
-- Keep the production path as whole-model Metal graph inference.
-- Always make sure that the SSD streaming, CUDA, distributed inference, Metal default inference are not affected by fixes to other parts of the code.
-- Keep model loading mmap-backed for the Metal default case; do not eagerly copy the full GGUF. Keep the model loading for SSD streaming of routed experts explicit: allocated buffers, fast reads from disk, always try to hide loading of missing routed experts by loading them while performing the inference of the shared expert and routed experts already in RAM. Always try to hide loading of layers for prefill in SSD streaming mode using the inference time of the current layer as the next one is loaded.
-- Keep the CPU backend CPU-only and use it only as reference/debug code.
-- Preserve correctness before speed. Do not keep a faster path with unexplained attention, KV cache, or logits drift.
-- Make long local agent sessions practical through live KV reuse and disk KV checkpoints.
+- Preserve the whole-model Metal graph as the production path.
+- Keep model loading mmap-backed. The large BF16 n-gram table stays on disk and
+  selected rows are read directly from the GGUF.
+- Keep the CPU path as a correctness/reference implementation and for fast
+  model-less tests; avoid huge CPU inference runs on macOS.
+- Preserve correctness before speed. Never accept unexplained attention,
+  recurrent-state, KV-cache, MTP, or logits drift.
+- Keep vision, directional steering, disk KV checkpoints, and the existing
+  distributed plumbing working when touching shared code.
 
-## Quality Rules
+## Quality rules
 
-- Keep the implementation small, sharp, easy to understand. Try to write elegant code in a state of grace. Don't settle for the first thing that comes to mind, try to find the most minimal and better working design. Don't introduce slop: very fragile code that just patches specific cases, dead code, useless code and code ways more complicated of how it should be.
-- Comment important inference code where the model mechanics, cache lifetime, memory policy, or API orchestration are not obvious from the local code.
-- Prefer comments beside the implementation over separate design documents.
-- Keep comments instructive and compact: explain why a shape, ordering, cache boundary, or memory choice exists.
-- Keep public APIs narrow. CLI/server code should not know tensor internals.
-- Do not add permanent semantic variants behind flags. Diagnostic switches are fine when they validate the one release path.
-- Do not introduce C++.
-
-## Safety
-
-- Avoid large CPU inference runs on macOS; the CPU path has previously exposed kernel VM failures with very large mappings.
-- Do not run multiple huge model processes concurrently. The instance lock is intentional.
+- Prefer the smallest direct implementation. Do not add C++, speculative
+  abstractions, permanent semantic variants, or a dependency for stdlib work.
+- Before changing a helper, find every caller. Fix a root cause once.
+- Keep public APIs narrow: frontends should not know tensor internals.
+- Comment only non-obvious model mechanics, cache lifetime, memory policy, and
+  synchronization constraints.
+- New branches, parsers, kernels, and state transitions need one focused
+  runnable regression. Reuse the existing test nearest to the behavior.
+- Preserve input validation and clean failure at GGUF, HTTP, snapshot, and
+  filesystem boundaries.
 
 ## Layout
 
-- `ds4.c`: model loading, tokenizer, CPU reference code, Metal graph scheduling,
-  sessions, disk-cache payload serialization.
-- `ds4_cli.c`: command line, linenoise REPL, interactive transcript handling.
-- `ds4_server.c`: OpenAI/Anthropic compatible HTTP API, worker queue, streaming,
-  tool-call mapping, disk KV cache policy.
-- `ds4_metal.m`: Objective-C Metal runtime and kernel wrappers.
-- `metal/*.metal`: compute kernels.
-- `tests/`: unit and live integration tests.
-- `misc/`: ignored notes, experiments, and old planning material.
-
-This list is not complete, check the files for more info.
+- `ds4.c`: Qwen model loading and validation, tokenizer/chat rendering, CPU
+  reference, graph scheduling, sessions, MTP, and payload serialization.
+- `ds4_metal.m`: Metal resource lifetime and kernel wrappers.
+- `metal/qwen4.metal`: Qwen text and MTP kernels.
+- `metal/qwen4_vision.metal`: Qwen vision kernels.
+- `ds4_cli.c`: command line and interactive REPL.
+- `ds4_server.c`: OpenAI/Responses/Anthropic-compatible HTTP server, batching,
+  tool-call continuation, and disk KV policy.
+- `ds4_bench.c`, `ds4_eval.c`: performance and quality tools.
+- `ds4_tp.*`, `ds4_distributed.*`: retained transport/distributed code.
+- `tests/test_qwen4_*`: Qwen-specific tests; `tests/ds4_test.c` covers shared
+  session and server behavior.
 
 ## Testing
 
-Use `make` for build validation. Use `make test` for unit/regression tests when a
-model and Metal are available. Use live server tests only when intentionally
-testing the API surface.
-
-At every major change where one of the following could be affected, make sure to:
-
-1. Test the normal Metal path and that speed is still at the level it was.
-2. Test the SSD streaming path.
-3. Test the distributed inference if it could be affected, but ask the user before doing so.
-4. Check if CUDA could be broken after the change, and ask the user to give you access to the CUDA machine to actually test if everything is still fine.
+Start with `make -j8 && make test -j8`. Use the focused Qwen targets listed in
+`AGENTS.md`; model-backed tests and parity require the large Qwen GGUF. For a
+performance change, compare identical prompts, context, quantization, and
+sampling settings before and after, and report medians rather than a best run.
+Do not run multiple full model processes concurrently.

@@ -16,7 +16,7 @@ static char *test_read_file(const char *path);
 
 static const char *test_model_path(void) {
     const char *model_path = getenv("DS4_TEST_MODEL");
-    return (model_path && model_path[0]) ? model_path : "ds4flash.gguf";
+    return (model_path && model_path[0]) ? model_path : "qwen3.8-flash-next.gguf";
 }
 
 static bool test_env_bool(const char *name) {
@@ -7246,7 +7246,7 @@ static void test_print_help(const char *prog) {
     puts("  -h, --help");
     puts("      Show this help.");
     puts("\nEnvironment:");
-    puts("  DS4_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
+    puts("  DS4_TEST_MODEL=FILE        Model path. Default: qwen3.8-flash-next.gguf");
     puts("  DS4_TEST_BACKEND=cpu       Run model tests on CPU instead of Metal/CUDA.");
     puts("  DS4_TEST_SSD_STREAMING=1   Run model tests through Metal SSD streaming.");
     puts("  DS4_TEST_SSD_STREAMING_CACHE_GB=N  Streaming routed expert cache in GiB.");

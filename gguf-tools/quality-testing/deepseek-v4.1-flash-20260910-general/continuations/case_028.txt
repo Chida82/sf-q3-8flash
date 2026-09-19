@@ -1,5 +1,0 @@
-# Why Grouped MoE Expert Execution Improves Prefill
-
-## The setup
-
-In a Mixture-of-Experts (MoE) layer, a token

@@ -1,1 +1,0 @@
-Scrivi una breve funzione C che limita un intero a un intervallo.

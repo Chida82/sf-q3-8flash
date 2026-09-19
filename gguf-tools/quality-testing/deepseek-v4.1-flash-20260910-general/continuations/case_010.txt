@@ -1,3 +1,0 @@
-# Inserimento in un B-tree
-
-Un **B-tree** è un albero di ricerca bilanciato progettato per essere efficiente su memoria

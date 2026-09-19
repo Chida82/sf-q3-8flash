@@ -1,3 +1,0 @@
-Ecco tre invarianti per una tabella di token speciali:
-
-## 1. Invariante di Unicit

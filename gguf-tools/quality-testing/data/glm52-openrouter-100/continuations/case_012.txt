@@ -1,1 +1,0 @@
-Il confronto tra l'uso di `mmap` (Memory-Mapped Files) e la copia completa (

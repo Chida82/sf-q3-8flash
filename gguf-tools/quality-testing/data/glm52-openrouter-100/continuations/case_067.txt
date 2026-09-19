@@ -1,1 +1,0 @@
-The difference between **virtual address space size** (the total memory you have mapped) and **page residency** (the

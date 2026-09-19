@@ -1,1 +1,0 @@
-Data una lista ordinata, descrivi la ricerca binaria del punto di inserimento.

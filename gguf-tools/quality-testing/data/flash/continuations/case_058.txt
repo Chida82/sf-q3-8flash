@@ -1,5 +1,0 @@
-# Checklist per la Validazione di Modelli Quantizzati
-
-## 1. Preparazione e Configurazione
-
--

@@ -1,1 +1,0 @@
-La **ricerca binaria del punto di inserimento** è un algoritmo che trova la posizione corretta in cui

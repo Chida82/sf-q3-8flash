@@ -1,3 +1,0 @@
-Here is a brief, actionable plan for testing long-context prompt chunking, structured in four phases.
-
-**Goal:**

@@ -1,3 +1,0 @@
-# Why Bounds Checking Matters Before Array Access
-
-A **bounds check** verifies that an index `i` falls within the valid range of an array —

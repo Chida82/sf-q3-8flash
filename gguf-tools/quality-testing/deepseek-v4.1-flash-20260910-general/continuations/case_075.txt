@@ -1,3 +1,0 @@
-# Rappresentazione di un insieme di stringhe con un Trie
-
-Un **trie** (o *albero prefisso*) è una struttura dati ad

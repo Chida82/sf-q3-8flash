@@ -1,1 +1,0 @@
-A **trie** (also called a prefix tree) represents a set of strings by storing them as paths from a

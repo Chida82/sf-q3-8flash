@@ -1,5 +1,0 @@
-# Pseudocodice per inserire un elemento in un heap binario
-
-## Funzione principale: INSERT
-
-```

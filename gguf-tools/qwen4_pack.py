@@ -39,7 +39,7 @@ from typing import Iterable
 import numpy as np
 from huggingface_hub import get_token, hf_hub_download
 
-from glm53_quantize import (
+from glm53_quantize import (  # sf-keep: shared GGUF primitives used by Qwen packing.
     GGUF_ALIGNMENT,
     GGUF_VERSION,
     align,

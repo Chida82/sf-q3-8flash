@@ -1,3 +1,0 @@
-# Perché raggruppare gli esperti MoE accelera il prefill
-
-Nei modelli **Mixture-of-Experts (Mo

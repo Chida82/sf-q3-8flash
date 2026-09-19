@@ -1,1 +1,0 @@
-Ecco un progetto conciso per un server TCP echo progettato specificamente per gestire client lenti o con

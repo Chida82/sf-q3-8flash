@@ -1,3 +1,0 @@
-Here is a short example of a race condition in C using POSIX threads (pthreads). 
-
-In this example, two

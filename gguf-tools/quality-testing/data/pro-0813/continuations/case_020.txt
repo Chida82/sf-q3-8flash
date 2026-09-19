@@ -1,3 +1,0 @@
-Binary search can efficiently find the insertion point for a target value in a sorted array. Here's how it works:
-
-##

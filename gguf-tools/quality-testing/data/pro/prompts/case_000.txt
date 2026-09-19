@@ -1,1 +1,0 @@
-Explain B-tree insertion, including splits and the root special case.

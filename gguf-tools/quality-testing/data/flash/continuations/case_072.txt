@@ -1,1 +1,0 @@
-La **consistenza eventuale** (in inglese *eventual consistency*) è un modello di coerenza

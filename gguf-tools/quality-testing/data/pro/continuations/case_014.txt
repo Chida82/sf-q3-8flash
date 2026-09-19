@@ -1,1 +1,0 @@
-La cache KV (Key-Value) su disco è un'innovazione cruciale per i sistemi agentici modern

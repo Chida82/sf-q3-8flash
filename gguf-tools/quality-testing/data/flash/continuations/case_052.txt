@@ -1,3 +1,0 @@
-Ti spiego il **softmax nell'attenzione** con un esempio molto semplice, passo per passo.
-
-Immag

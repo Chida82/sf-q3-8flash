@@ -1,1 +1,0 @@
-Per capire la differenza tra un **mutex** e un **contatore atomico**, dobbiamo prima

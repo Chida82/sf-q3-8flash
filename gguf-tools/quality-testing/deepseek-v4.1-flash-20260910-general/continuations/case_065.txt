@@ -1,3 +1,0 @@
-# How a Trie Represents a Set of Strings
-
-A **trie** (pronounced "try," from re**trie**val) is a

@@ -1,3 +1,0 @@
-## Short answer
-
-The excerpt **doesn't actually contain the code paths that run when a connection drops** — it's mostly constants, wire-format structs, state

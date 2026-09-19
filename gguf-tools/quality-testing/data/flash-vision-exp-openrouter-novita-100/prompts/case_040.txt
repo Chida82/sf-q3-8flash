@@ -1,1 +1,0 @@
-A user reports generation slows at long context. List the first five measurements to take.

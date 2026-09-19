@@ -1,3 +1,0 @@
-Ecco tre possibili invarianti per una tabella di token speciali:
-
-1. **Unicità del token

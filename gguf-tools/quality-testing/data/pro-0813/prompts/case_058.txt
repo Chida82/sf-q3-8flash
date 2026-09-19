@@ -1,1 +1,0 @@
-Scrivi una checklist per validare che un modello quantizzato segua ancora le istruzioni.

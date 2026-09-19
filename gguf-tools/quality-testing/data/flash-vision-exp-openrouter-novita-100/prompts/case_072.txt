@@ -1,1 +1,0 @@
-Che cosa significa consistenza eventuale in un database distribuito?

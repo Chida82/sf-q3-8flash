@@ -1,1 +1,0 @@
-Per capire la differenza tra **latenza** e **throughput**, il modo migliore è usare

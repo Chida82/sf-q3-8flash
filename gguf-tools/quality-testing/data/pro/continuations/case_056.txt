@@ -1,1 +1,0 @@
-Il router (o *gating network*) in un'architettura **Mixture-of-Experts (Mo

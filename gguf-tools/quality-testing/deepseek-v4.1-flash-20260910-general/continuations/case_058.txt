@@ -1,5 +1,0 @@
-# Checklist per Validare un Modello Quantizzato: Capacità di Seguire le Istruzioni
-
-## 1. Preparazione del Test
-
-- [

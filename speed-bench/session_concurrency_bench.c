@@ -177,7 +177,7 @@ static void usage(FILE *fp, const char *argv0) {
     fprintf(fp,
             "usage: %s [options]\n"
             "\n"
-            "  -m, --model PATH      GGUF path (default: ds4flash.gguf)\n"
+            "  -m, --model PATH      GGUF path (default: qwen3.8-flash-next.gguf)\n"
             "  --prompt-file PATH    token source (default: speed-bench/promessi_sposi.txt)\n"
             "  --concurrency LIST    stream counts (default: 1,2,4,8,16)\n"
             "  --ctx LIST            prompt lengths (default: 0,4096,16384,32768,65536,131072)\n"
@@ -966,7 +966,7 @@ static void print_summary(const cell_result *cells, int count) {
 
 int main(int argc, char **argv) {
     bench_config cfg = {
-        .model_path = "ds4flash.gguf",
+        .model_path = "qwen3.8-flash-next.gguf",
         .prompt_path = "speed-bench/promessi_sposi.txt",
         .csv_path = NULL,
         .gen = DEFAULT_GEN,

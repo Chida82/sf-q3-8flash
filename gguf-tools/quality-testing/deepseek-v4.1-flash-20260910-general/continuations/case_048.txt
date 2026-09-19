@@ -1,4 +1,0 @@
-# Quantized Model Instruction-Following Validation Checklist
-
-## 1. Pre-Validation Setup
-- [ ] Confirm baseline (pre-quantization) model

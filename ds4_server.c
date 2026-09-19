@@ -1,7 +1,6 @@
 #include "ds4.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
-#include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "ds4_tp.h"
@@ -985,8 +984,10 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
     r->kind = kind;
     r->api = API_OPENAI;
+    /* Parsers start from the legacy neutral test syntax; live requests replace
+     * it from the Qwen-only engine before rendering. */
     r->model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
-    r->model = xstrdup("deepseek-v4-flash");
+    r->model = xstrdup("qwen3.8-flash-next");
     r->max_tokens = max_tokens;
     r->top_k = 0;
     r->temperature = DS4_DEFAULT_TEMPERATURE;
@@ -1229,33 +1230,14 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
 
 static bool server_model_alias_known(const char *id) {
     return id &&
-           (!strcmp(id, "deepseek-v4-flash") ||
-            !strcmp(id, "deepseek-v4.1-flash") ||
-            !strcmp(id, "qwen3.8-flash-next") ||
+           (!strcmp(id, "qwen3.8-flash-next") ||
             !strcmp(id, "qwen3.8-flash-next-chat") ||
             !strcmp(id, "qwen3.8-flash-next-no-think") ||
             !strcmp(id, "qwen3.8-flash-next-nothink") ||
             !strcmp(id, "qwen3.8-flash-next-reasoner") ||
             !strcmp(id, "qwen/qwen3.8-flash-next") ||
             !strcmp(id, "qwen/qwen3.8-flash-next-chat") ||
-            !strcmp(id, "qwen/qwen3.8-flash-next-reasoner") ||
-            !strcmp(id, "deepseek-v4-pro") ||
-            !strcmp(id, "glm-5.2") ||
-            !strcmp(id, "glm-5.2-chat") ||
-            !strcmp(id, "glm-5.2-no-think") ||
-            !strcmp(id, "glm-5.2-nothink") ||
-            !strcmp(id, "glm-5.2-reasoner") ||
-            !strcmp(id, "zai/glm-5.2") ||
-            !strcmp(id, "zai/glm-5.2-chat") ||
-            !strcmp(id, "zai/glm-5.2-reasoner") ||
-            !strcmp(id, "glm-5.3-flash") ||
-            !strcmp(id, "glm-5.3-flash-chat") ||
-            !strcmp(id, "glm-5.3-flash-no-think") ||
-            !strcmp(id, "glm-5.3-flash-nothink") ||
-            !strcmp(id, "glm-5.3-flash-reasoner") ||
-            !strcmp(id, "zai/glm-5.3-flash") ||
-            !strcmp(id, "zai/glm-5.3-flash-chat") ||
-            !strcmp(id, "zai/glm-5.3-flash-reasoner"));
+            !strcmp(id, "qwen/qwen3.8-flash-next-reasoner"));
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -14940,25 +14922,11 @@ static bool send_model(server *s, int fd, const char *id) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_deepseek41(s->engine)) {
-        append_model_json(&b, s, server_model_id_from_engine(s->engine));
-    } else if (ds4_engine_is_qwen4(s->engine)) {
-        append_model_json(&b, s, "qwen3.8-flash-next");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "qwen3.8-flash-next-chat");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "qwen3.8-flash-next-reasoner");
-    } else if (ds4_engine_is_glm_dsa(s->engine)) {
-        append_model_json(&b, s, "glm-5.2");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "glm-5.2-chat");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "glm-5.2-reasoner");
-    } else {
-        append_model_json(&b, s, "deepseek-v4-flash");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "deepseek-v4-pro");
-    }
+    append_model_json(&b, s, "qwen3.8-flash-next");
+    buf_putc(&b, ',');
+    append_model_json(&b, s, "qwen3.8-flash-next-chat");
+    buf_putc(&b, ',');
+    append_model_json(&b, s, "qwen3.8-flash-next-reasoner");
     buf_puts(&b, "]}\n");
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -15210,8 +15178,6 @@ static void set_client_socket_nonblocking(int fd) {
 
 typedef struct {
     ds4_engine_options engine;
-    const char *gpu_vram_arg;
-    const char *gpu_devices_arg;
     const char *host;
     int port;
     int ctx_size;
@@ -15336,41 +15302,29 @@ static void usage(FILE *fp, const char *topic) {
 
 static ds4_backend parse_backend_arg(const char *s, const char *arg) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
-#ifdef DS4_ROCM_BUILD
-    if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
-#else
-    if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
-#endif
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
-    server_log(DS4_LOG_DEFAULT, "ds4-server: invalid %s value: %s", arg, s);
-#ifdef DS4_ROCM_BUILD
-    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, rocm, cpu");
-#else
-    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, cuda, cpu");
-#endif
+    server_log(DS4_LOG_DEFAULT, "ds4-server: invalid %s value: %s (expected metal or cpu)", arg, s);
     exit(2);
 }
 
 static ds4_backend default_server_backend(void) {
 #ifdef DS4_NO_GPU
     return DS4_BACKEND_CPU;
-#elif defined(__APPLE__)
-    return DS4_BACKEND_METAL;
 #else
-    return DS4_BACKEND_CUDA;
+    return DS4_BACKEND_METAL;
 #endif
 }
 
 static server_config parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
-            .model_path = "ds4flash.gguf",
+            .model_path = SF_DEFAULT_MODEL, /* sf: child-specific default model. */
             .backend = default_server_backend(),
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
         },
         .host = "127.0.0.1",
-        .port = 8000,
+        .port = SF_DEFAULT_PORT, /* sf: child-specific default port. */
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
@@ -15428,25 +15382,9 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.glm_mtp = true;
-        } else if (!strcmp(arg, "--mtp-model")) {
-            c.engine.mtp_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--mtp-draft")) {
-            c.engine.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--mtp-margin")) {
-            c.engine.mtp_margin = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
         } else if (!strcmp(arg, "--mtp-timing")) {
             c.engine.glm_mtp = true;
             c.engine.glm_mtp_timing = true;
-        } else if (!strcmp(arg, "--dspark")) {
-            c.engine.dspark = true;
-        } else if (!strcmp(arg, "--dspark-confidence")) {
-            c.engine.dspark = true;
-            c.engine.dspark_confidence_threshold =
-                parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
-            c.engine.dspark_confidence_threshold_set = true;
-        } else if (!strcmp(arg, "--dspark-strict")) {
-            c.engine.dspark = true;
-            c.engine.dspark_strict = true;
         } else if (!strcmp(arg, "--mtp-exact-sampling")) {
             c.engine.dspark_exact_sampling = true;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
@@ -15552,19 +15490,6 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
-#ifdef DS4_ROCM_BUILD
-        } else if (!strcmp(arg, "--rocm")) {
-            c.engine.backend = DS4_BACKEND_CUDA;
-#else
-        } else if (!strcmp(arg, "--cuda")) {
-            c.engine.backend = DS4_BACKEND_CUDA;
-#endif
-        } else if (!strcmp(arg, "--gpu-vram")) {
-            c.gpu_vram_arg = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--gpu-devices")) {
-            c.gpu_devices_arg = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--cuda-tensor-parallel")) {
-            c.engine.cuda_tensor_parallel = true;
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cpu")) {
@@ -15654,33 +15579,7 @@ int main(int argc, char **argv) {
         cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
     cfg.engine.share_session_prefill_workspace = cfg.batched_sessions > 0;
     ds4_engine *engine = NULL;
-    if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
-        ds4_gpu_config gpu_cfg = {0};
-        bool skip_cuda = false;
-        char gpu_err[256];
-        if (parse_gpu_vram_arg(cfg.gpu_vram_arg, cfg.gpu_devices_arg,
-                               &gpu_cfg, &skip_cuda,
-                               gpu_err, sizeof(gpu_err)) != 0) {
-            fprintf(stderr, "ds4-server: %s\n", gpu_err);
-            return 2;
-        }
-        cfg.engine.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
-        if (skip_cuda) {
-            if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
-        } else {
-            const bool was_auto =
-                (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "auto")) ||
-                (!cfg.gpu_vram_arg && cfg.gpu_devices_arg);
-            char layout[256];
-            if (format_gpu_layout_line(&gpu_cfg, was_auto,
-                                       layout, sizeof(layout)) > 0) {
-                fprintf(stdout, "%s\n", layout);
-                fflush(stdout);
-            }
-            if (ds4_engine_create_with_gpu_config(
-                    &engine, &cfg.engine, &gpu_cfg) != 0) return 1;
-        }
-    } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+    if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         return 1;
     }
 
@@ -17354,31 +17253,18 @@ static void test_reasoning_effort_mapping(void) {
     TEST_ASSERT(!parse_reasoning_effort_name("banana", &mode));
     TEST_ASSERT(think_mode_from_enabled(true, DS4_THINK_LOW) == DS4_THINK_LOW);
     TEST_ASSERT(think_mode_from_enabled(false, DS4_THINK_LOW) == DS4_THINK_NONE);
-    TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_LOW), "Reasoning Effort: High"));
-    TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_MEDIUM), "Reasoning Effort: High"));
     TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX, 32768) == DS4_THINK_HIGH);
     TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX,
                                            (int)ds4_think_max_min_context()) == DS4_THINK_MAX);
 }
 
 static void test_model_alias_thinking_controls(void) {
-    TEST_ASSERT(model_alias_disables_thinking("deepseek-chat"));
-    TEST_ASSERT(model_alias_disables_thinking("glm-5.2-chat"));
-    TEST_ASSERT(model_alias_disables_thinking("glm-5.2-no-think"));
-    TEST_ASSERT(model_alias_disables_thinking("zai/glm-5.2-chat"));
-    TEST_ASSERT(!model_alias_disables_thinking("glm-5.2"));
-    TEST_ASSERT(model_alias_enables_thinking("deepseek-reasoner"));
-    TEST_ASSERT(model_alias_enables_thinking("glm-5.2-reasoner"));
-    TEST_ASSERT(model_alias_enables_thinking("zai/glm-5.2-reasoner"));
-    TEST_ASSERT(server_model_alias_known("glm-5.2-chat"));
-    TEST_ASSERT(server_model_alias_known("glm-5.2-reasoner"));
-    TEST_ASSERT(model_alias_disables_thinking("glm-5.3-flash-chat"));
-    TEST_ASSERT(model_alias_disables_thinking("zai/glm-5.3-flash-chat"));
-    TEST_ASSERT(model_alias_enables_thinking("glm-5.3-flash-reasoner"));
-    TEST_ASSERT(model_alias_enables_thinking("zai/glm-5.3-flash-reasoner"));
-    TEST_ASSERT(server_model_alias_known("glm-5.3-flash"));
-    TEST_ASSERT(server_model_alias_known("glm-5.3-flash-chat"));
-    TEST_ASSERT(server_model_alias_known("glm-5.3-flash-reasoner"));
+    TEST_ASSERT(model_alias_disables_thinking("qwen3.8-flash-next-chat"));
+    TEST_ASSERT(model_alias_disables_thinking("qwen3.8-flash-next-no-think"));
+    TEST_ASSERT(model_alias_enables_thinking("qwen3.8-flash-next-reasoner"));
+    TEST_ASSERT(server_model_alias_known("qwen3.8-flash-next"));
+    TEST_ASSERT(server_model_alias_known("qwen/qwen3.8-flash-next-chat"));
+    TEST_ASSERT(!server_model_alias_known("other-model"));
 }
 
 static void test_api_thinking_controls_parse(void) {
@@ -22090,42 +21976,19 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_holds_partial_utf8_arguments();
     test_openai_tool_stream_handles_multiple_calls();
     test_streaming_holds_partial_utf8();
-    test_parse_short_dsml_and_canonical_suffix();
-    test_parse_glm_tool_call_message();
-    test_dsml_parser_recovers_loose_nested_parameters();
-    test_dsml_repair_produces_parseable_calls();
+    /* sf-ablate(models): legacy DSML/GLM protocol tests removed; Qwen tool syntax remains below. */
     test_tool_parse_failure_returns_recoverable_finish();
-    test_invalid_dsml_tool_error_suffix_includes_system_prompt();
-    test_invalid_glm_tool_error_suffix();
     test_tool_recovery_output_budget();
     test_incomplete_tool_call_keeps_stop_reason();
     test_invalid_qwen_tool_error_suffix();
-    test_thinking_dsml_is_not_executable_before_think_close();
-    test_thinking_dsml_after_think_close_is_executable();
-    test_tool_checkpoint_suffix_is_future_prompt_canonical();
-    test_glm_tool_checkpoint_suffix_is_canonical();
-    test_tool_checkpoint_minifies_json_parameters();
-    test_tool_memory_replays_sampled_dsml();
-    test_anthropic_tool_memory_replays_sampled_dsml();
-    test_anthropic_live_tail_renders_tool_results_only();
-    test_anthropic_tool_result_id_validation();
-    test_anthropic_full_replay_allows_unknown_live_id();
-    test_anthropic_tool_use_parses_before_role();
-    test_tool_checkpoint_canonicalization_gate_exact_replay();
-    test_responses_live_tail_renders_tool_outputs_only();
     test_responses_tool_output_id_validation();
     test_responses_stateless_tool_replay_requires_reasoning();
-    test_responses_visible_suffix_matches_client_replay();
     test_exact_dsml_tool_replay_can_be_disabled();
-    test_dsml_decode_state_separates_structure_and_payload();
-    test_decode_tracker_split_parameter_close();
-    test_glm_decode_tracker_boundaries();
     test_tool_control_text_inside_arguments();
     test_tool_body_escape_round_trip();
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();
-    test_thinking_checkpoint_canonical_matches_future_prompt();
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();

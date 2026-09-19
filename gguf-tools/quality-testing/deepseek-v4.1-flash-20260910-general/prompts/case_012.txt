@@ -1,1 +1,0 @@
-Confronta mmap dei pesi e copia completa dei pesi su macOS.

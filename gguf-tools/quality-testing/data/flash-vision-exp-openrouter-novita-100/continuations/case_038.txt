@@ -1,3 +1,0 @@
-Per capire perché raggruppare gli esperti MoE (Mixture of Experts) accelera il **prefill** (la fase di elaborazione del prompt), dobbiamo prima distinguere il prefill dal decoding e poi analizzare i colli di bottiglia computazionali.
-
-### Il

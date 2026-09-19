@@ -1,1 +1,0 @@
-Su macOS, il confronto tra **mmap dei pesi** e **copia completa dei pesi** è

@@ -1,3 +1,0 @@
-This is an open-ended comment completion task. The way you'd finish it depends on what the lock actually guards. Common, idiomatic completions include:
-
-```

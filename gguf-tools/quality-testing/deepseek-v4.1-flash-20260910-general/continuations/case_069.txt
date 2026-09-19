@@ -1,4 +1,0 @@
-# PR Review Checklist: Memory Lifetimes
-
-## Ownership & Borrowing
-- [ ] New `clone()`/`copy()` calls are intentional, not just

@@ -4759,6 +4759,7 @@ static NSString *ds4_gpu_full_source(void) {
      * Metal library.  Environment overrides are still honored so a diagnostic
      * run can swap one source file without changing the executable.
      */
+    /* sf-keep: upstream eagerly initializes shared pipelines; remove foreign kernel files only after that registry is Qwen-only. */
     NSArray<NSArray<NSString *> *> *required_sources = @[
         @[@"DS4_METAL_FLASH_ATTN_SOURCE", @"metal/flash_attn.metal"],
         @[@"DS4_METAL_DENSE_SOURCE",      @"metal/dense.metal"],

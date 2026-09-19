@@ -1,1 +1,0 @@
-To understand why **KV cache checkpointing** is a game-changer for agentic sessions, we first need to understand the

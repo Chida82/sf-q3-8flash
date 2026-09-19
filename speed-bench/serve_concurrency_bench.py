@@ -29,7 +29,7 @@ Only the standard library is used, like the other tools in this directory.
 
 Example:
 
-  ./ds4-server --ctx 32768 --batched-session 8 &
+  ./sf-q3-8flash-server --ctx 32768 --batched-session 8 &
   python3 speed-bench/serve_concurrency_bench.py \\
       --concurrency 8 --prompt-tokens 4096 --max-tokens 128 --requests 32
 """
@@ -322,7 +322,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Concurrent serving benchmark for ds4-server",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8004")
     parser.add_argument("--model", default="qwen3.8-flash-next")
     parser.add_argument("--prompt-file", default="speed-bench/promessi_sposi.txt")
     parser.add_argument("--prompt-tokens", type=int, default=1024,

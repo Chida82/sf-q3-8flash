@@ -1,6 +1,5 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
-#include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_tp.h"
 
@@ -36,14 +35,11 @@ extern int cudaProfilerStop(void) __attribute__((weak));
 
 typedef struct {
     const char *model_path;
-    const char *mtp_path;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
     const char *csv_path;
     const char *expert_profile_path;
-    const char *gpu_vram_arg;
-    const char *gpu_devices_arg;
     ds4_backend backend;
     int threads;
     int ctx_start;
@@ -67,12 +63,8 @@ typedef struct {
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
-    bool cuda_tensor_parallel;
     bool show_output;
     bool teacher_forced_decode;
-    bool dspark;
-    bool dspark_confidence_threshold_set;
-    float dspark_confidence_threshold;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -147,29 +139,18 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 }
 
 static ds4_backend parse_backend(const char *s, const char *opt) {
+    (void)opt;
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
-#ifdef DS4_ROCM_BUILD
-    if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
-#else
-    if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
-#endif
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
-    fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", opt, s);
-#ifdef DS4_ROCM_BUILD
-    fprintf(stderr, "ds4-bench: valid backends are: metal, rocm, cpu\n");
-#else
-    fprintf(stderr, "ds4-bench: valid backends are: metal, cuda, cpu\n");
-#endif
+    fprintf(stderr, "ds4-bench: invalid backend: %s (expected metal or cpu)\n", s);
     exit(2);
 }
 
 static ds4_backend default_backend(void) {
 #ifdef DS4_NO_GPU
     return DS4_BACKEND_CPU;
-#elif defined(__APPLE__)
-    return DS4_BACKEND_METAL;
 #else
-    return DS4_BACKEND_CUDA;
+    return DS4_BACKEND_METAL;
 #endif
 }
 
@@ -214,7 +195,7 @@ static char *read_file(const char *path) {
 
 static bench_config parse_options(int argc, char **argv) {
     bench_config c = {
-        .model_path = "ds4flash.gguf",
+        .model_path = SF_DEFAULT_MODEL, /* sf: child-specific default model. */
         .system = "You are a helpful assistant.",
         .backend = default_backend(),
         .ctx_start = 2048,
@@ -268,19 +249,6 @@ static bench_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--mtp-model")) {
-            c.mtp_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--dspark")) {
-            c.dspark = true;
-        } else if (!strcmp(arg, "--dspark-confidence")) {
-            const double v = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
-            if (v < 0.0 || v > 1.0) {
-                fprintf(stderr, "ds4-bench: --dspark-confidence must be between 0 and 1\n");
-                exit(2);
-            }
-            c.dspark = true;
-            c.dspark_confidence_threshold = (float)v;
-            c.dspark_confidence_threshold_set = true;
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -311,19 +279,6 @@ static bench_config parse_options(int argc, char **argv) {
             c.backend = parse_backend(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--metal")) {
             c.backend = DS4_BACKEND_METAL;
-#ifdef DS4_ROCM_BUILD
-        } else if (!strcmp(arg, "--rocm")) {
-            c.backend = DS4_BACKEND_CUDA;
-#else
-        } else if (!strcmp(arg, "--cuda")) {
-            c.backend = DS4_BACKEND_CUDA;
-#endif
-        } else if (!strcmp(arg, "--gpu-vram")) {
-            c.gpu_vram_arg = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--gpu-devices")) {
-            c.gpu_devices_arg = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--cuda-tensor-parallel")) {
-            c.cuda_tensor_parallel = true;
         } else if (!strcmp(arg, "--cpu")) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {
@@ -384,16 +339,6 @@ static bench_config parse_options(int argc, char **argv) {
 
     if (!!c.prompt_path == !!c.chat_prompt_path) {
         fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file or --chat-prompt-file\n");
-        exit(2);
-    }
-    if (c.dspark && !c.mtp_path) {
-        fprintf(stderr, "ds4-bench: --dspark requires --mtp-model FILE\n");
-        exit(2);
-    }
-    if (c.dspark && c.teacher_forced_decode) {
-        fprintf(stderr,
-                "ds4-bench: --dspark cannot be combined with "
-                "--teacher-forced-decode\n");
         exit(2);
     }
     if (c.ctx_start > c.ctx_max) {
@@ -631,23 +576,8 @@ int main(int argc, char **argv) {
     int placement_ctx_hint = cfg.ctx_max;
     if (cfg.ctx_alloc > placement_ctx_hint) placement_ctx_hint = cfg.ctx_alloc;
 
-    ds4_gpu_config gpu_cfg = {0};
-    bool skip_cuda = false;
-    const bool have_gpu_config = cfg.gpu_vram_arg || cfg.gpu_devices_arg;
-    if (have_gpu_config) {
-        char gpu_err[256];
-        if (parse_gpu_vram_arg(cfg.gpu_vram_arg, cfg.gpu_devices_arg,
-                               &gpu_cfg, &skip_cuda,
-                               gpu_err, sizeof(gpu_err)) != 0) {
-            fprintf(stderr, "ds4-bench: %s\n", gpu_err);
-            return 2;
-        }
-        cfg.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
-    }
-
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
-        .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_alloc,
@@ -660,10 +590,6 @@ int main(int argc, char **argv) {
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
-        .dspark = cfg.dspark,
-        .dspark_confidence_threshold = cfg.dspark_confidence_threshold,
-        .dspark_confidence_threshold_set = cfg.dspark_confidence_threshold_set,
-        .cuda_tensor_parallel = cfg.cuda_tensor_parallel,
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
@@ -682,21 +608,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     ds4_engine *engine = NULL;
-    if (have_gpu_config && !skip_cuda) {
-        const bool was_auto =
-            (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "auto")) ||
-            (!cfg.gpu_vram_arg && cfg.gpu_devices_arg);
-        char layout[256];
-        if (format_gpu_layout_line(&gpu_cfg, was_auto,
-                                   layout, sizeof(layout)) > 0) {
-            fprintf(stdout, "%s\n", layout);
-            fflush(stdout);
-        }
-        if (ds4_engine_create_with_gpu_config(
-                &engine, &opt, &gpu_cfg) != 0) return 1;
-    } else if (ds4_engine_open(&engine, &opt) != 0) {
-        return 1;
-    }
+    if (ds4_engine_open(&engine, &opt) != 0) return 1;
     ds4_tp *tp_leader = NULL;
     if (cfg.tp.role == DS4_TP_LEADER) {
         ds4_tp_identity tp_id = {
@@ -786,20 +698,7 @@ int main(int argc, char **argv) {
     const bool distributed =
         cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR ||
         cfg.tp.role == DS4_TP_LEADER;
-    const bool speculative = cfg.dspark && ds4_engine_mtp_draft_tokens(engine) > 1;
-    if (cfg.dspark && !speculative) {
-        fprintf(stderr, "ds4-bench: DSpark support model did not enable speculative decoding\n");
-        if (out != stdout) fclose(out);
-        ds4_session_free(session);
-        ds4_tokens_free(&prompt);
-        close_engine(engine, tp_leader);
-        return 1;
-    }
-    if (speculative) {
-        fprintf(stderr,
-                "ds4-bench: DSpark enabled with draft width %d; frontier restoration uses session snapshots\n",
-                ds4_engine_mtp_draft_tokens(engine));
-    }
+    const bool speculative = false; /* sf-ablate(specdec): benchmark has no external DSpark path. */
     ds4_session_snapshot snap = {0};
     const uint64_t snapshot_max_bytes = bench_snapshot_max_bytes();
     bool warned_large_snapshot = false;

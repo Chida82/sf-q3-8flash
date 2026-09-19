@@ -1,3 +1,0 @@
-Here is a comprehensive checklist for validating that a quantized model still follows instructions effectively. 
-
-Quantization (especially lower-bit

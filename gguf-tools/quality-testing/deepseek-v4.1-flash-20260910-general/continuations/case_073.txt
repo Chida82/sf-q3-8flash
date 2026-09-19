@@ -1,3 +1,0 @@
-# Esempio di Race Condition in C
-
-Una **race condition** si verifica quando due o più thread accedono contemporaneamente a una risors

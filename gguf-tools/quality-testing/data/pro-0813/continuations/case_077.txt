@@ -1,1 +1,0 @@
-La residenza delle pagine `mmap` può differire dalla dimensione virtuale per diversi motivi fondamentali

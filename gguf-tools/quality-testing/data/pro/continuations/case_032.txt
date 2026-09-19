@@ -1,3 +1,0 @@
-Certamente! Ecco la differenza tra **mutex** e **contatore atomico**:
-
-## **M

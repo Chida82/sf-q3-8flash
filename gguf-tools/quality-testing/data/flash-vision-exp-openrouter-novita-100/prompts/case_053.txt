@@ -1,1 +1,0 @@
-Dai uno schema JSON minimo per una tool call con nome e argomenti.

@@ -1,3 +1,0 @@
-Here's a comprehensive approach to test that a file-backed mmap is not repeatedly remapped:
-
-## 1. **

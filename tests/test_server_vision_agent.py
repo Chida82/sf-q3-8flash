@@ -9,10 +9,10 @@ import shutil
 import subprocess
 import sys
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--url", default="http://127.0.0.1:8080")
+parser.add_argument("--url", default="http://127.0.0.1:8004")
 parser.add_argument("--pi", type=Path, required=True)
 parser.add_argument("--output", type=Path, required=True)
-parser.add_argument("--model", default="deepseek-v4-flash")
+parser.add_argument("--model", default="qwen3.8-flash-next")
 parser.add_argument("--api", action="append", choices=[
     "openai-completions", "openai-responses", "anthropic-messages"])
 args = parser.parse_args()
@@ -34,9 +34,9 @@ for api in args.api or ["openai-completions", "openai-responses", "anthropic-mes
     if api == "openai-completions":
         provider["compat"] = {"supportsDeveloperRole": False}
     (settings / "models.json").write_text(json.dumps({"providers": {"ds4": provider}}))
-    for name in ["text.png", "spatial.png"]:
-        shutil.copyfile(root / "tests/vision-fixtures/glm53" / name, project / name)
-    (project / "ticket.py").write_text("def ticket():\n    return {}\n\ndef shapes():\n    return []\n")
+    for name in ["orbit.png", "maple.png"]:
+        shutil.copyfile(root / "tests/vision-fixtures/qwen38" / name, project / name)
+    (project / "ticket.py").write_text("def orbit():\n    return {}\n\ndef maple():\n    return {}\n")
     (project / "CONTEXT.txt").write_text("\n".join(
         "Archive record %d: the build passed with no warnings." % i for i in range(200)))
     cmd = [str(args.pi.resolve()),
@@ -44,11 +44,10 @@ for api in args.api or ["openai-completions", "openai-responses", "anthropic-mes
            "--thinking", "off", "--no-session", "--no-extensions", "--no-skills",
            "--no-context-files", "--no-prompt-templates",
            "Read CONTEXT.txt for background, then read ticket.py. Use the read tool to inspect "
-           "text.png. Implement ticket() returning a dictionary with keys train (integer), "
-           "gate (string), access (string), using the actual image. After editing ticket(), "
-           "use read to inspect spatial.png. Implement shapes() returning a list of lowercase "
-           "color/shape strings like 'purple oval', using the actual shapes. "
-           "Read each image separately, in that order. Run Python to check the implementation. "
+           "orbit.png. Implement orbit() returning a dictionary with keys text and shape, using "
+           "the actual image. After editing ticket.py, inspect maple.png and implement maple() "
+           "with the same keys. Read each image separately, in that order. Run Python to check "
+           "the implementation. "
            "Do not create other files. Finish with a brief result."]
     (project / "command.json").write_text(json.dumps(cmd))
     with (project / "pi.jsonl").open("w") as log:
@@ -56,7 +55,7 @@ for api in args.api or ["openai-completions", "openai-responses", "anthropic-mes
                        env=dict(os.environ, PI_CODING_AGENT_DIR=str(settings),
                                 PATH=os.environ.get("PATH", "")),
                        timeout=600, check=True)
-    oracle = "import ticket; assert ticket.ticket() == {'train': 482, 'gate': 'C7', 'access': 'MINT-731'}; assert set(ticket.shapes()) == {'blue circle', 'red triangle', 'green square'}"
+    oracle = "import ticket; assert ticket.orbit() == {'text': 'ORBIT 4729', 'shape': 'red square'}; assert ticket.maple() == {'text': 'MAPLE 8153', 'shape': 'blue circle'}"
     subprocess.run([sys.executable, "-c", oracle], cwd=project, check=True)
     events = []
     saw_image = False
@@ -76,6 +75,6 @@ for api in args.api or ["openai-completions", "openai-responses", "anthropic-mes
         if event.get("type") == "tool_execution_start":
             events.append(event)
     read_images = [e for e in events if e.get("toolName") == "read" and
-                   any(name in json.dumps(e.get("args", {})) for name in ["text.png", "spatial.png"])]
+                   any(name in json.dumps(e.get("args", {})) for name in ["orbit.png", "maple.png"])]
     assert len(read_images) >= 2, "Pi did not actually read both images"
     print("PASS Pi " + api + ": both image reads, code edits, independent output oracle", flush=True)

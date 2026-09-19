@@ -1,3 +1,0 @@
-# Why Sorted Arrays Make Membership Tests Faster
-
-A **membership test** asks: "Is value `x` in this collection?" The speed difference comes

@@ -1,1 +1,0 @@
-Explain how a ring buffer wraps and how to avoid overwriting unread data.

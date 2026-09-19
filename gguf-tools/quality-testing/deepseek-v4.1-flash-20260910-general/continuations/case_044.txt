@@ -1,3 +1,0 @@
-# Testing that a File-Backed `mmap` Is Not Repeatedly Remapped
-
-"Not repeatedly remapped" typically means the kernel isn't tearing down

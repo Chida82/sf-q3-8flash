@@ -1,1 +1,0 @@
-Quali sono i pro e contro di top-p rispetto a temperatura zero?

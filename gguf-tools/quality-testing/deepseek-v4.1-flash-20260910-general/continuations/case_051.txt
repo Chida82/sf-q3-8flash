@@ -1,3 +1,0 @@
-# Perché piccole differenze nei logit possono cambiare una continuazione greedy
-
-In una decodifica greedy scegli a ogni passo il token con

@@ -1,3 +1,0 @@
-Certamente! Ti spiego la **softmax nell'attenzione** in modo semplice, passo dopo passo.
-
-##

@@ -1,3 +1,0 @@
-Here are three examples of useful server metrics, covering different critical aspects of server health:
-
-### 1. CPU Utilization (

@@ -1,3 +1,0 @@
-Il vantaggio principale della cache è **la velocità**.
-
-(If you need a more complete sentence, you could also

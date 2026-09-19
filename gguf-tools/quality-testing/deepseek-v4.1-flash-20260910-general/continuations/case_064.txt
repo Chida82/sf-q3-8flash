@@ -1,4 +1,0 @@
-# Latency vs. Throughput
-
-These two terms describe **different dimensions** of system performance, and confusing them is a common source of bad design decisions.
-

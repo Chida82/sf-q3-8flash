@@ -1,3 +1,0 @@
-# Confrontare due quantizzazioni senza fidarsi di una sola risposta
-
-Quando si confrontano due modelli quantizzati (es. Q4_K

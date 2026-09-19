@@ -1,3 +1,0 @@
-# Perché RMSNorm richiede somma dei quadrati e riscalamento
-
-RMSNorm (Root Mean Square Normalization) è una semplificazione

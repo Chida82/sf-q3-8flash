@@ -1,1 +1,0 @@
-Ecco una breve e pratica checklist per revisionare il lifetime della memoria (gestione della memoria) in una Pull Request

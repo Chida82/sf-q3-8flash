@@ -1,3 +1,0 @@
-# Perché il prefill GPU può essere più veloce del decode di un singolo token
-
-La differenza fondamentale sta nella **natura del carico

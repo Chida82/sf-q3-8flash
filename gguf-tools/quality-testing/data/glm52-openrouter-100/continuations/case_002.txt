@@ -1,1 +1,0 @@
-On macOS, when developing applications that use machine learning models (via frameworks like PyTorch, llama.cpp, or Apple

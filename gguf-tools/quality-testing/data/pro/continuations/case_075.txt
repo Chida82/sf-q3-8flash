@@ -1,1 +1,0 @@
-Un **trie** (o albero prefisso) rappresenta un insieme di stringhe come una struttura ad al

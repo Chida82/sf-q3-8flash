@@ -1,3 +1,0 @@
-# Top-p Sampling vs. Temperature-0 (Greedy) Decoding
-
-These are two different approaches to selecting the next token, and they optimize for

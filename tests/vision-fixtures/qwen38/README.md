@@ -9,7 +9,3 @@ Their dimensions require no resizing at the default 64–1024 token limits.
 The ORBIT fixture exposed Q8-versus-original checkpoint drift below the 0.99
 minimum per-token cosine threshold, while the same-weight Metal/HF comparison
 passed. Keep this fixture when changing quantized reference handling.
-
-The documented suite also uses the existing GLM fixtures for OCR, diagrams,
-photography and resize coverage. These are numerical comparisons; the metric
-does not grade generated image descriptions.

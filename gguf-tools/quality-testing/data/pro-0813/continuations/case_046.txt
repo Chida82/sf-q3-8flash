@@ -1,1 +1,0 @@
-In a mixture-of-experts (MoE) layer, the **router** (also called a **gating network

@@ -1,3 +1,0 @@
-# Safe Format for Storing a Model Checkpoint Header
-
-A checkpoint header should separate **untrusted metadata** from **the data payload**, be parseable

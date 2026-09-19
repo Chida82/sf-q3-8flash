@@ -1,1 +1,0 @@
-Ecco diverse strategie per testare che un `mmap` su file non venga rimappato ripet

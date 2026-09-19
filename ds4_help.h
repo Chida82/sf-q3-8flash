@@ -6,7 +6,6 @@
 typedef enum {
     DS4_HELP_DS4,
     DS4_HELP_SERVER,
-    DS4_HELP_AGENT,
     DS4_HELP_BENCH,
     DS4_HELP_EVAL,
 } ds4_help_tool;
