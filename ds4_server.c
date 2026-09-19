@@ -1185,59 +1185,36 @@ static bool parse_output_config_effort(const char **p, ds4_think_mode *effort) {
 }
 
 static bool model_alias_disables_thinking(const char *model) {
-    return model &&
-           (!strcmp(model, "deepseek-chat") ||
-            !strcmp(model, "qwen3.8-flash-next-chat") ||
-            !strcmp(model, "qwen3.8-flash-next-no-think") ||
-            !strcmp(model, "qwen3.8-flash-next-nothink") ||
-            !strcmp(model, "qwen/qwen3.8-flash-next-chat") ||
-            !strcmp(model, "glm-5.2-chat") ||
-            !strcmp(model, "glm-5.2-no-think") ||
-            !strcmp(model, "glm-5.2-nothink") ||
-            !strcmp(model, "zai/glm-5.2-chat") ||
-            !strcmp(model, "glm-5.3-flash-chat") ||
-            !strcmp(model, "glm-5.3-flash-no-think") ||
-            !strcmp(model, "glm-5.3-flash-nothink") ||
-            !strcmp(model, "zai/glm-5.3-flash-chat"));
+    return model && (!strcmp(model, "qwen3.8-flash-next-chat") ||
+                     !strcmp(model, "qwen3.8-flash-next-no-think") ||
+                     !strcmp(model, "qwen3.8-flash-next-nothink") ||
+                     !strcmp(model, "qwen/qwen3.8-flash-next-chat"));
 }
 
 static bool model_alias_enables_thinking(const char *model) {
-    return model &&
-           (!strcmp(model, "deepseek-reasoner") ||
-            !strcmp(model, "qwen3.8-flash-next-reasoner") ||
-            !strcmp(model, "qwen/qwen3.8-flash-next-reasoner") ||
-            !strcmp(model, "glm-5.2-reasoner") ||
-            !strcmp(model, "zai/glm-5.2-reasoner") ||
-            !strcmp(model, "glm-5.3-flash-reasoner") ||
-            !strcmp(model, "zai/glm-5.3-flash-reasoner"));
+    return model && (!strcmp(model, "qwen3.8-flash-next-reasoner") ||
+                     !strcmp(model, "qwen/qwen3.8-flash-next-reasoner"));
 }
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
-    if (ds4_engine_is_qwen4(engine)) return SERVER_MODEL_SYNTAX_QWEN;
-    return ds4_engine_is_glm_dsa(engine) ?
-           SERVER_MODEL_SYNTAX_GLM : ds4_engine_is_deepseek41(engine) ?
-           SERVER_MODEL_SYNTAX_DEEPSEEK41 : SERVER_MODEL_SYNTAX_DEEPSEEK;
+    (void)engine;
+    return SERVER_MODEL_SYNTAX_QWEN;
 }
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
-    if (ds4_engine_is_deepseek41(engine)) return "deepseek-v4.1-flash";
-    if (ds4_engine_is_qwen4(engine)) return "qwen3.8-flash-next";
-    if (ds4_engine_is_glm53(engine)) return "glm-5.3-flash";
-    if (ds4_engine_is_glm_dsa(engine)) return "glm-5.2";
-    return ds4_engine_model_id(engine) == 1 ?
-           "deepseek-v4-pro" : "deepseek-v4-flash";
+    (void)engine;
+    return "qwen3.8-flash-next";
 }
 
 static bool server_model_alias_known(const char *id) {
-    return id &&
-           (!strcmp(id, "qwen3.8-flash-next") ||
-            !strcmp(id, "qwen3.8-flash-next-chat") ||
-            !strcmp(id, "qwen3.8-flash-next-no-think") ||
-            !strcmp(id, "qwen3.8-flash-next-nothink") ||
-            !strcmp(id, "qwen3.8-flash-next-reasoner") ||
-            !strcmp(id, "qwen/qwen3.8-flash-next") ||
-            !strcmp(id, "qwen/qwen3.8-flash-next-chat") ||
-            !strcmp(id, "qwen/qwen3.8-flash-next-reasoner"));
+    return id && (!strcmp(id, "qwen3.8-flash-next") ||
+                  !strcmp(id, "qwen3.8-flash-next-chat") ||
+                  !strcmp(id, "qwen3.8-flash-next-no-think") ||
+                  !strcmp(id, "qwen3.8-flash-next-nothink") ||
+                  !strcmp(id, "qwen3.8-flash-next-reasoner") ||
+                  !strcmp(id, "qwen/qwen3.8-flash-next") ||
+                  !strcmp(id, "qwen/qwen3.8-flash-next-chat") ||
+                  !strcmp(id, "qwen/qwen3.8-flash-next-reasoner"));
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -19862,7 +19839,7 @@ static void test_request_parsers_reject_malformed_duplicate_owned_fields(void) {
     char err[128];
     request r;
     bool ok = parse_anthropic_request(NULL, NULL,
-        "{\"model\":\"deepseek-v4-flash\",\"max_tokens\":1,"
+        "{\"model\":\"qwen3.8-flash-next\",\"max_tokens\":1,"
         "\"system\":\"ok\",\"system\":\"bad\\q\","
         "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
         1, 100, &r, err, sizeof(err));
@@ -19870,7 +19847,7 @@ static void test_request_parsers_reject_malformed_duplicate_owned_fields(void) {
     if (ok) request_free(&r);
 
     ok = parse_chat_request(NULL, NULL,
-        "{\"model\":\"deepseek-v4-flash\",\"model\":\"bad\\q\","
+        "{\"model\":\"qwen3.8-flash-next\",\"model\":\"bad\\q\","
         "\"max_tokens\":1,\"messages\":[{\"role\":\"user\","
         "\"content\":\"hello\"}]}",
         1, 100, &r, err, sizeof(err));
@@ -19878,7 +19855,7 @@ static void test_request_parsers_reject_malformed_duplicate_owned_fields(void) {
     if (ok) request_free(&r);
 
     ok = parse_responses_request(NULL, NULL,
-        "{\"model\":\"deepseek-v4-flash\",\"model\":\"bad\\q\","
+        "{\"model\":\"qwen3.8-flash-next\",\"model\":\"bad\\q\","
         "\"max_output_tokens\":1,\"input\":\"hello\"}",
         1, 100, &r, err, sizeof(err));
     TEST_ASSERT(!ok);
@@ -20081,19 +20058,19 @@ static void test_tool_history_validation_handles_large_replays(void) {
 
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
-    append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
+    append_model_json_values(&b, "qwen3.8-flash-next", "Qwen3.8 Flash Next",
                              32768, 393216);
-    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
-    TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"qwen3.8-flash-next\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"name\":\"Qwen3.8 Flash Next\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":32768") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"ignore_eos\"") != NULL);
     buf_free(&b);
 
-    append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
+    append_model_json_values(&b, "qwen3.8-flash-next", "Qwen3.8 Flash Next",
                              100000, 4096);
-    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
-    TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"qwen3.8-flash-next\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"name\":\"Qwen3.8 Flash Next\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
     buf_free(&b);

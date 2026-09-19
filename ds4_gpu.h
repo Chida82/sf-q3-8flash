@@ -79,7 +79,6 @@ int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_commands_active(void);
-#include "ds4_deepseek41_gpu.h"
 #ifdef __APPLE__
 int ds4_gpu_parallel_ffn_finish(void);
 void ds4_gpu_parallel_ffn_abort(void);
@@ -3144,114 +3143,7 @@ int ds4_gpu_glm53_matmul_bf16_qkv(
         uint32_t              out_dim,
         const ds4_gpu_tensor *x);
 
-#ifndef DS4_GLM53_VISION_TYPES_DEFINED
-#define DS4_GLM53_VISION_TYPES_DEFINED
-#define DS4_GLM53_VISION_LAYERS 24u
-
-typedef struct {
-    uint64_t norm1;
-    uint64_t qkv_weight;
-    uint64_t qkv_bias;
-    uint64_t q_norm;
-    uint64_t k_norm;
-    uint64_t attn_proj_weight;
-    uint64_t attn_proj_bias;
-    uint64_t norm2;
-    uint64_t gate_weight;
-    uint64_t gate_bias;
-    uint64_t up_weight;
-    uint64_t up_bias;
-    uint64_t down_weight;
-    uint64_t down_bias;
-} ds4_glm53_vision_layer_weights;
-
-typedef struct {
-    uint64_t patch_weight;
-    uint64_t patch_bias;
-    uint64_t post_norm;
-    uint64_t downsample_weight;
-    uint64_t downsample_bias;
-    uint64_t merger_proj;
-    uint64_t merger_norm;
-    uint64_t merger_norm_bias;
-    uint64_t merger_gate;
-    uint64_t merger_up;
-    uint64_t merger_down;
-    ds4_glm53_vision_layer_weights layer[DS4_GLM53_VISION_LAYERS];
-} ds4_glm53_vision_weights;
-#endif
-
-/* Encode normalized, block-major image patches into 4096-wide language-model
- * embeddings. GPU implementations keep every intermediate on device. */
-int ds4_gpu_glm53_vision_encode(
-        float                          *out,
-        const float                    *patches,
-        uint32_t                        grid_h,
-        uint32_t                        grid_w,
-        const void                     *model_map,
-        uint64_t                        model_size,
-        const ds4_glm53_vision_weights *weights);
-
-#ifndef DS4_DEEPSEEK4_VISION_TYPES_DEFINED
-#define DS4_DEEPSEEK4_VISION_TYPES_DEFINED
-#define DS4_DEEPSEEK4_VISION_LAYERS 32u
-#define DS4_DEEPSEEK4_LANGUAGE_LAYERS 43u
-#define DS4_DEEPSEEK4_MTP_LAYERS 3u
-
-typedef struct {
-    uint64_t norm1;
-    uint64_t qkv_weight;
-    uint64_t qkv_bias;
-    uint64_t attn_proj_weight;
-    uint64_t attn_proj_bias;
-    uint64_t norm2;
-    uint64_t mlp_w1;
-    uint64_t mlp_w2;
-} ds4_deepseek4_vision_layer_weights;
-
-typedef struct {
-    uint64_t patch_weight;
-    uint64_t patch_bias;
-    uint64_t post_norm;
-    uint64_t aligner_w1;
-    uint64_t aligner_w1_bias;
-    uint64_t aligner_w2;
-    uint64_t aligner_w2_bias;
-    uint64_t image_start;
-    uint64_t image_pad;
-    uint64_t image_newline;
-    uint64_t image_end;
-    uint64_t visual_router_bias[DS4_DEEPSEEK4_LANGUAGE_LAYERS];
-    uint64_t mtp_visual_router_bias[DS4_DEEPSEEK4_MTP_LAYERS];
-    uint64_t hash_router_bias[3];
-    ds4_deepseek4_vision_layer_weights layer[DS4_DEEPSEEK4_VISION_LAYERS];
-    uint32_t projection_dim;
-} ds4_deepseek4_vision_weights;
-#endif
-
-/* Encode row-major normalized 14x14 RGB patches. The output is the natural
- * row-major 3x3-aligned grid; N-layout permutation and sentinels are applied
- * by the prompt layer once the image's token position is known. */
-int ds4_gpu_deepseek4_vision_encode(
-        float                              *out,
-        const float                        *patches,
-        uint32_t                            grid_h,
-        uint32_t                            grid_w,
-        const void                         *model_map,
-        uint64_t                            model_size,
-        const ds4_deepseek4_vision_weights *weights);
-
-/* Replace token rows with projected image embeddings and repeat each row into
- * every GLM hyperconnection stream. Must be called in an active command batch. */
-int ds4_gpu_glm53_scatter_image_hc(
-        ds4_gpu_tensor       *hc,
-        const ds4_gpu_tensor *image,
-        uint32_t              dst_row,
-        uint32_t              image_row,
-        uint32_t              rows,
-        uint32_t              total_rows,
-        uint32_t              n_embd,
-        uint32_t              n_hc);
+/* sf-ablate(vision): GLM and DeepSeek vision towers removed; Qwen has its own projector. */
 
 /* GLM-5.3 Kimi Delta Attention. Recurrent and convolution state stay FP32. */
 int ds4_gpu_glm53_kda_decode(

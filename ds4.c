@@ -1374,7 +1374,6 @@ static int ds4_expert_hotlist_sort_cmp(const void *a, const void *b) {
 }
 
 #include "ds4_streaming_hotlist.inc"
-#include "ds4_streaming_hotlist_glm52.inc"
 
 static void ds4_json_write_string(FILE *fp, const char *s) {
     fputc('"', fp);
@@ -16185,11 +16184,6 @@ typedef struct {
     ds4_gpu_tensor *tp_zero;
     ds4_gpu_tensor *tp_logits_half;
 
-    /* DeepSeek Vision-Exp prefill routing state. The engine owns both the
-     * sidecar mapping and this immutable descriptor for the graph lifetime. */
-    const void *vision_model_map;
-    uint64_t vision_model_size;
-    const ds4_deepseek4_vision_weights *deepseek4_vision_weights;
     const int32_t *prefill_host_tokens;
     uint32_t prefill_host_pos0;
     uint32_t prefill_host_count;
@@ -21651,51 +21645,7 @@ static uint32_t metal_graph_streaming_builtin_hotness(uint32_t remaining,
 #endif
 }
 
-static bool metal_graph_streaming_expert_hotlist_load_default(
-        uint32_t    max_entries,
-        int32_t     experts[DS4_MAX_LAYER][DS4_MAX_EXPERT],
-        uint32_t    priorities[DS4_MAX_LAYER][DS4_MAX_EXPERT],
-        uint32_t    counts[DS4_MAX_LAYER],
-        bool        seen[DS4_MAX_LAYER][DS4_MAX_EXPERT],
-        uint32_t   *loaded_out) {
-    if (max_entries == 0 || !experts || !priorities || !counts || !seen || !loaded_out) {
-        return false;
-    }
-    const uint16_t (*hotlist)[2] = NULL;
-    uint32_t hotlist_count = 0;
-    if (g_ds4_shape.variant == DS4_VARIANT_PRO) {
-        hotlist = ds4_default_streaming_hotlist_pro;
-        hotlist_count = ds4_default_streaming_hotlist_pro_count;
-    } else if (g_ds4_shape.variant == DS4_VARIANT_FLASH) {
-        hotlist = ds4_default_streaming_hotlist_flash;
-        hotlist_count = ds4_default_streaming_hotlist_flash_count;
-    } else if (g_ds4_shape.variant == DS4_VARIANT_GLM52) {
-        hotlist = ds4_default_streaming_hotlist_glm52;
-        hotlist_count = ds4_default_streaming_hotlist_glm52_count;
-    } else {
-        *loaded_out = 0;
-        return true;
-    }
-    uint32_t loaded = 0;
-    for (uint32_t i = 0;
-         i < hotlist_count && loaded < max_entries;
-         i++) {
-        if (!metal_graph_streaming_expert_hotlist_add(
-                hotlist[i][0],
-                hotlist[i][1],
-                metal_graph_streaming_builtin_hotness(max_entries - loaded,
-                                                       max_entries),
-                experts,
-                priorities,
-                counts,
-                seen,
-                &loaded)) {
-            return false;
-        }
-    }
-    *loaded_out = loaded;
-    return true;
-}
+/* sf-ablate(streaming-hotlist): foreign-model preload tables removed. */
 
 static uint32_t metal_graph_streaming_expert_preload_count(
         const ds4_gpu_graph *g,
@@ -29117,72 +29067,11 @@ static bool metal_graph_upload_prompt_embeddings_hc_cpu(
     return ok;
 }
 
-static const float *metal_graph_visual_embedding_row(
-        const ds4_gpu_graph *g,
-        uint32_t             token_pos) {
-    if (!g || !g->prefill_vision_spans) return NULL;
-    for (size_t i = 0; i < g->prefill_vision_span_count; i++) {
-        const ds4_vision_span *span = &g->prefill_vision_spans[i];
-        const uint64_t begin = span->token_start;
-        const uint64_t end = begin + span->embedding.token_count;
-        if (token_pos >= begin && token_pos < end && span->embedding.data) {
-            return span->embedding.data +
-                   ((uint64_t)token_pos - begin) * DS4_N_EMBD;
-        }
-    }
-    return NULL;
-}
-
+/* sf-ablate(vision): foreign vision path removed. */
 /* DeepSeek image prompts use typed synthetic token ids for routing and
  * attention. Seed those rows from the vision encoder output instead of the
  * vocabulary table; regular rows retain the ordinary token embedding. */
-static bool metal_graph_upload_visual_prompt_embeddings_hc(
-        ds4_gpu_graph        *g,
-        ds4_gpu_tensor       *out_hc,
-        const ds4_model      *model,
-        const ds4_weights    *weights,
-        const token_vec      *prompt,
-        uint32_t              pos0,
-        uint32_t              n_tokens) {
-    if (!g || !out_hc || !model || !weights || !prompt ||
-        pos0 > (uint32_t)prompt->len ||
-        n_tokens > (uint32_t)prompt->len - pos0) return false;
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    const uint64_t total = (uint64_t)n_tokens * hc_dim;
-    if (total > SIZE_MAX / sizeof(float)) return false;
-    float *hc = xmalloc((size_t)total * sizeof(hc[0]));
-    float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(plain[0]));
-
-    bool ok = true;
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        const int token = prompt->v[pos0 + t];
-        const float *source = NULL;
-        if (token >= 0 && token < (int)DS4_N_VOCAB) {
-            embed_token_f16(model, weights, token, plain);
-            source = plain;
-        } else {
-            source = metal_graph_visual_embedding_row(g, pos0 + t);
-            if (!source) {
-                ok = false;
-                break;
-            }
-        }
-        float *dst = hc + (uint64_t)t * hc_dim;
-        for (uint32_t h = 0; h < DS4_N_HC; h++) {
-            memcpy(dst + (uint64_t)h * DS4_N_EMBD,
-                   source,
-                   (size_t)DS4_N_EMBD * sizeof(source[0]));
-        }
-    }
-    if (ok) {
-        ok = ds4_gpu_tensor_write(out_hc, 0, hc,
-                                  total * sizeof(hc[0])) != 0;
-    }
-    free(plain);
-    free(hc);
-    return ok;
-}
-
+/* sf-ablate(vision): foreign visual-prefill upload removed. */
 /* Seed the batched HC state from token ids: every HC stream starts as the same
  * 4096-wide embedding.  Long prefill chunks use the Metal get-rows/repeat
  * kernel so the CPU does not build and upload a large [token, HC, dim] tensor. */
@@ -29530,22 +29419,7 @@ static uint32_t metal_graph_tp_prefill_split_min(void) {
     return (uint32_t)cached;
 }
 
-static const int32_t *metal_graph_visual_tokens_for_batch(
-        const ds4_gpu_graph *g,
-        uint32_t             pos0,
-        uint32_t             n_tokens) {
-    if (!g || !g->deepseek4_vision_weights || !g->prefill_has_visual ||
-        !g->prefill_host_tokens || pos0 < g->prefill_host_pos0) return NULL;
-    const uint32_t off = pos0 - g->prefill_host_pos0;
-    if (off > g->prefill_host_count ||
-        n_tokens > g->prefill_host_count - off) return NULL;
-    const int32_t *tokens = g->prefill_host_tokens + off;
-    for (uint32_t i = 0; i < n_tokens; i++) {
-        if (tokens[i] >= (int32_t)DS4_N_VOCAB) return tokens;
-    }
-    return NULL;
-}
-
+/* sf-ablate(vision): foreign vision path removed. */
 static bool metal_graph_encode_layer_attention_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -29566,9 +29440,7 @@ static bool metal_graph_encode_layer_attention_batch(
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const bool compressed = ratio != 0;
     const bool zero_prefix = pos0 == 0;
-    const int32_t *visual_tokens =
-        metal_graph_visual_tokens_for_batch(g, pos0, n_tokens);
-    const bool visual_attention = visual_tokens != NULL;
+    const bool visual_attention = false;
     /* TP attention row split for large zero-prefix chunks: q_a and the KV
      * path stay full (both ranks need every row's KV, and the compressor/
      * indexer keep updating their state from full rows), q_b onward runs on
@@ -30011,7 +29883,7 @@ static bool metal_graph_encode_layer_attention_batch(
                     model->map, model->size, layer->attn_sinks->abs_offset,
                     metal_graph_batch_q(g), g->layer_raw_cache[il],
                     NULL, 0, NULL, 0,
-                    visual_tokens, DS4_N_VOCAB,
+                    NULL, DS4_N_VOCAB,
                     n_tokens, pos0, n_tokens, g->raw_cap, 0,
                     0, g->raw_window, 0,
                     DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
@@ -30074,7 +29946,7 @@ static bool metal_graph_encode_layer_attention_batch(
                     model->map, model->size, layer->attn_sinks->abs_offset,
                     metal_graph_batch_q(g), g->layer_raw_cache[il],
                     NULL, 0, NULL, 0,
-                    visual_tokens, DS4_N_VOCAB,
+                    NULL, DS4_N_VOCAB,
                     n_tokens, pos0, n_raw, g->raw_cap, raw_start,
                     0, g->raw_window, 0,
                     DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
@@ -30769,7 +30641,7 @@ static bool metal_graph_encode_layer_attention_batch(
                         metal_graph_attn_comp_cache_is_f16(),
                         use_indexed_comp ? metal_graph_comp_mask(g) : NULL,
                         use_indexed_comp ? 1u : 0u,
-                        visual_tokens, DS4_N_VOCAB,
+                        NULL, DS4_N_VOCAB,
                         n_tokens, pos0, n_raw, g->raw_cap, raw_start,
                         n_comp, g->raw_window, ratio,
                         DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
@@ -31500,29 +31372,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                               (uint64_t)n_tokens * sizeof(int32_t));
         ok = router_tokens != NULL;
     }
-    if (ok && g->deepseek4_vision_weights && g->prefill_has_visual) {
-        ok = ds4_gpu_router_select_batch_visual_tensor(
-                    metal_graph_batch_router_selected(g),
-                    metal_graph_batch_router_weights(g),
-                    metal_graph_batch_router_probs(g),
-                    model->map,
-                    model->size,
-                    layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
-                    layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
-                    layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
-                    layer->ffn_exp_probs_b != NULL,
-                    layer->ffn_gate_tid2eid != NULL,
-                    g->vision_model_map,
-                    g->vision_model_size,
-                    g->deepseek4_vision_weights->visual_router_bias[il],
-                    metal_graph_batch_router_logits(g),
-                    router_tokens,
-                    DS4_N_VOCAB,
-                    DS4_N_EXPERT,
-                    DS4_N_EXPERT_USED,
-                    DS4_EXPERT_WEIGHT_SCALE,
-                    n_tokens) != 0;
-    } else if (ok) {
+    if (ok) {
         ok = ds4_gpu_router_select_batch_tensor(
                     metal_graph_batch_router_selected(g),
                     metal_graph_batch_router_weights(g),
@@ -32630,13 +32480,6 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
                                                            &loaded)) {
             return false;
         }
-    } else if (!metal_graph_streaming_expert_hotlist_load_default(preload_count,
-                                                                  experts,
-                                                                  priorities,
-                                                                  counts,
-                                                                  seen,
-                                                                  &loaded)) {
-        return false;
     }
     if (loaded == 0) return true;
 
@@ -36192,14 +36035,6 @@ static bool metal_graph_prefill_layer_major(
     g->prefill_host_pos0 = start;
     g->prefill_host_count = n_tokens;
     g->prefill_has_visual = false;
-    if (g->deepseek4_vision_weights) {
-        for (uint32_t i = 0; i < n_tokens; i++) {
-            if (prompt->v[start + i] >= (int)DS4_N_VOCAB) {
-                g->prefill_has_visual = true;
-                break;
-            }
-        }
-    }
 
     if (display_progress)
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
@@ -36266,11 +36101,7 @@ static bool metal_graph_prefill_layer_major(
     }
 
     if (!split_commands) {
-        ok = g->prefill_has_visual ?
-            metal_graph_upload_visual_prompt_embeddings_hc(
-                g, metal_graph_batch_cur_hc(g), model, weights,
-                prompt, start, n_tokens) :
-            metal_graph_upload_prompt_embeddings_hc(
+        ok = metal_graph_upload_prompt_embeddings_hc(
                 metal_graph_batch_cur_hc(g), metal_graph_prefill_tokens(g),
                 model, weights, prompt, start, n_tokens);
         if (ok) ok = ds4_gpu_begin_commands() != 0;
@@ -36426,11 +36257,7 @@ static bool metal_graph_prefill_layer_major(
 #endif
 
     double t_layer0 = (profile || throttle) ? now_sec() : 0.0;
-    ok = g->prefill_has_visual ?
-        metal_graph_upload_visual_prompt_embeddings_hc(
-            g, metal_graph_batch_cur_hc(g), model, weights,
-            prompt, start, n_tokens) :
-        metal_graph_upload_prompt_embeddings_hc(
+    ok = metal_graph_upload_prompt_embeddings_hc(
             metal_graph_batch_cur_hc(g), metal_graph_prefill_tokens(g),
             model, weights, prompt, start, n_tokens);
     const double t_embed_encoded = (profile || throttle) ? now_sec() : 0.0;
@@ -36944,25 +36771,7 @@ static bool metal_graph_prefill_raw_swa(
                                            display_progress_ud);
 }
 
-static uint32_t metal_graph_visual_prefill_chunk(
-        const ds4_gpu_graph *g,
-        const token_vec     *prompt,
-        uint32_t             pos0,
-        uint32_t             end,
-        uint32_t             cap) {
-    const uint32_t normal = end - pos0 < cap ? end - pos0 : cap;
-    if (!g->deepseek4_vision_weights) return normal;
-    uint32_t chunk = 0;
-    if (!ds4_deepseek4_prefill_chunk(
-            prompt->v, end, DS4_N_VOCAB, pos0, cap, &chunk)) {
-        fprintf(stderr,
-                "ds4: malformed or oversized DeepSeek image token block at token %u\n",
-                pos0);
-        return 0;
-    }
-    return chunk;
-}
-
+/* sf-ablate(vision): foreign vision path removed. */
 /* Prefill a contiguous token range in fixed-size chunks.
  *
  * The common case starts at token zero, but server sessions also use this to
@@ -37045,12 +36854,7 @@ static bool metal_graph_prefill_chunked_range(
                 if (to_boundary < local_cap) local_cap = to_boundary;
             }
         }
-        if (g->deepseek4_vision_weights &&
-            prompt->v[pos0] >= (int)DS4_N_VOCAB) {
-            local_cap = chunk_cap;
-        }
         uint32_t chunk = remaining < local_cap ? remaining : local_cap;
-        chunk = metal_graph_visual_prefill_chunk(g, prompt, pos0, end, local_cap);
         if (chunk == 0) return false;
         const uint32_t chunk_end = pos0 + chunk;
         float *chunk_logits = (progress || chunk_end == end) ? logits : NULL;
@@ -38886,8 +38690,6 @@ struct ds4_engine {
     ds4_mtp_weights mtp_weights;
     ds4_dspark_weights dspark_weights;
 #ifndef DS4_NO_GPU
-    ds4_glm53_vision_weights vision_weights;
-    ds4_deepseek4_vision_weights deepseek4_vision_weights;
     ds4_qwen4_vision_weights qwen4_vision_weights;
 #endif
     ds4_vision_kind vision_kind;
@@ -49059,19 +48861,7 @@ static bool glm_graph_forward_tokens(
                                                DS4_N_EMBD,
                                                DS4_N_HC) != 0;
         }
-        for (size_t i = 0; ok && i < vision_overlay.count; i++) {
-            const glm_vision_overlay_segment *segment =
-                    &vision_overlay.segments[i];
-            ok = ds4_gpu_glm53_scatter_image_hc(
-                    g->glm53 ? hc_cur : cur,
-                    vision_overlay.tensor,
-                    segment->dst_row,
-                    segment->src_row,
-                    segment->rows,
-                    n_tokens,
-                    DS4_N_EMBD,
-                    g->glm53 ? DS4_N_HC : 1u) != 0;
-        }
+        /* sf-ablate(vision): GLM-only image overlay removed. */
         if (trace) {
             const double ms = (now_sec() - t0) * 1000.0;
             if (trace_all || ms >= trace_slow_ms || !ok) {
@@ -50344,19 +50134,7 @@ static bool glm_graph_forward_indexed_tokens(
                                                DS4_N_EMBD,
                                                DS4_N_HC) != 0;
         }
-        for (size_t i = 0; ok && i < vision_overlay.count; i++) {
-            const glm_vision_overlay_segment *segment =
-                    &vision_overlay.segments[i];
-            ok = ds4_gpu_glm53_scatter_image_hc(
-                    g->glm53 ? hc_cur : cur,
-                    vision_overlay.tensor,
-                    segment->dst_row,
-                    segment->src_row,
-                    segment->rows,
-                    n_tokens,
-                    DS4_N_EMBD,
-                    g->glm53 ? DS4_N_HC : 1u) != 0;
-        }
+        /* sf-ablate(vision): GLM-only image overlay removed. */
         if (trace) {
             const double ms = (now_sec() - t0) * 1000.0;
             if (trace_all || ms >= trace_slow_ms || !ok) {
@@ -67855,152 +67633,7 @@ void ds4_vision_embedding_free(ds4_vision_embedding *embedding) {
 
 #define DS4_VISION_LAYOUT_DEEPSEEK4_NATURAL 1u
 
-#ifndef DS4_NO_GPU
-static float ds4_vision_bf16_to_f32(uint16_t value) {
-    uint32_t bits = (uint32_t)value << 16;
-    float result;
-    memcpy(&result, &bits, sizeof(result));
-    return result;
-}
-
-static const uint16_t *ds4_deepseek4_vision_vector(
-        const ds4_engine *e,
-        uint64_t offset) {
-    const uint64_t bytes = (uint64_t)DS4_N_EMBD * sizeof(uint16_t);
-    if (!e || !e->vision_model.map || offset > e->vision_model.size ||
-        bytes > e->vision_model.size - offset) return NULL;
-    return (const uint16_t *)((const uint8_t *)e->vision_model.map + offset);
-}
-
-static int ds4_prompt_append_deepseek4_vision(
-        ds4_engine *e,
-        ds4_tokens *tokens,
-        ds4_vision_span *span,
-        ds4_vision_embedding *embedding,
-        char *error,
-        size_t error_cap) {
-    if (embedding->layout != DS4_VISION_LAYOUT_DEEPSEEK4_NATURAL ||
-        embedding->grid_height == 0 || embedding->grid_width == 0 ||
-        embedding->token_count !=
-            embedding->grid_height * embedding->grid_width) {
-        if (error && error_cap)
-            snprintf(error, error_cap, "invalid DeepSeek vision embedding layout");
-        return 0;
-    }
-    ds4_deepseek4_image_layout layout = {0};
-    const bool v41 = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
-    const bool layout_ok = v41 ? ds4_deepseek41_image_layout_build(
-            &layout, embedding->grid_height, embedding->grid_width, error, error_cap) :
-        ds4_deepseek4_image_layout_build(
-            &layout, embedding->grid_height, embedding->grid_width,
-            (uint32_t)tokens->len, error, error_cap);
-    if (!layout_ok) return 0;
-    if (layout.image_count != embedding->token_count ||
-        layout.token_count > (uint32_t)(INT_MAX - tokens->len)) {
-        ds4_deepseek4_image_layout_free(&layout);
-        if (error && error_cap)
-            snprintf(error, error_cap, "DeepSeek vision prompt is too large");
-        return 0;
-    }
-    const uint64_t values = (uint64_t)layout.token_count * DS4_N_EMBD;
-    if (values > SIZE_MAX / sizeof(float)) {
-        ds4_deepseek4_image_layout_free(&layout);
-        if (error && error_cap)
-            snprintf(error, error_cap, "DeepSeek vision embedding is too large");
-        return 0;
-    }
-    float *block = malloc((size_t)values * sizeof(float));
-    if (!block) {
-        ds4_deepseek4_image_layout_free(&layout);
-        if (error && error_cap)
-            snprintf(error, error_cap, "unable to allocate DeepSeek image block");
-        return 0;
-    }
-    const ds4_deepseek4_vision_weights *w = &e->deepseek4_vision_weights;
-    const uint16_t *sentinel[5] = {
-        ds4_deepseek4_vision_vector(e, w->image_start),
-        v41 ? NULL : ds4_deepseek4_vision_vector(e, w->image_pad),
-        NULL,
-        ds4_deepseek4_vision_vector(e, w->image_newline),
-        ds4_deepseek4_vision_vector(e, w->image_end),
-    };
-    if (!sentinel[DS4_DEEPSEEK4_IMAGE_START] ||
-        (!v41 && !sentinel[DS4_DEEPSEEK4_IMAGE_PAD]) ||
-        !sentinel[DS4_DEEPSEEK4_IMAGE_NEWLINE] ||
-        !sentinel[DS4_DEEPSEEK4_IMAGE_END]) {
-        free(block);
-        ds4_deepseek4_image_layout_free(&layout);
-        if (error && error_cap)
-            snprintf(error, error_cap, "DeepSeek vision sentinels are not mapped");
-        return 0;
-    }
-
-    uint32_t image_pos = 0;
-    for (uint32_t row = 0; row < layout.token_count; row++) {
-        const uint8_t type = layout.types[row];
-        float *dst = block + (uint64_t)row * DS4_N_EMBD;
-        if (type == DS4_DEEPSEEK4_IMAGE) {
-            if (image_pos >= layout.image_count) {
-                free(block);
-                ds4_deepseek4_image_layout_free(&layout);
-                if (error && error_cap)
-                    snprintf(error, error_cap,
-                             "invalid DeepSeek image embedding permutation");
-                return 0;
-            }
-            const uint32_t source = layout.perm[image_pos++];
-            memcpy(dst, embedding->data + (uint64_t)source * DS4_N_EMBD,
-                   DS4_N_EMBD * sizeof(float));
-        } else {
-            const uint16_t *src = sentinel[type];
-            for (uint32_t d = 0; d < DS4_N_EMBD; d++)
-                dst[d] = ds4_vision_bf16_to_f32(src[d]);
-        }
-    }
-    if (image_pos != layout.image_count) {
-        free(block);
-        ds4_deepseek4_image_layout_free(&layout);
-        if (error && error_cap)
-            snprintf(error, error_cap,
-                     "invalid DeepSeek image embedding count");
-        return 0;
-    }
-
-    const uint32_t token_start = (uint32_t)tokens->len;
-    for (uint32_t i = 0; i < layout.token_count; i++) {
-        ds4_tokens_push(tokens, v41 ? e->vision_image_token : (int)(DS4_N_VOCAB + layout.types[i]));
-    }
-    free(embedding->data);
-    embedding->data = block;
-    embedding->token_count = layout.token_count;
-    embedding->layout = 0;
-    embedding->grid_width = 0;
-    embedding->grid_height = 0;
-    memset(span, 0, sizeof(*span));
-    span->token_start = token_start;
-    span->embedding = *embedding;
-    memset(embedding, 0, sizeof(*embedding));
-    ds4_deepseek4_image_layout_free(&layout);
-    return 1;
-}
-#else
-static int ds4_prompt_append_deepseek4_vision(
-        ds4_engine *e,
-        ds4_tokens *tokens,
-        ds4_vision_span *span,
-        ds4_vision_embedding *embedding,
-        char *error,
-        size_t error_cap) {
-    (void)e;
-    (void)tokens;
-    (void)span;
-    (void)embedding;
-    if (error && error_cap)
-        snprintf(error, error_cap,
-                 "DeepSeek vision requires a GPU backend");
-    return 0;
-}
-#endif
+/* sf-ablate(vision): DeepSeek prompt rendering removed. */
 
 int ds4_prompt_append_vision(
         ds4_engine *e,
@@ -68013,10 +67646,6 @@ int ds4_prompt_append_vision(
         embedding->token_count == 0 || !e->vision_ready) {
         if (error && error_cap) snprintf(error, error_cap, "invalid vision prompt input");
         return 0;
-    }
-    if (e->vision_kind == DS4_VISION_DEEPSEEK4) {
-        return ds4_prompt_append_deepseek4_vision(
-                e, tokens, span, embedding, error, error_cap);
     }
     if ((uint64_t)tokens->len + embedding->token_count + 2u > INT_MAX) {
         if (error && error_cap) snprintf(error, error_cap, "vision prompt is too large");
@@ -68197,64 +67826,26 @@ static int ds4_engine_vision_encode_image(
     uint32_t grid_width = 0, grid_height = 0;
     uint32_t layout = 0;
     int ok = 0;
-    if (e->vision_kind == DS4_VISION_DEEPSEEK4) {
-        ds4_deepseek4_image_patches patches = {0};
-        const bool preprocessed = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ?
-            ds4_image_preprocess_deepseek41(&patches, image, error, error_cap) :
-            ds4_image_preprocess_deepseek4(&patches, image, error, error_cap);
-        if (!preprocessed) return 0;
-        token_count = patches.llm_grid_height * patches.llm_grid_width;
-        embedding = malloc((size_t)token_count * DS4_N_EMBD * sizeof(float));
-        if (embedding) {
-#ifndef DS4_NO_GPU
-            ok = ds4_gpu_deepseek4_vision_encode(
-                    embedding, patches.patches,
-                    patches.grid_height, patches.grid_width,
-                    e->vision_model.map, e->vision_model.size,
-                    &e->deepseek4_vision_weights);
-#endif
-        }
-        content_width = patches.content_width;
-        content_height = patches.content_height;
-        grid_width = patches.llm_grid_width;
-        grid_height = patches.llm_grid_height;
-        layout = DS4_VISION_LAYOUT_DEEPSEEK4_NATURAL;
-        ds4_deepseek4_image_patches_free(&patches);
-    } else if (e->vision_kind == DS4_VISION_QWEN4) {
-#ifdef DS4_HAS_QWEN4_GPU
-        ds4_image_patches patches = {0};
-        if (!qwen4_vision_encode_image(&e->vision_model, &e->qwen4_vision_weights, image, 64u,
-                                       qwen4_vision_max_tokens(), &embedding, &patches, error, error_cap)) {
-            ds4_image_patches_free(&patches);
-            return 0;
-        }
-        ok = 1;
-        token_count = patches.image_token_count;
-        content_width = patches.content_width;
-        content_height = patches.content_height;
-        grid_width = patches.grid_width / 2u;
-        grid_height = patches.grid_height / 2u;
-        ds4_image_patches_free(&patches);
-#endif
-    } else {
-        ds4_image_patches patches = {0};
-        if (!ds4_image_preprocess_glm53(&patches, image, 16u, 8000u,
-                                        error, error_cap)) return 0;
-        token_count = patches.image_token_count;
-        embedding = malloc((size_t)token_count * 4096u * sizeof(float));
-        if (embedding) {
-#ifndef DS4_NO_GPU
-            ok = ds4_gpu_glm53_vision_encode(
-                    embedding, patches.patches,
-                    patches.grid_height, patches.grid_width,
-                    e->vision_model.map, e->vision_model.size,
-                    &e->vision_weights);
-#endif
-        }
-        content_width = patches.content_width;
-        content_height = patches.content_height;
-        ds4_image_patches_free(&patches);
+    /* sf-ablate(vision): only Qwen3-VL projectors are accepted by this child. */
+    if (e->vision_kind != DS4_VISION_QWEN4) {
+        if (error && error_cap) snprintf(error, error_cap, "unsupported vision projector");
+        return 0;
     }
+#ifdef DS4_HAS_QWEN4_GPU
+    ds4_image_patches patches = {0};
+    if (!qwen4_vision_encode_image(&e->vision_model, &e->qwen4_vision_weights, image, 64u,
+                                   qwen4_vision_max_tokens(), &embedding, &patches, error, error_cap)) {
+        ds4_image_patches_free(&patches);
+        return 0;
+    }
+    ok = 1;
+    token_count = patches.image_token_count;
+    content_width = patches.content_width;
+    content_height = patches.content_height;
+    grid_width = patches.grid_width / 2u;
+    grid_height = patches.grid_height / 2u;
+    ds4_image_patches_free(&patches);
+#endif
     if (!embedding) {
         if (error && error_cap)
             snprintf(error, error_cap, "unable to allocate vision output");
@@ -68263,9 +67854,7 @@ static int ds4_engine_vision_encode_image(
     if (!ok) {
         free(embedding);
         if (error && error_cap)
-            snprintf(error, error_cap, "%s vision inference failed",
-                     e->vision_kind == DS4_VISION_DEEPSEEK4 ? "DeepSeek V4" :
-                     e->vision_kind == DS4_VISION_QWEN4 ? "Qwen3.8" : "GLM-5.3");
+            snprintf(error, error_cap, "Qwen3.8 vision inference failed");
         return 0;
     }
     out->data = embedding;
@@ -69076,11 +68665,6 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->graph.ssd_streaming = e->ssd_streaming;
     s->graph.ssd_streaming_cold = e->ssd_streaming_cold;
     s->graph.streaming_preload_experts = e->ssd_streaming_preload_experts;
-    if (e->vision_kind == DS4_VISION_DEEPSEEK4) {
-        s->graph.vision_model_map = e->vision_model.map;
-        s->graph.vision_model_size = e->vision_model.size;
-        s->graph.deepseek4_vision_weights = &e->deepseek4_vision_weights;
-    }
     if (e->tp.active) {
         s->graph.tp_world = 2;
         s->graph.tp_rank = (uint32_t)e->tp.rank;

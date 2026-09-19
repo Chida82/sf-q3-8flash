@@ -28,37 +28,6 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
-static bool cli_env_flag_enabled(const char *name, bool defval) {
-    const char *v = getenv(name);
-    if (!v || !v[0]) return defval;
-    return strcmp(v, "0") != 0;
-}
-
-static bool cli_splitkv_spec_requested(void) {
-    if (cli_env_flag_enabled("DS4_CUDA_NO_SPLITKV_SPEC", false)) return false;
-    return cli_env_flag_enabled("DS4_CUDA_SPLITKV_SPEC", false);
-}
-
-static bool cli_greedy_fast_attention_requested(void) {
-    if (!cli_env_flag_enabled("DS4_CUDA_NO_GREEDY_SPLITKV", false) &&
-        cli_env_flag_enabled("DS4_CUDA_GREEDY_SPLITKV", false))
-    {
-        return true;
-    }
-    if (!cli_env_flag_enabled("DS4_CUDA_NO_GREEDY_VEC4", false) &&
-        cli_env_flag_enabled("DS4_CUDA_GREEDY_VEC4", false))
-    {
-        return true;
-    }
-    return false;
-}
-
-static bool cli_greedy_argmax_requested(bool speculative_requested) {
-    if (cli_greedy_fast_attention_requested()) return true;
-    if (speculative_requested) return false;
-    return cli_env_flag_enabled("DS4_CUDA_GREEDY_TOP1", true);
-}
-
 typedef struct {
     const char *prompt;
     const char *system;
@@ -580,9 +549,9 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     const bool speculative_argmax = cfg->gen.temperature <= 0.0f &&
         ((ds4_engine_mtp_draft_tokens(engine) > 1 &&
           getenv("DS4_MTP_SPEC_DISABLE") == NULL) ||
-         cli_splitkv_spec_requested());
+         false);
     const bool greedy_argmax = cfg->gen.temperature <= 0.0f &&
-        cli_greedy_argmax_requested(speculative_argmax);
+        !speculative_argmax;
     bool have_greedy_next = false;
     int greedy_next = -1;
     const double t_decode0 = cli_now_sec();
@@ -1587,9 +1556,9 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
     const bool speculative_argmax = cfg->gen.temperature <= 0.0f &&
         ((ds4_engine_mtp_draft_tokens(engine) > 1 &&
           getenv("DS4_MTP_SPEC_DISABLE") == NULL) ||
-         cli_splitkv_spec_requested());
+         false);
     const bool greedy_argmax = cfg->gen.temperature <= 0.0f &&
-        cli_greedy_argmax_requested(speculative_argmax);
+        !speculative_argmax;
     bool have_greedy_next = false;
     int greedy_next = -1;
     const double t_decode0 = cli_now_sec();
@@ -2138,25 +2107,13 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.first_token_test = true;
         } else if (!strcmp(arg, "--metal-graph-test")) {
             c.gen.metal_graph_test = true;
-#ifdef DS4_ROCM_BUILD
-            c.engine.backend = DS4_BACKEND_CUDA;
-#else
             c.engine.backend = DS4_BACKEND_METAL;
-#endif
         } else if (!strcmp(arg, "--metal-graph-full-test")) {
             c.gen.metal_graph_full_test = true;
-#ifdef DS4_ROCM_BUILD
-            c.engine.backend = DS4_BACKEND_CUDA;
-#else
             c.engine.backend = DS4_BACKEND_METAL;
-#endif
         } else if (!strcmp(arg, "--metal-graph-prompt-test")) {
             c.gen.metal_graph_prompt_test = true;
-#ifdef DS4_ROCM_BUILD
-            c.engine.backend = DS4_BACKEND_CUDA;
-#else
             c.engine.backend = DS4_BACKEND_METAL;
-#endif
         } else if (!strcmp(arg, "--metal-graph-generate")) {
             fprintf(stderr, "ds4: --metal-graph-generate was removed; --metal is the graph path\n");
             exit(2);
