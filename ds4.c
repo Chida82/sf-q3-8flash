@@ -56,12 +56,7 @@
 #endif
 
 #ifdef DS4_TEST_HOOKS
-static uint64_t ds4_test_ds41_native_evals;
 static uint64_t ds4_test_mixed_native_evals;
-
-uint64_t ds4_test_ds41_batch_count(void) {
-    return ds4_test_ds41_native_evals;
-}
 
 uint64_t ds4_test_mixed_native_count(void) {
     return ds4_test_mixed_native_evals;
@@ -520,7 +515,6 @@ enum {
 typedef enum {
     DS4_MODEL_FAMILY_DEEPSEEK4 = 0,
     DS4_MODEL_FAMILY_GLM_DSA   = 1,
-    DS4_MODEL_FAMILY_DEEPSEEK41 = 2,
     DS4_MODEL_FAMILY_QWEN4_EXP = 3,
 } ds4_model_family;
 
@@ -1156,24 +1150,11 @@ static void ds4_die(const char *msg) {
 /* Attention compression is read from GGUF metadata after validating that it
  * matches the exact layout expected for the loaded model shape. */
 static uint32_t ds4_layer_compress_ratio(uint32_t il) {
-    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4 &&
-        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) return 0;
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) return 0;
     if (il >= DS4_N_LAYER) ds4_die("DeepSeek4 layer index is outside the loaded model layout");
     return g_ds4_compress_ratios[il];
 }
 
-
-static bool ds41_kv_source(uint32_t il) {
-    return il == 2 || il == 8 || il == 14 || il == 20;
-}
-
-static bool ds41_index_source(uint32_t il) {
-    return ds41_kv_source(il) || il == 24 || il == 28 || il == 32 || il == 36;
-}
-
-static bool ds41_engram_layer(uint32_t il) {
-    return il == 1 || il == 14;
-}
 
 static void ds4_die_errno(const char *what, const char *path) {
     fprintf(stderr, "ds4: %s '%s': %s\n", what, path, strerror(errno));
@@ -3026,9 +3007,6 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
         const ds4_tensor *t = &m->tensors[i];
         if (t->bytes == 0) continue;
         if (t == m->ngram_tensor) continue;
-        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
-            (ds4_streq(t->name, "blk.1.engram_embd.weight") ||
-             ds4_streq(t->name, "blk.14.engram_embd.weight"))) continue;
         if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) {
             free(spans);
             return false;
@@ -4962,8 +4940,7 @@ static void tensor_expect_routed_expert(
 }
 
 static bool weights_have_output_head(const ds4_weights *w) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return w && w->output_norm && w->output;
     }
     if (ds4_model_is_qwen4()) {
@@ -4978,8 +4955,7 @@ static bool weights_have_output_head(const ds4_weights *w) {
 }
 
 static bool weights_have_partial_output_head(const ds4_weights *w) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return w && (w->output_norm || w->output);
     }
     if (ds4_model_is_qwen4()) {
@@ -5292,18 +5268,7 @@ static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) 
     }
 
     const uint32_t ratio = ds4_layer_compress_ratio(il);
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
-        if (!l->ffn_exp_probs_b) return false;
-        if (ds41_kv_source(il) &&
-            (!l->attn_compressor_kv || !l->attn_compressor_norm ||
-             !l->indexer_attn_k || !l->indexer_k_norm ||
-             (ratio == 2 && !l->attn_compressor_gate))) return false;
-        if (ds41_index_source(il) && (!l->indexer_attn_q_b || !l->indexer_proj))
-            return false;
-        if (ds41_engram_layer(il) &&
-            (!l->engram_kv || !l->engram_q_norm || !l->engram_k_norm)) return false;
-        return true;
-    }
+    /* sf-ablate(deepseek41): V4.1-only compressor and Engram requirements removed. */
     if (ratio != 0 &&
         (!l->attn_compressor_ape ||
          !l->attn_compressor_kv ||
@@ -5543,11 +5508,9 @@ static void weights_validate_layout(
     if (require_output && !have_output) ds4_die("required output head tensors are missing");
     if (weights_have_partial_output_head(w) && !have_output) ds4_die("partial output head in GGUF");
     if (have_output) {
-        if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) {
-            tensor_expect_layout(w->output_hc_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
-            tensor_expect_layout(w->output_hc_fn,    DS4_TENSOR_F16,  2, hc_dim, DS4_N_HC, 0);
-            tensor_expect_layout(w->output_hc_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
-        }
+        tensor_expect_layout(w->output_hc_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
+        tensor_expect_layout(w->output_hc_fn,    DS4_TENSOR_F16,  2, hc_dim, DS4_N_HC, 0);
+        tensor_expect_layout(w->output_hc_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
         tensor_expect_layout(w->output_norm,     DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
         tensor_expect_dense_quant_layout(w->output,          2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
@@ -5573,41 +5536,8 @@ static void weights_validate_layout(
         tensor_expect_dense_quant_layout(l->attn_output_a,  2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
         tensor_expect_dense_quant_layout(l->attn_output_b,  2, out_low_dim, DS4_N_EMBD, 0);
 
-        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
-            /* The V4.1 grouped output kernels consume Q8 blocks directly. */
-            tensor_expect_layout(l->attn_output_a, DS4_TENSOR_Q8_0, 2,
-                DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
-            tensor_expect_layout(l->attn_output_b, DS4_TENSOR_Q8_0, 2,
-                out_low_dim, DS4_N_EMBD, 0);
-            if (ds41_kv_source(il)) {
-                tensor_expect_layout(l->attn_compressor_kv, DS4_TENSOR_F16, 2,
-                                     DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
-                tensor_expect_layout(l->attn_compressor_norm, DS4_TENSOR_F32, 1,
-                                     DS4_N_HEAD_DIM, 0, 0);
-                if (ratio == 2)
-                    tensor_expect_layout(l->attn_compressor_gate, DS4_TENSOR_F16, 2,
-                                         DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
-                tensor_expect_layout(l->indexer_attn_k, DS4_TENSOR_F16, 2,
-                                     DS4_N_HEAD_DIM, DS4_N_INDEXER_HEAD_DIM, 0);
-                tensor_expect_layout(l->indexer_k_norm, DS4_TENSOR_F32, 1,
-                                     DS4_N_INDEXER_HEAD_DIM, 0, 0);
-            }
-            if (ds41_index_source(il)) {
-                tensor_expect_layout(l->indexer_attn_q_b, DS4_TENSOR_F16, 2,
-                                     DS4_N_LORA_Q,
-                                     DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM, 0);
-                tensor_expect_layout(l->indexer_proj, DS4_TENSOR_F16, 2,
-                                     DS4_N_EMBD, DS4_N_INDEXER_HEAD, 0);
-            }
-            if (ds41_engram_layer(il)) {
-                tensor_expect_layout(l->engram_kv, DS4_TENSOR_F16, 2,
-                                     24u * 256u, (DS4_N_HC + 1u) * DS4_N_EMBD, 0);
-                tensor_expect_layout(l->engram_q_norm, DS4_TENSOR_F32, 2,
-                                     DS4_N_EMBD, DS4_N_HC, 0);
-                tensor_expect_layout(l->engram_k_norm, DS4_TENSOR_F32, 2,
-                                     DS4_N_EMBD, DS4_N_HC, 0);
-            }
-        } else if (ratio != 0) {
+        /* sf-ablate(deepseek41): V4.1 grouped-output and Engram layout checks removed. */
+        if (ratio != 0) {
             const uint32_t coff = ratio == 4 ? 2u : 1u;
             const uint64_t comp_width = (uint64_t)coff * DS4_N_HEAD_DIM;
             tensor_expect_layout(l->attn_compressor_ape,  DS4_TENSOR_F16, 2, comp_width, ratio, 0);
@@ -5630,9 +5560,7 @@ static void weights_validate_layout(
         tensor_expect_layout(l->hc_ffn_scale,   DS4_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_ffn_base,    DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
         tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-        tensor_expect_layout(l->ffn_gate_inp,
-                             DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ?
-                             DS4_TENSOR_F32 : DS4_TENSOR_F16,
+        tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F16,
                              2, DS4_N_EMBD, DS4_N_EXPERT, 0);
         tensor_expect_optional(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
         tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
@@ -6401,8 +6329,7 @@ static void weights_bind_output(
             w->output_hc_up   = model_find_tensor(m, "output_hc_up.weight");
             w->output         = model_find_tensor(m, "output.weight");
         }
-    } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+    } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
 
         if (required) {
             w->output_norm = required_tensor(m, "output_norm.weight");
@@ -6589,27 +6516,8 @@ static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_
     l->attn_sinks      = required_tensorf(m, "blk.%u.attn_sinks.weight", il);
     l->attn_output_a   = required_tensorf(m, "blk.%u.attn_output_a.weight", il);
     l->attn_output_b   = required_tensorf(m, "blk.%u.attn_output_b.weight", il);
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
-        l->ffn_exp_probs_vl = tensor_by_namef(m, "blk.%u.exp_probs_b_vl.bias", il);
-        tensor_expect_optional(l->ffn_exp_probs_vl, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
-        if (ds41_kv_source(il)) {
-            l->attn_compressor_kv = required_tensorf(m, "blk.%u.attn_compressor_kv.weight", il);
-            l->attn_compressor_norm = required_tensorf(m, "blk.%u.attn_compressor_norm.weight", il);
-            if (compress_ratio == 2)
-                l->attn_compressor_gate = required_tensorf(m, "blk.%u.attn_compressor_gate.weight", il);
-            l->indexer_attn_k = required_tensorf(m, "blk.%u.indexer.attn_k.weight", il);
-            l->indexer_k_norm = required_tensorf(m, "blk.%u.indexer.k_norm.weight", il);
-        }
-        if (ds41_index_source(il)) {
-            l->indexer_attn_q_b = required_tensorf(m, "blk.%u.indexer.attn_q_b.weight", il);
-            l->indexer_proj = required_tensorf(m, "blk.%u.indexer.proj.weight", il);
-        }
-        if (ds41_engram_layer(il)) {
-            l->engram_kv = required_tensorf(m, "blk.%u.engram_kv.weight", il);
-            l->engram_q_norm = required_tensorf(m, "blk.%u.engram_q_norm.weight", il);
-            l->engram_k_norm = required_tensorf(m, "blk.%u.engram_k_norm.weight", il);
-        }
-    } else if (compress_ratio != 0) {
+    /* sf-ablate(deepseek41): V4.1-only weight binding removed. */
+    if (compress_ratio != 0) {
         l->attn_compressor_ape  = required_tensorf(m, "blk.%u.attn_compressor_ape.weight", il);
         l->attn_compressor_kv   = required_tensorf(m, "blk.%u.attn_compressor_kv.weight", il);
         l->attn_compressor_gate = required_tensorf(m, "blk.%u.attn_compressor_gate.weight", il);
@@ -38180,9 +38088,6 @@ static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap(
             normal_layers - 1u);
 }
 
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-static ds4_context_memory ds41_graph_memory(uint32_t ctx);
-#endif
 static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
     const char *env = getenv("DS4_QWEN4_PREFILL_CHUNK");
     const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : 8192ul;
@@ -38222,10 +38127,6 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
     }
 
     if (ds4_backend_uses_graph(backend)) {
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41)
-            return ds41_graph_memory(ctx);
-#endif
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
             const uint32_t work_ctx =
                 glm_graph_full_attention_cap(ctx, ssd_streaming);
@@ -38679,7 +38580,6 @@ typedef enum {
 
 struct ds4_engine {
     char *model_path;
-    uint64_t ds41_session_bytes;
     ds4_model model;
     ds4_model mtp_model;
     ds4_model vision_model;
@@ -39830,8 +39730,7 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
 
     vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
     vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
-    vocab->system_id    = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ?
-                          vocab_lookup(vocab, "<｜System｜>") : -1;
+    vocab->system_id    = -1;
     vocab->user_id      = vocab_lookup(vocab, "<｜User｜>");
     vocab->assistant_id = vocab_lookup(vocab, "<｜Assistant｜>");
     vocab->observation_id = -1;
@@ -39952,9 +39851,7 @@ static void encode_chat_prompt(
     chat_push_bos_sequence(vocab, out);
     chat_push_think_prefix(vocab, think_mode, out);
     if (system && system[0]) {
-        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-            (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
-             !ds4_think_mode_enabled(think_mode)))
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA)
             token_vec_push(out, vocab->system_id);
         bpe_tokenize_text(vocab, system, out);
     }
@@ -39985,7 +39882,6 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         {"[gMASK]",                vocab->bos_id},
         {"<sop>",                  vocab->sop_id},
         {"<|system|>",             vocab->system_id},
-        {"<｜System｜>",            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ? vocab->system_id : -1},
         {"<｜User｜>",              vocab->user_id},
         {"<｜Assistant｜>",         vocab->assistant_id},
         {"<|user|>",               vocab->user_id},
@@ -40074,20 +39970,6 @@ void ds4_chat_append_think_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_m
     chat_push_think_prefix(&e->vocab, mode, tokens);
 }
 
-static void ds41_chat_system_marker(const ds4_vocab *vocab, ds4_tokens *tokens) {
-    /* Initial system text may be built in pieces after the effort prefix.
-     * Later system messages must introduce their own role token. */
-    bool has_system = false;
-    for (int i = 0; i < tokens->len; i++) {
-        if (tokens->v[i] == vocab->user_id || tokens->v[i] == vocab->assistant_id) {
-            token_vec_push(tokens, vocab->system_id);
-            return;
-        }
-        if (tokens->v[i] == vocab->system_id) has_system = true;
-    }
-    if (!has_system) token_vec_push(tokens, vocab->system_id);
-}
-
 static void bpe_tokenize_wrapped_payload_text(ds4_vocab *vocab, const char *content,
                                               const char *end, token_vec *out) {
     /* Tool output is plain data inside the model-family wrapper.
@@ -40167,8 +40049,6 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     }
 
     if (!strcmp(role, "system") || !strcmp(role, "developer")) {
-        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41)
-            ds41_chat_system_marker(vocab, tokens);
         bpe_tokenize_text(vocab, content, tokens);
     } else if (!strcmp(role, "assistant")) {
         token_vec_push(tokens, vocab->assistant_id);
@@ -55854,8 +55734,8 @@ uint32_t ds4_think_max_min_context(void) {
 }
 
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size) {
-    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 &&
-        mode == DS4_THINK_MAX && (uint32_t)(ctx_size > 0 ? ctx_size : 0) < DS4_THINK_MAX_MIN_CONTEXT) {
+    if (mode == DS4_THINK_MAX &&
+        (uint32_t)(ctx_size > 0 ? ctx_size : 0) < DS4_THINK_MAX_MIN_CONTEXT) {
         return DS4_THINK_HIGH;
     }
     return mode;
@@ -55983,10 +55863,6 @@ struct ds4_session {
     uint64_t tp_session_id;
     uint64_t glm_reserved_graph_bytes;
 #ifndef DS4_NO_GPU
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    ds41_gpu_graph ds41_graph;
-    bool ds41_graph_ready;
-#endif
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
     bool glm_graph_ready;
@@ -56978,10 +56854,6 @@ static int payload_read_or_skip_glm_full_kv_span(FILE *fp,
 
 static bool ds4_session_is_cpu(const ds4_session *s) {
     return s && s->engine && s->engine->backend == DS4_BACKEND_CPU;
-}
-
-static bool ds4_session_is_ds41(const ds4_session *s) {
-    return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
 }
 
 static void ds4_session_dspark_capture_invalidate(ds4_session *s) {
@@ -58116,114 +57988,6 @@ static void session_greedy_splitkv_reset(ds4_session *s) {
 }
 #endif
 
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-typedef struct {
-    ds4_gpu_tensor *tensor;
-    uint64_t bytes;
-} ds41_state_span;
-
-/* The selection masks are rebuilt by each index-source layer on the next
- * token. Only owner caches, windows and unfinished compression pairs persist. */
-static uint32_t ds41_state_spans(ds41_gpu_graph *g, uint32_t pos,
-                                 ds41_state_span spans[54]) {
-    uint32_t n = 0;
-    const uint32_t raw = pos < 128u ? pos : 128u;
-    for (uint32_t il = 0; il < 40; il++)
-        spans[n++] = (ds41_state_span){g->window[il], (uint64_t)raw * 512u * 4u};
-    for (uint32_t i = 0; i < 4; i++) {
-        const uint32_t live = pos / (i < 3 ? 2u : 1u);
-        spans[n++] = (ds41_state_span){g->compressed[i], (uint64_t)live * 512u * 4u};
-        spans[n++] = (ds41_state_span){g->index_cache[i], (uint64_t)live * 128u * 4u};
-        if (i < 3 && (pos & 1u)) {
-            spans[n++] = (ds41_state_span){g->previous_kv[i], 512u * 4u};
-            spans[n++] = (ds41_state_span){g->previous_score[i], 512u * 4u};
-        }
-    }
-    return n;
-}
-
-static uint64_t ds41_payload_body_bytes(ds41_gpu_graph *g, uint32_t pos) {
-    ds41_state_span spans[54];
-    const uint32_t n = ds41_state_spans(g, pos, spans);
-    uint64_t bytes = ((uint64_t)pos + DS4_N_VOCAB) * sizeof(float);
-    for (uint32_t i = 0; i < n; i++) bytes += spans[i].bytes;
-    return bytes;
-}
-
-static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
-    ds41_gpu_graph *g = &s->ds41_graph;
-    if (!s->ds41_graph_ready || !g->valid || g->pos != (uint32_t)s->checkpoint.len ||
-        !ds4_gpu_synchronize()) {
-        payload_set_err(err, errlen, "V4.1 graph has no complete frontier to save");
-        return 1;
-    }
-    const uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
-        DS4_SESSION_PAYLOAD_MAGIC, DS4_SESSION_PAYLOAD_VERSION,
-        g->ctx, 1, 128, 128, g->ctx + 1u, g->pos, 40, 512, 128, DS4_N_VOCAB, 0x413431u
-    };
-    for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++)
-        if (payload_write_u32(fp, h[i], err, errlen)) return 1;
-    for (int i = 0; i < s->checkpoint.len; i++)
-        if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen)) return 1;
-    if (payload_write_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * 4u, err, errlen)) return 1;
-    ds41_state_span spans[54];
-    const uint32_t n = ds41_state_spans(g, g->pos, spans);
-    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
-    int rc = 0;
-    for (uint32_t i = 0; i < n && !rc; i++)
-        rc = payload_write_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
-                                        buf, DS4_SESSION_IO_CHUNK, err, errlen);
-    free(buf);
-    return rc;
-}
-
-static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
-                              uint64_t remaining, char *err, size_t errlen) {
-    ds41_gpu_graph *g = &s->ds41_graph;
-    const uint32_t pos = h[7];
-    if (!s->ds41_graph_ready || !pos || pos >= g->ctx || pos >= h[2] || h[2] > 1048576u ||
-        h[3] != 1 || h[4] != 128 || h[5] != 128 || h[6] != h[2] + 1u ||
-        h[8] != 40 || h[9] != 512 || h[10] != 128 || h[11] != DS4_N_VOCAB ||
-        h[12] != 0x413431u || remaining != ds41_payload_body_bytes(g, pos)) {
-        payload_set_err(err, errlen, "invalid V4.1 snapshot dimensions or size");
-        return 1;
-    }
-    ds4_tokens tokens = {0};
-    int rc = 0;
-    for (uint32_t i = 0; i < pos; i++) {
-        uint32_t token;
-        if (payload_read_u32(fp, &token, &remaining, err, errlen) || token >= DS4_N_VOCAB) {
-            payload_set_err(err, errlen, "invalid V4.1 snapshot token");
-            rc = 1;
-            break;
-        }
-        token_vec_push(&tokens, (int)token);
-    }
-    if (!rc && !ds4_gpu_synchronize()) rc = 1;
-    if (!rc) {
-        s->checkpoint_valid = false;
-        g->valid = false;
-        rc = payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * 4u, &remaining, err, errlen);
-        ds41_state_span spans[54];
-        const uint32_t n = ds41_state_spans(g, pos, spans);
-        uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
-        for (uint32_t i = 0; i < n && !rc; i++)
-            rc = payload_read_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
-                                           buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
-        free(buf);
-        if (!rc) {
-            ds41_graph_reset(g);
-            for (uint32_t i = 0; i < 3 && i < pos; i++)
-                g->history.tail[i] = (int32_t)g->token_map[tokens.v[pos - 1u - i]];
-            g->pos = pos;
-            ds4_tokens_copy(&s->checkpoint, &tokens);
-            s->checkpoint_valid = true;
-        }
-    }
-    ds4_tokens_free(&tokens);
-    return rc;
-}
-#endif
 #ifdef DS4_HAS_QWEN4_GPU
 static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows);
 #endif
@@ -58246,14 +58010,6 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
     }
     if (!s || !s->checkpoint_valid) return 0;
     if (s->distributed) return 0;
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(s)) {
-        if (!s->ds41_graph_ready || !s->ds41_graph.valid ||
-            s->ds41_graph.pos != (uint32_t)s->checkpoint.len) return 0;
-        return DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t) +
-               ds41_payload_body_bytes(&s->ds41_graph, (uint32_t)s->checkpoint.len);
-    }
-#endif
     if (ds4_session_is_cpu(s)) {
         uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
         bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
@@ -58621,9 +58377,6 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     if (s->distributed) {
         return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
     }
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(s)) return ds41_save_payload(s, fp, err, errlen);
-#endif
     if (ds4_session_is_qwen4(s) && !ds4_session_is_cpu(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         payload_set_err(err, errlen, "graph backend support is not compiled in");
@@ -59008,9 +58761,6 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         ds4_tokens_free(&tokens);
         return rc;
     }
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(s)) return ds41_load_payload(s, fp, h, remaining, err, errlen);
-#endif
     if (ds4_session_is_qwen4(s) && !ds4_session_is_cpu(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         payload_set_err(err, errlen, "graph backend support is not compiled in");
@@ -59707,12 +59457,6 @@ int ds4_dump_chat_tokenization(const char *model_path,
     if (!fp) fp = stdout;
     model_open(&model, model_path, false, false);
     config_validate_model(&model);
-    if (ds4_think_mode_level(think_mode) >= 0 &&
-        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) {
-        fprintf(stderr, "ds4: --think-level requires a DeepSeek V4.1 model\n");
-        model_close(&model);
-        return 2;
-    }
     think_mode = ds4_think_mode_for_context(think_mode, ctx_size);
     vocab_load(&vocab, &model);
     encode_chat_prompt(&vocab, system, prompt ? prompt : "", think_mode,
@@ -59726,9 +59470,6 @@ int ds4_dump_chat_tokenization(const char *model_path,
 }
 
 #ifndef DS4_NO_GPU
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cache);
-#endif
 static bool imatrix_read_text_file(const char *path, char **out, size_t *len_out) {
     *out = NULL;
     *len_out = 0;
@@ -59793,44 +59534,23 @@ static int ds4_engine_collect_sequential_imatrix(
         int         max_tokens,
         int         min_expert_samples) {
     ds4_glm_gpu_graph g = {0};
-    const bool v41 = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
-    const char *name = v41 ? "V4.1" : "GLM";
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    ds41_gpu_graph d = {.table = {{.fd = -1}, {.fd = -1}}};
-    if (v41) {
-        if (e->tp.active) {
-            fprintf(stderr, "ds4: V4.1 imatrix collection requires a single-host session\n");
-            return 1;
-        }
-        if (ctx_size > 1048576 ||
-            !ds41_memory_admit(e, ds4_add_sat_u64(e->ds41_session_bytes,
-                ds41_graph_bytes((uint32_t)ctx_size)), false) ||
-            !ds41_graph_alloc(&d, &e->model, &e->weights, e->model_path,
-                              (uint32_t)ctx_size, e->ssd_streaming)) return 1;
-    } else
-#endif
+    const char *name = "GLM";
     if (!glm_graph_alloc(&g, &e->model, &e->weights, ctx_size,
                          e->ssd_streaming, e->ssd_streaming_cold)) {
         fprintf(stderr, "ds4: failed to allocate %s imatrix graph\n", name);
         return 1;
     }
     g.quality = e->quality;
-    const uint32_t layers = v41 ? DS4_N_LAYER : g.normal_layers;
+    const uint32_t layers = g.normal_layers;
 
     ds4_imatrix_collector collector;
     if (!imatrix_collector_init(&collector, 1, dataset_path)) {
         fprintf(stderr, "ds4: failed to allocate %s imatrix collector\n", name);
         imatrix_collector_free(&collector);
         glm_graph_free(&g);
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-        ds41_graph_free(&d);
-#endif
         return 1;
     }
     g.imatrix = &collector;
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    d.imatrix = &collector;
-#endif
 
     fprintf(stderr,
             "ds4: collecting %s routed imatrix from %s "
@@ -59866,20 +59586,11 @@ static int ds4_engine_collect_sequential_imatrix(
                 prompt.len = max_tokens - tokens_done;
             }
             if (prompt.len > 0) {
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-                if (v41) ds41_graph_reset(&d);
-                else
-#endif
                 if (!glm_graph_reset_kda_state(&g)) {
                     fprintf(stderr, "ds4: failed to reset %s imatrix state\n", name);
                     ok = false;
                 }
                 for (int pos = 0; ok && pos < prompt.len; pos++) {
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-                    if (v41) ok = ds41_graph_step(&d, &e->model, &e->weights,
-                                                   prompt.v[pos], NULL);
-                    else
-#endif
                     ok = glm_graph_forward_token(&g,
                                                  &e->model,
                                                  &e->weights,
@@ -59960,9 +59671,6 @@ static int ds4_engine_collect_sequential_imatrix(
     }
     imatrix_collector_free(&collector);
     glm_graph_free(&g);
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    ds41_graph_free(&d);
-#endif
     return ok ? 0 : 1;
 }
 #endif
@@ -59996,8 +59704,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     size_t dataset_len = 0;
     if (!imatrix_read_text_file(dataset_path, &dataset, &dataset_len)) return 1;
 
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         const int rc = ds4_engine_collect_sequential_imatrix(e,
                                                       dataset,
                                                       dataset_len,
@@ -60343,7 +60050,7 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
-    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s)) {
+    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
     }
@@ -60822,7 +60529,7 @@ int ds4_engine_generate_argmax(
                     ds4_backend_name(e->backend));
             return 1;
         }
-        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        if (e->multi_tier) {
             ds4_session *s = NULL;
             char err[256] = {0};
             const double t_prefill0 = now_sec();
@@ -63847,8 +63554,7 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e, int ctx_siz
         e->ssd_streaming_cache_bytes != 0) {
         return true;
     }
-    if (!ds4_backend_supports_streaming_auto_cache(e->backend) &&
-        !(e->backend == DS4_BACKEND_CUDA && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41)) {
+    if (!ds4_backend_supports_streaming_auto_cache(e->backend)) {
         return true;
     }
 
@@ -66075,55 +65781,6 @@ static bool engine_warm_full_model(const ds4_engine_options *opt) {
            opt->distributed.role == DS4_DISTRIBUTED_NONE;
 }
 
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
-                                      bool fit_cache, uint64_t host,
-                                      uint64_t recommended) {
-    const uint64_t gib = UINT64_C(1073741824);
-    uint64_t budget = host / 8u * 7u;
-    if (!host || !recommended) {
-        fprintf(stderr, "ds4: cannot determine a safe V4.1 memory budget\n");
-        return false;
-    }
-    if (budget > recommended) budget = recommended;
-    uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
-    if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
-    weights = ds4_add_sat_u64(weights, e->vision_model.size);
-    const uint64_t fixed = ds4_add_sat_u64(weights,
-        ds4_add_sat_u64(graph_bytes, 2u * gib + e->ssd_streaming_prefill_headroom_bytes));
-    uint64_t expert = 0;
-    if (e->ssd_streaming && !ds4_streaming_routed_expert_bytes(&e->weights, &expert)) return false;
-    if (fixed >= budget || (expert && budget - fixed < expert)) {
-        fprintf(stderr, "ds4: V4.1 needs %.2f GiB before the expert cache; safe budget %.2f GiB. "
-                        "Use --ssd-streaming or a smaller context.\n",
-                ds4_bytes_to_gib(fixed), ds4_bytes_to_gib(budget));
-        return false;
-    }
-    if (expert && e->ssd_streaming_cache_experts > (budget - fixed) / expert) {
-        if (!fit_cache) {
-            fprintf(stderr, "ds4: no room for another V4.1 session; reduce context or the SSD expert cache\n");
-            return false;
-        }
-        const uint32_t count = (uint32_t)((budget - fixed) / expert);
-        fprintf(stderr, "ds4: V4.1 SSD cache fitted from %u to %u experts for context/runtime headroom\n",
-                e->ssd_streaming_cache_experts, count);
-        e->ssd_streaming_cache_experts = count;
-        e->ssd_streaming_cache_bytes = (uint64_t)count * expert;
-    }
-    return true;
-}
-
-static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cache) {
-    uint64_t host = glm_graph_host_memory_bytes();
-#ifdef __linux__
-    const long pages = sysconf(_SC_PHYS_PAGES), page_size = sysconf(_SC_PAGESIZE);
-    if (pages > 0 && page_size > 0 && (uint64_t)pages <= UINT64_MAX / (uint64_t)page_size)
-        host = (uint64_t)pages * (uint64_t)page_size;
-#endif
-    return ds41_memory_admit_for_host(e, graph_bytes, fit_cache,
-        host, ds4_gpu_recommended_working_set_size());
-}
-#endif
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     return ds4_engine_open_internal(out, opt, NULL);
@@ -66267,13 +65924,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
-        opt->vision_path && opt->vision_path[0] && e->backend != DS4_BACKEND_METAL) {
-        fprintf(stderr, "ds4: V4.1 vision requires Metal\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
-    }
     config_validate_model(&e->model);
     if (ds4_model_is_qwen4() && !opt->inspect_only) {
         const bool backend_ok =
@@ -66294,38 +65944,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
     }
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
-        const bool supported = (e->backend == DS4_BACKEND_METAL ||
-#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__)
-                (e->backend == DS4_BACKEND_CUDA && !opt->cuda_tensor_parallel &&
-                 (!gpu_cfg || gpu_cfg->n_gpus <= 1)) ||
-#endif
-                 false) &&
-            opt->distributed.role == DS4_DISTRIBUTED_NONE &&
-            !load_slice && !opt->dspark && !opt->glm_mtp &&
-            !opt->first_token_test && !opt->metal_graph_test &&
-            (!opt->mtp_path || !opt->mtp_path[0]) &&
-            (!opt->directional_steering_file || !opt->directional_steering_file[0]) &&
-            e->power_percent == 100 && opt->context_size <= 1048576;
-        if (!supported) {
-            fprintf(stderr, "ds4: V4.1 requires Metal or single-GPU CUDA per rank (optional network tensor parallelism); "
-                            "DSpark, steering and legacy diagnostics are not supported (maximum context 1048576)\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        /* The agent may change directory before creating its first session.
-         * Engram readers reopen this file and check it against model.fd. */
-        e->model_path = realpath(opt->model_path, NULL);
-        if (!e->model_path) {
-            fprintf(stderr, "ds4: cannot resolve V4.1 model path: %s\n", strerror(errno));
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-    }
-    if (engine_warm_full_model(opt) && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41)
-        model_warm_weights(&e->model);
+    /* sf-ablate(deepseek41): V4.1-only runtime admission and Engram path removed. */
+    if (engine_warm_full_model(opt)) model_warm_weights(&e->model);
     if (opt->vision_path && opt->vision_path[0]) {
 #ifdef DS4_NO_GPU
         fprintf(stderr, "ds4: this build does not include a GPU vision backend\n");
@@ -66394,17 +66014,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
         fprintf(stderr, "ds4: Qwen BF16 n-grams: %.2f GiB, disk reads only\n",
                 (double)e->model.ngram_tensor->bytes / (1024.0 * 1024.0 * 1024.0));
     }
-    if (e->vision_ready && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            if (!e->weights.layer[il].ffn_exp_probs_vl) {
-                fprintf(stderr, "ds4: V4.1 vision requires visual router biases in the language GGUF\n");
-                ds4_engine_close(e);
-                *out = NULL;
-                return 1;
-            }
-        }
-    }
-
     /* TP always maps one contiguous routed-expert half per rank. Decide
      * immediately after binding so memory guards account only the bytes this
      * rank owns (replicated dense weights plus its expert shard). */
@@ -66413,27 +66022,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         opt->tp.role != DS4_TP_NONE &&
         !e->ssd_streaming;
     const int tp_shard_rank = opt->tp.role == DS4_TP_WORKER ? 1 : 0;
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (tp_shard && (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 ||
-        (gpu_cfg && gpu_cfg->n_gpus > 1) || opt->quality)) {
-        fprintf(stderr, "ds4: network CUDA TP currently requires V4.1 Q2, one GPU per rank, no quality mode\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
-    }
-    if (tp_shard) {
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            if (e->weights.layer[il].ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
-                e->weights.layer[il].ffn_up_exps->type != DS4_TENSOR_IQ2_XXS ||
-                e->weights.layer[il].ffn_down_exps->type != DS4_TENSOR_Q2_K) {
-                fprintf(stderr, "ds4: network CUDA TP requires IQ2_XXS gate/up and Q2_K down experts\n");
-                ds4_engine_close(e);
-                *out = NULL;
-                return 1;
-            }
-        }
-    }
-#endif
+    /* sf-ablate(deepseek41): V4.1 CUDA tensor-parallel admission removed. */
     if (tp_shard && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         uint32_t bad_layer = 0;
         uint32_t bad_type = 0;
@@ -66459,19 +66048,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 model_map_span_vec_total_bytes(&shard_spans);
             free(shard_spans.v);
         }
-    }
-#endif
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
-        const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
-        const uint32_t sessions = e->placement_session_count_hint > 0 ?
-            (uint32_t)e->placement_session_count_hint : 1;
-        if (!ds41_memory_admit(e, ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions), true)) {
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        if (engine_warm_full_model(opt)) model_warm_weights(&e->model);
     }
 #endif
     if (ds4_model_is_qwen4()) {
@@ -66927,18 +66503,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
-            const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
-            const uint32_t sessions = e->placement_session_count_hint > 0 ?
-                (uint32_t)e->placement_session_count_hint : 1;
-            if (!ds41_memory_admit(e, ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions), true)) {
-                ds4_engine_close(e);
-                *out = NULL;
-                return 1;
-            }
-        }
-#endif
         ds4_engine_fit_glm_streaming_budget(
                 e,
                 load_slice,
@@ -67094,9 +66658,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                       weights_have_output_head(&e->weights)));
             ds4_model_map_span_vec spans;
             bool spans_ok = false;
-            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
-                spans_ok = weights_model_map_decode_static_spans(&e->weights, true, true, &spans);
-            } else if (load_slice) {
+                    if (load_slice) {
                 if (e->ssd_streaming_static_decode_map) {
                     spans_ok = weights_model_map_decode_runtime_slice_spans(
                             &e->weights,
@@ -67456,45 +67018,9 @@ uint64_t ds4_engine_hidden_f32_values(ds4_engine *e) {
     return (uint64_t)DS4_N_HC * DS4_N_EMBD;
 }
 
-bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
-                                        uint32_t layer,
-                                        uint32_t full_live,
-                                        uint32_t key_dim,
-                                        uint32_t value_dim,
-                                        uint32_t compact_live,
-                                        uint32_t index_live,
-                                        uint64_t *out) {
-#ifdef DS4_NO_GPU
-    (void)e;
-    (void)layer;
-    (void)full_live;
-    (void)key_dim;
-    (void)value_dim;
-    (void)compact_live;
-    (void)index_live;
-    (void)out;
-    return false;
-#else
-    (void)e;
-    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA) return false;
-    return glm_layer_payload_tensor_bytes(layer,
-                                          full_live,
-                                          key_dim,
-                                          value_dim,
-                                          compact_live,
-                                          index_live,
-                                          out);
-#endif
-}
-
 int ds4_engine_model_id(ds4_engine *e) {
     (void)e;
     return (int)DS4_MODEL_VARIANT;
-}
-
-bool ds4_engine_is_glm53(ds4_engine *e) {
-    (void)e;
-    return ds4_model_is_glm53();
 }
 
 bool ds4_engine_is_qwen4(ds4_engine *e) {
@@ -67881,7 +67407,7 @@ int ds4_engine_tp_vocab_split(ds4_engine *e) {
     return e && e->tp.active && e->tp.vocab_split;
 }
 
-#ifdef DS4_HAS_DEEPSEEK41_GPU
+#ifdef DS4_HAS_QWEN4_GPU
 static int ds4_engine_tp_exchange(void *ud, uint32_t layer, uint32_t gate, uint64_t seq) {
     ds4_engine *e = ud;
     ds4_tp *tp = e->tp.ctx;
@@ -67938,14 +67464,13 @@ static int ds4_engine_tp_big_exchange(void *ud, uint32_t layer, uint64_t seq,
 #endif
 
 int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen) {
-#ifndef DS4_HAS_DEEPSEEK41_GPU
+#ifndef DS4_HAS_QWEN4_GPU
     (void)e; (void)tp;
     snprintf(err, errlen, "tensor parallelism requires the Metal backend");
     return 0;
 #else
-    if (!e || !tp || (e->backend != DS4_BACKEND_METAL &&
-        (e->backend != DS4_BACKEND_CUDA || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41))) {
-        snprintf(err, errlen, "tensor parallelism requires Metal or V4.1 CUDA");
+    if (!e || !tp || e->backend != DS4_BACKEND_METAL) {
+        snprintf(err, errlen, "tensor parallelism requires the Metal backend");
         return 0;
     }
     if (e->tp.ctx) {
@@ -68020,9 +67545,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     g_tp_block_ctx = tp;
 #endif
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
-    /* Reuse the existing half-logit frames for V4.1 on CUDA as well. */
-    e->tp.vocab_split = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4 ||
-        (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && e->backend == DS4_BACKEND_CUDA);
+    e->tp.vocab_split = false; /* Qwen ranks retain a complete output head. */
     e->tp.ctx = tp;
     e->tp.rank = ds4_tp_rank(tp);
     e->tp.eval_seq = 0;
@@ -68038,7 +67561,7 @@ fail:
 }
 
 void ds4_engine_tp_unbind(ds4_engine *e) {
-#ifdef DS4_HAS_DEEPSEEK41_GPU
+#ifdef DS4_HAS_QWEN4_GPU
     if (!e || !e->tp.ctx) return;
     ds4_gpu_tp_shutdown();
     ds4_tp_detach_slab(e->tp.ctx);
@@ -68065,16 +67588,6 @@ void ds4_engine_tp_unbind(ds4_engine *e) {
 #else
     (void)e;
 #endif
-}
-
-bool ds4_engine_is_glm_dsa(ds4_engine *e) {
-    (void)e;
-    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
-}
-
-bool ds4_engine_is_deepseek41(ds4_engine *e) {
-    (void)e;
-    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
 }
 
 void ds4_engine_close(ds4_engine *e) {
@@ -68286,47 +67799,6 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
-        if (ctx_size > 1048576 ||
-            !ds41_memory_admit(e, ds4_add_sat_u64(e->ds41_session_bytes,
-                ds41_graph_bytes((uint32_t)ctx_size)), false) ||
-            !ds41_graph_alloc(&s->ds41_graph, &e->model, &e->weights,
-                              e->model_path, (uint32_t)ctx_size, e->ssd_streaming)) {
-            free(s);
-            return 1;
-        }
-        s->ds41_graph_ready = true;
-        s->ds41_graph.quality = e->quality;
-        if (e->tp.active) {
-            s->ds41_graph.tp_world = 2;
-            s->ds41_graph.tp_rank = (uint32_t)e->tp.rank;
-            s->ds41_graph.tp_out = e->tp.out_views;
-            s->ds41_graph.tp_in = e->tp.in_views;
-            if (e->tp.vocab_split) {
-                const uint64_t half_bytes = (uint64_t)DS4_N_VOCAB / 2u * sizeof(float);
-                s->ds41_graph.tp_logits_half = ds4_gpu_tensor_view(s->ds41_graph.logits,
-                    (uint64_t)e->tp.rank * half_bytes, half_bytes);
-                if (!s->ds41_graph.tp_logits_half ||
-                    !ds4_gpu_tensor_fill_f32(s->ds41_graph.logits, 0, DS4_N_VOCAB)) {
-                    ds41_graph_free(&s->ds41_graph);
-                    free(s);
-                    return 1;
-                }
-            }
-        }
-        s->prefill_cap = s->ds41_graph.prefill_cap;
-        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
-        s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
-        e->ds41_session_bytes += s->ds41_graph.allocation_bytes;
-        if (!ds4_session_tp_register(s)) {
-            ds4_session_free(s);
-            return 1;
-        }
-        *out = s;
-        return 0;
-    }
-#endif
 #ifdef DS4_HAS_QWEN4_GPU
     if (ds4_model_is_qwen4()) {
         if ((e->backend != DS4_BACKEND_METAL && e->backend != DS4_BACKEND_CUDA) ||
@@ -68735,12 +68207,6 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     else {
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-        if (s->ds41_graph_ready) {
-            s->engine->ds41_session_bytes -= s->ds41_graph.allocation_bytes;
-            ds41_graph_free(&s->ds41_graph);
-        } else
-#endif
 #ifdef DS4_HAS_QWEN4_GPU
         if (ds4_session_is_qwen4(s)) {
             if (s->engine && s->engine->glm_mtp_timing && s->qwen4_spec_cycles) {
@@ -70631,23 +70097,11 @@ int ds4_session_sync_multimodal(
     }
     s->sync_images = images;
     s->sync_image_count = image_count;
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(s)) {
-        s->ds41_graph.images = images;
-        s->ds41_graph.image_count = image_count;
-    }
-#endif
 #ifndef DS4_NO_GPU
     s->graph.prefill_vision_spans = images;
     s->graph.prefill_vision_span_count = image_count;
 #endif
     const int rc = ds4_session_sync(s, prompt, err, errlen);
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(s)) {
-        s->ds41_graph.images = NULL;
-        s->ds41_graph.image_count = 0;
-    }
-#endif
 #ifndef DS4_NO_GPU
     s->graph.prefill_vision_spans = NULL;
     s->graph.prefill_vision_span_count = 0;
@@ -70811,98 +70265,6 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
     (void)backend_name; (void)e;
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(s)) {
-        ds41_gpu_graph *g = &s->ds41_graph;
-        if (!s->ds41_graph_ready) {
-            snprintf(err, errlen, "V4.1 graph is not initialized");
-            return 1;
-        }
-        if (!s->checkpoint_valid || !g->valid || g->pos != (uint32_t)s->checkpoint.len ||
-            !ds4_tokens_starts_with(prompt, &s->checkpoint)) {
-            ds41_graph_reset(g);
-            s->checkpoint.len = 0;
-            s->checkpoint_valid = false;
-        }
-        bool pending_logits = false, interrupted = false, decoder_pending = false;
-        ds41_encoder_residency encoder = {0};
-        ds41_encoder_acquire(g, &e->model, &e->weights,
-            (uint32_t)(prompt->len - s->checkpoint.len), &encoder, s->cancel, s->cancel_ud);
-        for (int i = s->checkpoint.len; i < prompt->len;) {
-            if (ds4_session_cancelled(s)) {
-                interrupted = true;
-                break;
-            }
-            const uint32_t remaining = (uint32_t)(prompt->len - i);
-            if (g->encoder_resident && remaining < 768u)
-                ds41_encoder_release(g, &e->model, &encoder);
-            const uint32_t short_count = decoder_pending ? 0u :
-                ds41_short_prefill_count(g, &e->weights, remaining);
-            const uint32_t count = short_count ? short_count : g->encoder_resident ?
-                (remaining - 512u < g->prefill_cap ? remaining - 512u : g->prefill_cap) :
-                ds41_prefill_count(g, remaining);
-            const bool defer_decoder = !g->encoder_resident && count >= 16384u &&
-                remaining - count >= 8192u &&
-                !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX") &&
-                !getenv("DS4_METAL_DISABLE_V41_DEFER_DECODER");
-            /* Never add an encoder sweep just to defer the decoder. A short
-             * remainder finishes the pending decoder here, then runs normally. */
-            const bool layer_major = count > 1u;
-            const bool ok = short_count ?
-                ds41_graph_short_prefill(g, &e->model, &e->weights, prompt->v + i, count) :
-                layer_major ?
-                (defer_decoder || decoder_pending ?
-                 ds41_graph_prefill_sweep(g, &e->model, &e->weights, prompt->v + i, count,
-                    s->progress, s->progress_ud, prompt->len, s->cancel, s->cancel_ud,
-                    defer_decoder, decoder_pending) :
-                 ds41_graph_prefill(g, &e->model, &e->weights, prompt->v + i, count,
-                    s->progress, s->progress_ud, prompt->len, s->cancel, s->cancel_ud)) :
-                ds41_graph_step(g, &e->model, &e->weights, prompt->v[i], NULL);
-            if (!ok) {
-                ds41_encoder_release(g, &e->model, &encoder);
-                s->checkpoint_valid = false;
-                if (ds4_session_cancelled(s)) {
-                    snprintf(err, errlen, "interrupted");
-                    return DS4_SESSION_SYNC_INTERRUPTED;
-                }
-                snprintf(err, errlen, "V4.1 prefill failed at position %d", i);
-                return 1;
-            }
-            for (uint32_t t = 0; t < count; t++)
-                token_vec_push(&s->checkpoint, prompt->v[i + (int)t]);
-            i += (int)count;
-            decoder_pending = defer_decoder;
-            pending_logits = true;
-            s->checkpoint_valid = false;
-            if (s->progress)
-                s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
-        }
-        ds41_encoder_release(g, &e->model, &encoder);
-        if (decoder_pending) {
-            s->checkpoint_valid = false;
-            g->valid = false;
-            snprintf(err, errlen, "interrupted");
-            return DS4_SESSION_SYNC_INTERRUPTED;
-        }
-        /* Prefill needs only its final output head. An interrupted prefix must
-         * still have matching logits before it can be saved or continued. */
-        if (pending_logits) {
-            if (!ds41_graph_logits(g, &e->model, &e->weights, s->logits)) {
-                g->valid = false;
-                snprintf(err, errlen, "V4.1 prefill output head failed");
-                return 1;
-            }
-            s->checkpoint_valid = true;
-            if (s->progress)
-                s->progress(s->progress_ud, "prefill_chunk", s->checkpoint.len, prompt->len);
-        }
-        if (interrupted) {
-            snprintf(err, errlen, "interrupted");
-            return DS4_SESSION_SYNC_INTERRUPTED;
-        }
-        return 0;
-    }
-#endif
     if (ds4_session_is_glm(s)) {
         /* Debug: truncate the prompt so the dumped prefill logits line up
          * with the CPU first-token reference (DS4_GLM_LOGIT_DUMP). */
@@ -72734,21 +72096,6 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     return 1;
 #else
     ds4_engine *e = s->engine;
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(s)) {
-        if (!s->ds41_graph_ready ||
-            (!s->checkpoint_valid && s->checkpoint.len != 0) ||
-            s->ds41_graph.pos != (uint32_t)s->checkpoint.len ||
-            !ds41_graph_step(&s->ds41_graph, &e->model, &e->weights, token, s->logits)) {
-            s->checkpoint_valid = false;
-            if (errlen) snprintf(err, errlen, "V4.1 decode failed at position %d", s->checkpoint.len);
-            return 1;
-        }
-        token_vec_push(&s->checkpoint, token);
-        s->checkpoint_valid = true;
-        return 0;
-    }
-#endif
 #ifdef DS4_HAS_QWEN4_GPU
     if (ds4_session_is_qwen4(s)) {
         if (!s->qwen4_graph_ready) {
@@ -73577,33 +72924,6 @@ static bool glm53_graph_encode_native_session_batch(
     return ok;
 }
 
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-static bool ds41_sessions_batch_supported(ds4_decode_item *items, int count,
-                                          const ds4_engine *e) {
-    if (!items || count < 2 || count > DS4_TP_BATCH_MAX_ROWS || !e ||
-        e->support_kind != DS4_SUPPORT_NONE)
-        return false;
-    const bool cuda = e->backend == DS4_BACKEND_CUDA;
-    if (cuda ? !metal_graph_tp_env_flag("DS4_CUDA_SESSION_BATCH_MOE", true) :
-        (e->backend != DS4_BACKEND_METAL || getenv("DS4_METAL_DISABLE_V41_SESSION_BATCH")))
-        return false;
-    ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
-    for (int i = 0; i < count; i++) {
-        ds4_session *s = items[i].session;
-        if (!s || s->engine != e || !s->ds41_graph_ready || !s->checkpoint_valid || s->distributed ||
-            (cuda ? !ds41_cuda_row_batch_supported(&s->ds41_graph, &e->weights) : s->ds41_graph.streaming) ||
-            s->ds41_graph.imatrix || s->ds41_graph.quality ||
-            !s->ds41_graph.valid || s->ds41_graph.image_count ||
-            s->ds41_graph.pos != (uint32_t)s->checkpoint.len) return false;
-        /* Smaller TP batches lose to ordered decode. Single-host execution
-         * starts at two; the network crossover is backend-specific. */
-        if (s->ds41_graph.tp_world == 2 && count < (cuda ? 5 : 3)) return false;
-        graphs[i] = &s->ds41_graph;
-    }
-    return ds41_batch_workspace(graphs, count) != NULL;
-}
-
-#endif
 
 #ifdef DS4_HAS_QWEN4_METAL
 /* Batch weight-only work in the shared arena while keeping each session's
@@ -74832,7 +74152,6 @@ static int ds4_sessions_eval_batch_native(
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(1);
 #endif
     bool ok = ds4_gpu_begin_commands() != 0;
-    const bool native_ds41 = ds4_session_is_ds41(items[0].session);
     const uint32_t prefill_rows = prefill ?
         (uint32_t)(prefill_prompt->len - prefill->checkpoint.len) : 0u;
     const bool native_glm53 = ok &&
@@ -74843,29 +74162,12 @@ static int ds4_sessions_eval_batch_native(
 #else
     const bool native_qwen4 = false;
 #endif
-    const bool native_shared = ok && !native_ds41 && !native_glm53 && !native_qwen4 &&
+    const bool native_shared = ok && !native_glm53 && !native_qwen4 &&
         metal_graph_native_session_batch_shared_supported(items, count, e);
     const bool native_qkv = native_shared &&
         metal_graph_native_session_batch_qkv_supported(items, count, e);
-    if (native_ds41) {
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-        ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
-        int tokens[DS4_TP_BATCH_MAX_ROWS];
-        for (uint32_t i = 0; i < prefill_rows; i++) {
-            graphs[i] = &prefill->ds41_graph;
-            tokens[i] = prefill_prompt->v[prefill->checkpoint.len + i];
-        }
-        for (int i = 0; i < count; i++) {
-            graphs[prefill_rows + i] = &items[i].session->ds41_graph;
-            tokens[prefill_rows + i] = items[i].token;
-        }
-        ok = ok && ds41_graph_step_batch(graphs, tokens, count + (int)prefill_rows,
-                                          prefill_rows, &e->model, &e->weights);
-#else
-        ok = false;
-#endif
 #ifdef DS4_HAS_QWEN4_METAL
-    } else if (native_qwen4) {
+    if (native_qwen4) {
         ok = qwen4_graph_encode_native_session_batch(
                 items, count, e->qwen4_shared_workspace, &e->model, &e->weights);
 #endif
@@ -74905,18 +74207,7 @@ static int ds4_sessions_eval_batch_native(
 #if defined(__APPLE__)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(0);
 #endif
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ok && e->tp.active && ds4_gpu_tp_failed()) {
-        if (err && errlen) snprintf(err, errlen, "tp: batch gate transport failed");
-        ok = false;
-    }
-#endif
 
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ok && prefill)
-        ok = ds4_gpu_tensor_read(prefill->ds41_graph.logits, 0, prefill->logits,
-                                  (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
-#endif
     for (int i = 0; ok && i < count; i++) {
         ds4_session *s = items[i].session;
 #ifdef DS4_HAS_QWEN4_METAL
@@ -74936,9 +74227,6 @@ static int ds4_sessions_eval_batch_native(
 #endif
         ds4_gpu_tensor *logits = ds4_session_is_glm(s)
             ? s->glm_graph.logits : metal_graph_logits(&s->graph);
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-        if (native_ds41) logits = s->ds41_graph.logits;
-#endif
         ok = ds4_gpu_tensor_read(logits,
                                  0,
                                  s->logits,
@@ -74977,7 +74265,7 @@ static int ds4_sessions_eval_batch_native(
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
         if (updates_dense) ds4_session_glm_note_dense_cache(s, pos, 1);
-        if (!ds4_session_is_glm(s) && !native_ds41) {
+        if (!ds4_session_is_glm(s)) {
             ds4_session_dspark_capture_note_checkpoint(s);
         }
     }
@@ -74985,19 +74273,15 @@ static int ds4_sessions_eval_batch_native(
         prefill->progress(prefill->progress_ud, "prefill_chunk",
                           prefill_prompt->len, prefill_prompt->len);
 #ifdef DS4_TEST_HOOKS
-    if (native_ds41) {
-        ds4_test_ds41_native_evals++;
-        if (prefill) ds4_test_mixed_native_evals++;
-    }
+    if (native_qwen4 && prefill) ds4_test_mixed_native_evals++;
 #endif
     if (getenv("DS4_METAL_SESSION_BATCH_LOG") != NULL) {
         fprintf(stderr,
                 "ds4: %s session batch rows=%d prefill_rows=%u family=%s "
-                "native_ds41=%d native_glm53=%d native_qwen4=%d native_shared=%d native_qkv=%d\n",
+                "native_glm53=%d native_qwen4=%d native_shared=%d native_qkv=%d\n",
                 ds4_backend_name(e->backend), count, prefill_rows,
                 ds4_session_is_glm(items[0].session) ? "glm" :
                 ds4_session_is_qwen4(items[0].session) ? "qwen" : "deepseek",
-                native_ds41 ? 1 : 0,
                 native_glm53 ? 1 : 0,
                 native_qwen4 ? 1 : 0,
                 native_shared ? 1 : 0,
@@ -75006,25 +74290,6 @@ static int ds4_sessions_eval_batch_native(
     return 0;
 }
 
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-static bool ds41_mixed_batch_supported(ds4_decode_item *items, int count,
-                                       ds4_session *prefill, const ds4_tokens *prompt) {
-    const int rows = prompt->len - prefill->checkpoint.len;
-    if (count < 1 || rows < 1 || count >= DS4_TP_BATCH_MAX_ROWS ||
-        rows > DS4_TP_BATCH_MAX_ROWS - count || ds4_session_cancelled(prefill)) return false;
-    ds4_decode_item combined[DS4_TP_BATCH_MAX_ROWS];
-    for (int i = 0; i < rows; i++)
-        combined[i] = (ds4_decode_item){prefill, prompt->v[prefill->checkpoint.len + i]};
-    for (int i = 0; i < count; i++) {
-        if (ds4_session_cancelled(items[i].session)) return false;
-        combined[rows + i] = items[i];
-    }
-    if (prefill->engine->backend == DS4_BACKEND_CUDA)
-        return metal_graph_tp_env_flag("DS4_CUDA_MIXED_PREFILL_DECODE", true) &&
-            ds41_sessions_batch_supported(combined, rows + count, prefill->engine);
-    return ds4_sessions_eval_batch_metal_supported(combined, rows + count, prefill->engine);
-}
-#endif
 
 static bool ds4_sessions_eval_batch_with_prefill_metal_supported(
         ds4_decode_item *items,
@@ -75597,12 +74862,6 @@ int ds4_sessions_eval_batch_with_prefill(
     }
 
 #ifndef DS4_NO_GPU
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(prefill_session) &&
-        ds41_mixed_batch_supported(items, count, prefill_session, prefill_prompt))
-        return ds4_sessions_eval_batch_native(items, count, prefill_session->engine,
-                                              prefill_session, prefill_prompt, err, errlen);
-#endif
     if (prefill_session->engine->backend == DS4_BACKEND_CUDA) {
         return ds4_sessions_eval_batch_with_prefill_cuda(
                 items, count, prefill_session, prefill_prompt, err, errlen);
@@ -79340,12 +78599,8 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
      * cross-device events.  Encoding several independent graphs before the
      * final synchronization lets their packets fill different pipeline stages
      * while preserving the exact one-token kernels and per-session KV order. */
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(first) && ds41_sessions_batch_supported(items, count, e))
-        return ds4_sessions_eval_batch_native(items, count, e, NULL, NULL, err, errlen);
-#endif
     if (e->backend == DS4_BACKEND_CUDA &&
-        !ds4_session_is_glm(first) && !ds4_session_is_ds41(first) &&
+        !ds4_session_is_glm(first) &&
         !ds4_session_is_qwen4(first) &&
         e->support_kind == DS4_SUPPORT_NONE) {
         bool ok = ds4_gpu_begin_commands() != 0;
@@ -79475,7 +78730,7 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
     const bool native_supported =
         native_requested &&
         e->backend == DS4_BACKEND_CUDA &&
-        !ds4_session_is_glm(prefill_session) && !ds4_session_is_ds41(prefill_session) &&
+        !ds4_session_is_glm(prefill_session) &&
         !ds4_session_is_qwen4(prefill_session) &&
         e->support_kind == DS4_SUPPORT_NONE &&
         metal_graph_mixed_prefill_decode_supported(
@@ -80560,9 +79815,6 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_image_count = 0;
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (s->ds41_graph_ready) ds41_graph_reset(&s->ds41_graph);
-#endif
     ds4_session_glm_reset_dense_cache(s);
 #endif
 }

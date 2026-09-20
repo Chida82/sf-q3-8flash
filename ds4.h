@@ -293,20 +293,10 @@ int ds4_chat_append_multimodal_message(ds4_engine *e,
                                        char *error,
                                        size_t error_cap);
 int ds4_engine_tp_vocab_split(ds4_engine *e);
-bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
-                                        uint32_t layer,
-                                        uint32_t full_live,
-                                        uint32_t key_dim,
-                                        uint32_t value_dim,
-                                        uint32_t compact_live,
-                                        uint32_t index_live,
-                                        uint64_t *out);
 /* Stable id for cache compatibility.  0 is the original Flash shape, so old
  * KV files with the previously-zero reserved byte remain Flash-compatible;
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
-bool ds4_engine_is_glm_dsa(ds4_engine *e);
-bool ds4_engine_is_glm53(ds4_engine *e);
 bool ds4_engine_is_qwen4(ds4_engine *e);
 /* Qwen3.8 reasoning-effort system instruction for a think mode (NULL when none) */
 const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode);
@@ -316,7 +306,6 @@ int ds4_think_mode_level(ds4_think_mode mode);
 bool ds4_think_mode_parse_level(const char *text, ds4_think_mode *out);
 const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);
-const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode);
 uint32_t ds4_think_max_min_context(void);
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
 /* Uses the active model shape selected by ds4_engine_open(); call after opening
@@ -356,9 +345,6 @@ int ds4_dump_chat_tokenization(const char *model_path,
                                int ctx_size,
                                FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
-bool ds4_engine_is_glm_dsa(ds4_engine *e);
-bool ds4_engine_is_deepseek41(ds4_engine *e);
-const char *ds4_deepseek41_reasoning_effort_text(ds4_think_mode mode);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt);
@@ -505,7 +491,6 @@ int ds4_test_speculative_delta_sample(const float *target_logits,
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
 uint64_t ds4_test_mixed_native_count(void);
-uint64_t ds4_test_ds41_batch_count(void);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
