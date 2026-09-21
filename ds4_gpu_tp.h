@@ -41,13 +41,7 @@ int ds4_gpu_tp_gate_prefetch_plan(uint32_t gate,
                                 const void *model_map, uint64_t model_size,
                                 const uint64_t *offsets, const uint64_t *bytes,
                                 uint32_t count);
-/* Coordinator-only drafting is replicated; verification remains sharded. */
-void ds4_gpu_tp_suspend_expert_sharding(int suspend);
 /* No-op when TP is not bound. */
 void ds4_gpu_tp_keepalive_pause(int paused);
-/* GLM attention head ownership; the caller zeros unowned heads and exchanges
- * the output-projection partials at the big gate. */
-void ds4_gpu_tp_set_attn_head_split(int enabled);
-
 /* sf-ablate(build): C++ linkage guard removed; this child has no C++ translation unit. */
 #endif

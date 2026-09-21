@@ -130,7 +130,54 @@ routine unit test; use an existing local GGUF or ask first.
 - Docs describe only this child. Delete stale paragraphs rather than rewriting
   upstream text into a different promise.
 - For upstream updates, follow StarForge `SYNC.md`: fetch `upstream`, merge on
-  `sync/<sha7>`, let rerere help, never use `-X ours/theirs`, test, update
-  `TRACE.md`, and run parity. `TRACE.md` is only for upstream-sync reasoning.
+  `sync/<sha7>`, let rerere help, never use `-X ours/theirs`, test, and run
+  parity. Sync reasoning lives in the `sf-ablate`/`sf-keep` markers at the cut
+  and in the commit message, never in a separate ledger.
 - Stop and ask if upstream renamed/split a `ds4_*` file, a conflict changes
   shared Qwen numerics, or model-less tests pass while parity fails.
+
+## Why this repository keeps shrinking
+
+The point of a child is not only a smaller binary. It is a source tree that an
+agent (or a person) can load, read and reason about with the fewest tokens
+possible, so that Qwen3.8-specific optimisation work is cheap and safe. That
+goal is weighed against sync cost: every removed line is a divergence from
+upstream that `git merge upstream/main` will bring back as a conflict, and
+`git rerere` only replays a resolution when the conflict text is identical.
+Whole dead functions repay that cost many times over (tens or hundreds of
+lines per conflict site). Scattered dead conditionals do not, and the
+compiler already drops them from the binary; remove them only when the
+token saving is real and the site is not interleaved with preprocessor
+directives that break mechanical tools.
+
+## Names that lie: do not remove by name, verify by reachability
+
+Upstream grew several models in one tree, so many identifiers carry the name
+of the model they were written for, not of the code they now serve. The list
+below is what this child has established so far. At a sync, take upstream
+fixes to these even when the name looks foreign; at an ablation, never delete
+them on the strength of the name alone.
+
+| Name family | What it really is | Evidence |
+|---|---|---|
+| `glm_graph_*`, `glm_gpu_graph`, `glm_dense_*`, `glm_debug_*` | the shared Metal graph host: workspace, tensor views, env toggles, matmul wrappers. Qwen3.8 runs on it | ~1,200 references remain after every GLM-5.3 branch was removed; the build depends on them |
+| `glm_mtp`, `glm_mtp_timing`, `glm_mtp_have` | the built-in MTP switch. `--mtp` sets `engine.glm_mtp`; Qwen speculation is off without it | `ds4_cli.c` `--mtp` handler; `ds4_session_eval_speculative*` Qwen branch |
+| `spec_frontier_*`, `metal_graph_dspark_cache_*`, `g->dspark_cache_*` | snapshot/rollback frontier used by `ds4_session_tp_spec_cycle` (TP plumbing, SPEC.md §B). Qwen's own `--mtp` path never reaches it | runtime probes: zero hits with `--mtp`, with depth pinned to 2, and with `DS4_MTP_FORCE_SNAPSHOT` |
+| `dspark_exact_sampling` | the `--mtp-exact-sampling` flag for built-in MTP; not DSpark | `ds4_cli.c`, `ds4_server.c` handlers |
+| `dsv4_*.metal`, `kernel_dsv4_*` | DeepSeek-derived kernels that the Qwen graph reuses (hc, kv, rope, misc) | every kernel in those files is referenced from `ds4_metal.m` |
+| `ds4_deepseek4_attention_bounds` and the `deepseek4.*` GGUF key readers | shared attention-bounds helper and metadata readers | called from the Qwen path |
+
+When in doubt, prove it: build with the symbol removed, or add a one-line
+`fprintf` probe and run the model. A probe result outranks any name.
+
+## Misleading-name traps that already cost time
+
+- `make cpu` links the CPU-reference build over the same four binary names;
+  the next model-backed run then fails with "requires Metal or single-GPU
+  CUDA". Rebuild with `make` first.
+- `mtp-verify-depth` (removed) exercised the external MTP support model, not
+  built-in MTP, so it could only skip or fail here.
+- A preprocessor-output diff (`cc -E -P` before/after) cannot see the removal
+  of `#error`/`#warning` guards or of `#else` fallbacks whose condition is true
+  in the tested configuration. Check those with a negative compile, never with
+  the oracle alone.

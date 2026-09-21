@@ -130,7 +130,6 @@ typedef struct {
 
 typedef struct {
     const char *model_path;
-    const char *mtp_path;
     const char *vision_path;
     ds4_backend backend;
     int n_threads;
@@ -138,7 +137,6 @@ typedef struct {
     uint32_t prefill_chunk;
     int mtp_draft_tokens;
     float mtp_margin;
-    float dspark_confidence_threshold;
     const char *directional_steering_file;
     const char *expert_profile_path;
     float directional_steering_attn;
@@ -153,10 +151,7 @@ typedef struct {
     bool quality;
     bool glm_mtp;
     bool glm_mtp_timing;
-    bool dspark;
-    bool dspark_strict;
     bool dspark_exact_sampling;
-    bool dspark_confidence_threshold_set;
     bool cuda_tensor_parallel;
     bool ssd_streaming;
     bool ssd_streaming_cold;
