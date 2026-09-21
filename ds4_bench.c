@@ -376,7 +376,7 @@ static bench_config parse_options(int argc, char **argv) {
         exit(2);
     }
     if (c.dist.role == DS4_DISTRIBUTED_WORKER || c.tp.role == DS4_TP_WORKER) {
-        fprintf(stderr, "ds4-bench: --role worker is a serving mode; start workers with ./ds4\n");
+        fprintf(stderr, "ds4-bench: --role worker is a serving mode; start workers with ./sf-q3-8flash\n");
         exit(2);
     }
     return c;

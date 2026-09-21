@@ -28,6 +28,13 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+/* sf: the child identity comes from the Makefile's SF_DEFS block.  Guard it
+ * before the first use below, so a stray `cc ds4_cli.c` reports this instead
+ * of a syntax error on the first macro that stayed unexpanded. */
+#if !defined(SF_DEFAULT_MODEL) || !defined(SF_HOME)
+#error "build through the Makefile"
+#endif
+
 typedef struct {
     const char *prompt;
     const char *system;
@@ -1863,10 +1870,6 @@ static char *read_prompt_file(const char *path, bool fatal) {
     return buf;
 }
 
-#ifndef SF_DEFAULT_MODEL
-#error "build through the Makefile"
-#endif
-
 static cli_config parse_options(int argc, char **argv) {
     cli_config c = {
         .engine = {
@@ -2109,7 +2112,7 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {
-            fprintf(stderr, "ds4: use ds4-server for the HTTP server\n");
+            fprintf(stderr, "ds4: use sf-q3-8flash-server for the HTTP server\n");
             exit(2);
         } else {
             fprintf(stderr, "ds4: unknown option: %s\n", arg);

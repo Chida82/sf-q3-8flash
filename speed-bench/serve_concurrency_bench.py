@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end serving benchmark for ds4-server under concurrent load.
+"""End-to-end serving benchmark for sf-q3-8flash-server under concurrent load.
 
 The engine-level harness (speed-bench/session_concurrency_bench.c) measures
 what the graph can do.  This one measures what a client actually gets: queueing
@@ -320,7 +320,7 @@ def make_payload(args, prompt):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Concurrent serving benchmark for ds4-server",
+        description="Concurrent serving benchmark for sf-q3-8flash-server",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--base-url", default="http://127.0.0.1:8004")
     parser.add_argument("--model", default="qwen3.8-flash-next")

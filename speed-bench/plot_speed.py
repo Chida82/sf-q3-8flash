@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate an SVG throughput graph from a ds4-bench CSV file.
+"""Generate an SVG throughput graph from a sf-q3-8flash-bench CSV file.
 
 The benchmark intentionally reports instantaneous throughput at each context
 frontier. This script keeps the plot equally direct: one line for incremental
@@ -206,8 +206,8 @@ def frange(start, stop, step):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot ds4-bench throughput CSV data as SVG.")
-    parser.add_argument("csv", type=Path, help="input CSV produced by ds4-bench")
+    parser = argparse.ArgumentParser(description="Plot sf-q3-8flash-bench throughput CSV data as SVG.")
+    parser.add_argument("csv", type=Path, help="input CSV produced by sf-q3-8flash-bench")
     parser.add_argument("-o", "--output", type=Path, help="output SVG path")
     parser.add_argument("--title", help="graph title; defaults to a title derived from the CSV name")
     parser.add_argument("--width", type=int, default=960, help="SVG width in pixels")

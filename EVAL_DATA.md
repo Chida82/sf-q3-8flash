@@ -1,6 +1,6 @@
 # Evaluation data
 
-`ds4-eval` contains small, curated subsets of external benchmarks. They are
+`sf-q3-8flash-eval` contains small, curated subsets of external benchmarks. They are
 integration tests for DwarfStar, not official benchmark distributions or
 leaderboard scores. Case IDs are retained so each prompt can be checked against
 its source.
@@ -34,7 +34,7 @@ Selected source IDs:
 
 The MMLU-Pro choices and keys are unchanged. OlympiadBench cases are English,
 text-only rows; only their published final answers are embedded. LiveBench's
-benchmark-specific output wrapper was removed because `ds4-eval` supplies one
+benchmark-specific output wrapper was removed because `sf-q3-8flash-eval` supplies one
 uniform final-answer instruction. The NIST cases are short, locally written
 reductions of Juliet weakness patterns rather than copies of complete Juliet
 test cases.

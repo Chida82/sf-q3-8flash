@@ -3,7 +3,7 @@
 /* Session-concurrency benchmark.
  *
  * Serving several requests at once is a different regime from the single
- * session walk ds4-bench measures.  The numbers that matter here are the
+ * session walk sf-q3-8flash-bench measures.  The numbers that matter here are the
  * aggregate decode throughput at a given batch width, how much per-stream
  * speed is lost as the width grows, and how badly a resumed prefill disturbs
  * the decoders that share the engine.  This harness drives the engine API
@@ -100,7 +100,7 @@ typedef struct {
     double prefill_wall_s;      /* whole wave, first stream start to last done */
     double prefill_last_ttft_s; /* the unlucky stream's wait */
     double prefill_tps;         /* aggregate prompt tokens per second */
-    double decode_agg_tps;      /* eval-only, comparable with ds4-bench */
+    double decode_agg_tps;      /* eval-only, comparable with sf-q3-8flash-bench */
     double decode_wall_tps;     /* including token selection */
     double step_ms_mean;
     double step_ms_p50;

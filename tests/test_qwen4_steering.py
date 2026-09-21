@@ -24,7 +24,7 @@ def main():
         bank[layer * 2560] = 1.0
     path = out / "directions.f32"
     path.write_bytes(bank.tobytes())
-    base = [str(root / "ds4"), "-m", str(args.model.resolve()),
+    base = [str(root / "sf-q3-8flash"), "-m", str(args.model.resolve()),
             "--ctx", "512", "--temp", "0", "--nothink", "-p",
             "Write a three-sentence summary of the plot of Hamlet."]
 
@@ -54,7 +54,7 @@ def main():
     for component in ["ffn_out", "attn_out"]:
         work = out / component
         work.mkdir(exist_ok=True)
-        rows = capture.run_capture(root / "ds4", args.model.resolve(), "Explain a rainbow.",
+        rows = capture.run_capture(root / "sf-q3-8flash", args.model.resolve(), "Explain a rainbow.",
                                    "", False, 512, component, 48, 2560, work)
         assert len(rows) == 48 and all(len(r) == 2560 for r in rows)
         assert all(math.isfinite(v) for r in rows for v in r)

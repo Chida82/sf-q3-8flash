@@ -2986,7 +2986,7 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         return false;
     }
     if (!e || !s || !ds4_engine_has_vision(e)) {
-        snprintf(err, errlen, "image input requires starting ds4-server with --vision FILE");
+        snprintf(err, errlen, "image input requires starting sf-q3-8flash-server with --vision FILE");
         return false;
     }
 
@@ -13850,7 +13850,7 @@ static server_config parse_options(int argc, char **argv) {
     }
     if (c.engine.tp.role == DS4_TP_WORKER) {
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: --role worker is a serving mode; start tensor-parallel workers with ./ds4");
+                   "ds4-server: --role worker is a serving mode; start tensor-parallel workers with ./sf-q3-8flash");
         exit(2);
     }
     return c;

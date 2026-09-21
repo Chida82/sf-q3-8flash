@@ -3,11 +3,10 @@
 /* Shared disk KV checkpoint file support.
  *
  * The low-level file layout and payload helpers are intentionally shared.  The
- * ds4-server still owns the automatic byte-prefix cache policy built on top of
- * this file; ds4-agent uses only the same durable format for explicit sessions,
- * with its own policy in ds4_agent.c.  Protocol-specific extras, such as the
- * server's tool-id -> exact DSML trailer, are attached through trailer hooks and
- * still live with the protocol code that owns those mappings. */
+ * server owns the automatic byte-prefix cache policy built on top of this
+ * file.  Protocol-specific extras, such as the server's tool-id -> exact DSML
+ * trailer, are attached through trailer hooks and still live with the protocol
+ * code that owns those mappings. */
 
 #include <ctype.h>
 #include <dirent.h>

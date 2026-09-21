@@ -1,4 +1,4 @@
-/* Run on two dedicated Metal hosts; the peer is the ordinary ds4 worker. */
+/* Run on two dedicated Metal hosts; the peer is the ordinary sf-q3-8flash worker. */
 #include "../ds4.h"
 #include "../ds4_tp.h"
 #include <math.h>

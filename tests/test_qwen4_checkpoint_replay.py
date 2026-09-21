@@ -54,7 +54,7 @@ def main():
         port = sock.getsockname()[1]
     base = f"http://127.0.0.1:{port}"
     cmd = [
-        str(root / "ds4-server"),
+        str(root / "sf-q3-8flash-server"),
         "-m",
         str(pathlib.Path(args.model).resolve()),
         "--ctx",

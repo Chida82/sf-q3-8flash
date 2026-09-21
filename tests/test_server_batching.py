@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Concurrent API correctness/load check for ds4-server session batching.
+"""Concurrent API correctness/load check for sf-q3-8flash-server session batching.
 
 Each case is submitted twice with the same non-zero seed. The pairs run in one
 cold concurrent wave and must return identical output, even though prompt sizes
@@ -46,7 +46,7 @@ def make_payload(case, case_number, nonce, stream):
         "Do not quote the filler.\nFILLER:\n%s"
     ) % (nonce, case_number, name, filler)
     payload = {
-        "model": "deepseek-chat",
+        "model": "qwen3.8-flash-next.gguf",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": temperature,
@@ -170,7 +170,7 @@ def comparable(result):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8004")
-    parser.add_argument("--model", default="deepseek-chat")
+    parser.add_argument("--model", default="qwen3.8-flash-next.gguf")
     parser.add_argument("--pairs", type=int, default=4)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--timeout", type=float, default=1800.0)

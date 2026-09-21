@@ -13,7 +13,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--backend", choices=("metal", "cuda"))
+    parser.add_argument("--backend", choices=("metal",))
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     out = args.output or Path(tempfile.mkdtemp(prefix="qwen-logit-dump-"))
@@ -37,7 +37,7 @@ def main():
     print(f"Logit dump diagnostics: {out}", flush=True)
     with (out / "stdout").open("wb") as stdout, (out / "stderr").open("wb") as stderr:
         result = subprocess.run(
-            [str(root / "ds4"), *(["--" + args.backend] if args.backend else []), "-m", str(args.model.resolve()),
+            [str(root / "sf-q3-8flash"), *(["--" + args.backend] if args.backend else []), "-m", str(args.model.resolve()),
              "--ctx", "256",
              "--first-token-test", "-p", "hello"], cwd=root, env=env,
             stdout=stdout, stderr=stderr, timeout=300)

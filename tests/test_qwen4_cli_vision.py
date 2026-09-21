@@ -15,7 +15,7 @@ import tempfile
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", default="./ds4")
+    parser.add_argument("--binary", default="./sf-q3-8flash")
     parser.add_argument("--model", required=True)
     parser.add_argument("--vision", required=True)
     parser.add_argument("--image", action="append", required=True)

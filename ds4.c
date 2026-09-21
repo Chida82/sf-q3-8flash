@@ -53869,9 +53869,9 @@ static void ds4_acquire_instance_lock(void) {
                 owner = strtol(buf, &end, 10);
             }
             if (owner > 0) {
-                fprintf(stderr, "ds4: another ds4 process is already running (pid %ld); refusing to start\n", owner);
+                fprintf(stderr, "sf-q3-8flash: another sf-q3-8flash process is already running (pid %ld); refusing to start\n", owner);
             } else {
-                fprintf(stderr, "ds4: another ds4 process is already running; refusing to start\n");
+                fprintf(stderr, "sf-q3-8flash: another sf-q3-8flash process is already running; refusing to start\n");
             }
             close(fd);
             exit(2);
