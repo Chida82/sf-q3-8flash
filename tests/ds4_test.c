@@ -6,8 +6,7 @@
 #include "../ds4_gpu.h"
 #include <math.h>
 
-bool ds4_test_dspark_cache_window_crop(void);
-bool ds4_test_dspark_prefix_capture(ds4_engine *engine, const ds4_tokens *prompt);
+/* sf-ablate(specdec): DSpark tests removed with the external support-model path (registry: Qwen3.8 uses built-in MTP only). */
 
 static ds4_engine *test_engine_fast;
 static ds4_engine *test_engine_quality;
@@ -1256,9 +1255,6 @@ static void test_metal_store_raw_kv_batch_wrap(void) {
     ds4_gpu_tensor_free(raw);
 }
 
-static void test_dspark_cache_window_crop(void) {
-    TEST_ASSERT(ds4_test_dspark_cache_window_crop());
-}
 
 static void test_metal_q8_0_decode_pair_exact_case(
         uint32_t out0_dim,
@@ -5127,7 +5123,6 @@ static void test_metal_kernel_group(void) {
     test_metal_q8_0_prefill_matmul();
     test_metal_pack_slot_rows_f32();
     test_metal_store_raw_kv_batch_wrap();
-    test_dspark_cache_window_crop();
     test_metal_q8_0_decode_pair_exact();
 #if defined(__APPLE__)
     test_metal_f16_compressor_pair_state_store_exact();
@@ -6956,37 +6951,7 @@ static const char *test_mtp_copy_prompt(void) {
 }
 
 #define TEST_MTP_MAXGEN 256
-#define TEST_DSPARK_MAXGEN 128
 
-static ds4_engine *test_open_dspark_engine(const char *support_path) {
-    ds4_engine *engine = NULL;
-    ds4_engine_options opt = {
-        .model_path = test_model_path(),
-#ifdef __APPLE__
-        .backend = DS4_BACKEND_METAL,
-#else
-        .backend = DS4_BACKEND_CUDA,
-#endif
-        .quality = false,
-        .prefill_chunk = 512,
-        .ssd_streaming = test_env_bool("DS4_TEST_SSD_STREAMING"),
-        .ssd_streaming_cold = test_env_bool("DS4_TEST_SSD_STREAMING_COLD"),
-        .ssd_streaming_cache_experts =
-            test_env_u32("DS4_TEST_SSD_STREAMING_CACHE_EXPERTS"),
-        .ssd_streaming_cache_bytes =
-            test_env_gib("DS4_TEST_SSD_STREAMING_CACHE_GB"),
-        .ssd_streaming_preload_experts =
-            test_env_u32("DS4_TEST_SSD_STREAMING_PRELOAD_EXPERTS"),
-        .mtp_path = support_path,
-        .mtp_draft_tokens = 0,
-        .dspark = true,
-        .dspark_confidence_threshold = 0.9f,
-        .dspark_confidence_threshold_set = true,
-    };
-    const int rc = ds4_engine_open(&engine, &opt);
-    TEST_ASSERT(rc == 0);
-    return rc == 0 ? engine : NULL;
-}
 
 /* Regression for the swapped top-k arguments in metal_graph_verify_suffix_tops
  * at draft depth > 2.  Replays the committed speculative tokens through plain
@@ -7031,66 +6996,6 @@ static void test_mtp_verify_depth(void) {
     ds4_tokens_free(&prompt);
 }
 
-/* Same invariant as the MTP depth smoke, but for the DSpark support model.  This
- * is separate from the fixture because it teacher-forces every committed token
- * through normal decode and directly checks that DSpark never commits a token
- * that was not near the target argmax. */
-static void test_dspark_verify_depth(void) {
-    const char *support = getenv("DS4_TEST_DSPARK");
-    if (!support || !support[0]) {
-        fprintf(stderr, "ds4-test: dspark-verify-depth skipped (set DS4_TEST_DSPARK to a DSpark support GGUF)\n");
-        return;
-    }
-
-    char *saved_scheduler = test_save_env("DS4_DSPARK_SCHEDULER");
-    setenv("DS4_DSPARK_SCHEDULER", "0", 1);
-
-    ds4_engine *engine = test_open_dspark_engine(support);
-    ds4_tokens prompt = {0};
-    int *spec = NULL;
-
-    if (engine) {
-        const int draft_depth = ds4_engine_mtp_draft_tokens(engine);
-        TEST_ASSERT(draft_depth > 2);
-
-        ds4_chat_begin(engine, &prompt);
-        ds4_chat_append_message(engine, &prompt, "user", test_mtp_copy_prompt());
-        ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
-        TEST_ASSERT(prompt.len > 0);
-
-        TEST_ASSERT(ds4_test_dspark_prefix_capture(engine, &prompt));
-
-        spec = malloc((size_t)TEST_DSPARK_MAXGEN * sizeof(*spec));
-        TEST_ASSERT(spec != NULL);
-        if (draft_depth > 2 && spec && prompt.len > 0) {
-            int nspec = 0, max_chunk = 0;
-            const bool ok_spec = test_mtp_capture_speculative(engine, &prompt,
-                                                              TEST_DSPARK_MAXGEN,
-                                                              spec, &nspec,
-                                                              &max_chunk);
-            TEST_ASSERT(ok_spec);
-            TEST_ASSERT(max_chunk > 1);
-            TEST_ASSERT(nspec > 64);
-
-            float worst_gap = 0.0f;
-            int worst_at = -1;
-            const bool ok_check = test_mtp_worst_argmax_gap(engine, &prompt,
-                                                            spec, nspec,
-                                                            &worst_gap,
-                                                            &worst_at);
-            TEST_ASSERT(ok_check);
-            fprintf(stderr,
-                    "ds4-test: dspark-verify-depth nspec=%d max_chunk=%d draft_depth=%d worst_argmax_gap=%.3f at=%d\n",
-                    nspec, max_chunk, draft_depth, worst_gap, worst_at);
-            TEST_ASSERT(worst_gap <= 2.0f);
-        }
-    }
-
-    free(spec);
-    ds4_tokens_free(&prompt);
-    ds4_engine_close(engine);
-    test_restore_env("DS4_DSPARK_SCHEDULER", saved_scheduler);
-}
 #endif
 
 static void test_server_unit_group(void) {
@@ -7124,7 +7029,6 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
-    {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
@@ -7161,7 +7065,6 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local fixture. Default: flash-0731/local-golden.vec.");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
     puts("  DS4_TEST_MTP=FILE         Legacy MTP support GGUF for --mtp-verify-depth.");
-    puts("  DS4_TEST_DSPARK=FILE      DSpark support GGUF for --dspark-verify-depth.");
     puts("  DS4_TEST_CONTINUED_PREFILL_TOKENS=N  Large suffix size for --glm53-continued-prefill.");
     puts("  DS4_TEST_CONTINUED_PREFILL_STEPS=N   Number of consecutive large suffixes to test.");
     puts("  DS4_TEST_CONTINUED_PREFILL_ALLOW_COARSE=1  Permit coarse short-suffix progress for baseline timing.");
