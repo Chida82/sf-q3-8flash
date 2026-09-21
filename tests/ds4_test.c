@@ -102,9 +102,9 @@ static ds4_backend test_model_backend(void) {
 
 static ds4_engine *test_open_engine(bool quality) {
     ds4_engine *engine = NULL;
-    /* DS4_TEST_MTP loads the MTP head on the fast engine so the speculative
-     * verify regression can reuse it; draft=4 hits the multi-row verify path. */
-    const char *mtp = getenv("DS4_TEST_MTP");
+    /* sf-ablate(specdec): DS4_TEST_MTP loaded an external MTP head; this child
+     * has no external support model. Built-in Qwen MTP is driven by
+     * DS4_TEST_GLM_MTP below. */
     ds4_engine_options opt = {
         .model_path = test_model_path(),
         .backend = test_model_backend(),
@@ -117,8 +117,6 @@ static ds4_engine *test_open_engine(bool quality) {
             test_env_gib("DS4_TEST_SSD_STREAMING_CACHE_GB"),
         .ssd_streaming_preload_experts =
             test_env_u32("DS4_TEST_SSD_STREAMING_PRELOAD_EXPERTS"),
-        .mtp_path = (mtp && mtp[0] && !quality) ? mtp : NULL,
-        .mtp_draft_tokens = (mtp && mtp[0] && !quality) ? 4 : 0,
         .glm_mtp = test_env_bool("DS4_TEST_GLM_MTP"),
         .dspark_exact_sampling = test_env_bool("DS4_TEST_MTP_EXACT"),
     };
@@ -6953,48 +6951,6 @@ static const char *test_mtp_copy_prompt(void) {
 #define TEST_MTP_MAXGEN 256
 
 
-/* Regression for the swapped top-k arguments in metal_graph_verify_suffix_tops
- * at draft depth > 2.  Replays the committed speculative tokens through plain
- * decode and requires each to be a (near-)argmax: that is the verify invariant,
- * and unlike comparing token streams it tolerates the near-greedy tie
- * divergences.  Needs an MTP head, so it self-skips without DS4_TEST_MTP. */
-static void test_mtp_verify_depth(void) {
-    ds4_engine *engine = test_get_engine(false);
-    if (!engine || !ds4_engine_has_mtp(engine)) {
-        fprintf(stderr, "ds4-test: mtp-verify-depth skipped (set DS4_TEST_MTP to an MTP GGUF)\n");
-        return;
-    }
-    TEST_ASSERT(ds4_engine_mtp_draft_tokens(engine) > 2);
-
-    ds4_tokens prompt = {0};
-    ds4_chat_begin(engine, &prompt);
-    ds4_chat_append_message(engine, &prompt, "user", test_mtp_copy_prompt());
-    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
-    TEST_ASSERT(prompt.len > 0);
-
-    int *spec = malloc((size_t)TEST_MTP_MAXGEN * sizeof(*spec));
-    TEST_ASSERT(spec != NULL);
-    if (spec && prompt.len > 0) {
-        int nspec = 0, max_chunk = 0;
-        const bool ok_spec = test_mtp_capture_speculative(engine, &prompt, TEST_MTP_MAXGEN,
-                                                          spec, &nspec, &max_chunk);
-        TEST_ASSERT(ok_spec);
-        TEST_ASSERT(max_chunk > 1);  /* multi-token chunks committed: the multi-row path ran */
-        TEST_ASSERT(nspec > 128);    /* enough output to surface the bug, incl. a spurious-EOS truncation */
-
-        float worst_gap = 0.0f;
-        int worst_at = -1;
-        const bool ok_check = test_mtp_worst_argmax_gap(engine, &prompt, spec, nspec,
-                                                        &worst_gap, &worst_at);
-        TEST_ASSERT(ok_check);
-        fprintf(stderr, "ds4-test: mtp-verify-depth nspec=%d max_chunk=%d worst_argmax_gap=%.3f at=%d\n",
-                nspec, max_chunk, worst_gap, worst_at);
-        TEST_ASSERT(worst_gap <= 2.0f);  /* correct: ~0; bug: ~21 on the reference model */
-    }
-
-    free(spec);
-    ds4_tokens_free(&prompt);
-}
 
 #endif
 
@@ -7028,7 +6984,6 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
-    {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
@@ -7064,7 +7019,6 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_VECTOR_FILE=FILE  Official fixture. Default: flash-0731/official.vec.");
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local fixture. Default: flash-0731/local-golden.vec.");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
-    puts("  DS4_TEST_MTP=FILE         Legacy MTP support GGUF for --mtp-verify-depth.");
     puts("  DS4_TEST_CONTINUED_PREFILL_TOKENS=N  Large suffix size for --glm53-continued-prefill.");
     puts("  DS4_TEST_CONTINUED_PREFILL_STEPS=N   Number of consecutive large suffixes to test.");
     puts("  DS4_TEST_CONTINUED_PREFILL_ALLOW_COARSE=1  Permit coarse short-suffix progress for baseline timing.");

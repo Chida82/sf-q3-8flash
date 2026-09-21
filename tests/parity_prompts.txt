@@ -7,6 +7,8 @@ Given the JSON {"a":1,"b":[1,2,3]} return the sum of all numbers. Answer with th
 Scrivi tre righe su Palermo.
 What is the capital of Australia? One word.
 Summarize the plot of Hamlet in exactly two sentences.
-Describe the sea.	--dir-steering-file dir-steering/examples/PLACEHOLDER.bin --dir-steering-ffn 2.0
+Describe the sea.	--dir-steering-file dir-steering/examples/qwen38-unit-probe.f32 --dir-steering-ffn 2.0
 Write a haiku about compilers.	--mtp
-# NOTE: PLACEHOLDER.bin must be replaced at bootstrap with a real steering vector present in the child (see dir-steering/README.md).
+# The steering prompt uses dir-steering/examples/qwen38-unit-probe.f32: one unit
+# direction per trunk layer, reproducible byte for byte, so parity exercises the
+# whole steering path deterministically (see dir-steering/README.md).

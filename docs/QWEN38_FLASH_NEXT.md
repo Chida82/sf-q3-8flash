@@ -53,7 +53,7 @@ make test-qwen4-vision
 ```sh
 make test-qwen4-kernels test-qwen4-q2 test-qwen4-prefill-reuse
 make test-q8-prefill-variants test-qwen4-ngrams
-make mtp-verify-depth DS4_TEST_MODEL=/path/to/main-with-mtp.gguf
+DS4_TEST_MODEL=/path/to/main-with-mtp.gguf DS4_TEST_GLM_MTP=1 ./ds4_test
 python3 tests/test_qwen4_checkpoint_replay.py --model /path/to/main-with-mtp.gguf
 python3 tests/test_qwen4_mtp_limits.py --model /path/to/main-with-mtp.gguf
 python3 tests/test_qwen4_logit_dump.py --model /path/to/main-with-mtp.gguf

@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Offline checks for the single-model downloader."""
+"""Offline checks for the single-model downloader.
+
+The downloader must never place a GGUF inside the repository: the Hugging Face
+CLI owns the shared cache and download.sh only links into it (SPEC.md §C). The
+fake `hf` here behaves like the real one without --local-dir: it materializes
+the file in a cache directory and prints that path.
+"""
 import hashlib
 import os
 from pathlib import Path
@@ -29,6 +35,7 @@ class DownloadTests(unittest.TestCase):
         self.root.mkdir()
         self.bin = self.root / "bin"
         self.bin.mkdir()
+        self.cache = Path(self.tmp.name) / "hub cache"
         self.out = self.root / "gguf files"
         self.script = self.root / "download.sh"
         text = (ROOT / "download.sh").read_text()
@@ -39,17 +46,22 @@ class DownloadTests(unittest.TestCase):
         self.script.write_text(text)
         hf = self.bin / "hf"
         hf.write_text("""#!/usr/bin/env python3
+import os
 from pathlib import Path
 import sys
 args = sys.argv[1:]
 assert args[:2] == ['download', ('ggml-org/Qwen3.8-Flash-Next-GGUF' if args[2].startswith('mmproj') else 'antirez/qwen3.8-flash-next-gguf')]
-out = Path(args[args.index('--local-dir') + 1])
-out.mkdir(parents=True, exist_ok=True)
-(out / args[2]).write_bytes((args[2] + '\\n').encode())
+assert '--local-dir' not in args, 'download.sh must not copy the GGUF into the repository'
+cache = Path(os.environ['FAKE_HF_CACHE'])
+cache.mkdir(parents=True, exist_ok=True)
+path = cache / args[2]
+path.write_bytes((args[2] + '\\n').encode())
+print(path)
 """)
         hf.chmod(0o755)
         self.env = dict(os.environ, HOME=str(self.root / "home"), HF_TOKEN="",
                         PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
+                        FAKE_HF_CACHE=str(self.cache),
                         DS4_GGUF_DIR=str(self.out))
 
     def run_download(self, target, ok=True):
@@ -61,12 +73,24 @@ out.mkdir(parents=True, exist_ok=True)
     def test_models_are_verified_and_linked(self):
         for target, name in (("q2", Q2), ("q4", Q4)):
             self.assertIn("Verifying SHA-256", self.run_download(target))
-            self.assertEqual((self.root / "qwen3.8-flash-next.gguf").resolve(), (self.out / name).resolve())
+            self.assertEqual((self.root / "qwen3.8-flash-next.gguf").resolve(),
+                             (self.out / name).resolve())
             self.assertIn("Already downloaded", self.run_download(target))
 
+    def test_repository_only_gains_symlinks(self):
+        self.run_download("q4")
+        linked = self.out / Q4
+        self.assertTrue(linked.is_symlink(), "gguf/ entry must be a symlink")
+        self.assertEqual(linked.resolve(), (self.cache / Q4).resolve())
+        self.assertTrue((self.root / "qwen3.8-flash-next.gguf").is_symlink())
+        strays = [p for p in self.root.rglob("*.gguf") if not p.is_symlink()]
+        self.assertEqual(strays, [], "a real GGUF was copied into the repository")
+
     def test_corrupt_model_is_rejected(self):
-        self.out.mkdir()
-        ((self.out / Q2).resolve()).write_bytes(b"bad")
+        self.cache.mkdir(parents=True, exist_ok=True)
+        (self.cache / Q2).write_bytes(b"bad")
+        self.out.mkdir(parents=True, exist_ok=True)
+        (self.out / Q2).symlink_to(self.cache / Q2)
         self.assertIn("Incorrect file size", self.run_download("q2", ok=False))
         self.assertFalse((self.root / "qwen3.8-flash-next.gguf").exists())
 
@@ -75,7 +99,7 @@ out.mkdir(parents=True, exist_ok=True)
         linked = (self.root / "qwen3.8-flash-next.gguf").resolve()
         self.run_download("vision")
         self.assertEqual((self.root / "qwen3.8-flash-next.gguf").resolve(), linked)
-        self.assertTrue((self.out / VISION).is_file())
+        self.assertTrue((self.out / VISION).is_symlink())
 
     def test_help_and_invalid_target(self):
         help_text = self.run_download("--help")

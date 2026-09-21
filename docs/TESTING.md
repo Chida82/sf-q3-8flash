@@ -21,7 +21,8 @@ make test-qwen4-ngrams
 Model-backed checks require a Qwen3.8 GGUF:
 
 ```sh
-make mtp-verify-depth DS4_TEST_MODEL=/absolute/path/model.gguf
+DS4_TEST_MODEL=/absolute/path/model.gguf DS4_TEST_GLM_MTP=1 ./ds4_test
+python3 tests/test_qwen4_mtp_limits.py --model /absolute/path/model.gguf
 ./sf-q3-8flash-eval -m /absolute/path/model.gguf --suite core
 ./sf-q3-8flash-bench -m /absolute/path/model.gguf
 ```

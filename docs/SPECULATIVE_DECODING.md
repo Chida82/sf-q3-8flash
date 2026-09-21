@@ -12,5 +12,13 @@ The runtime adaptively uses depth two or three. `DS4_QWEN4_MTP_DEPTH=2` or `=3`
 can pin the depth for diagnosis. `--mtp-exact-sampling` preserves ordinary
 sampling semantics; greedy decoding accepts matching drafts directly.
 
-Run `make mtp-verify-depth DS4_TEST_MODEL=/absolute/path/model.gguf` after
-changes to MTP, session rollback, recurrent state, batching, or sampling.
+After changes to MTP, session rollback, recurrent state, batching or sampling,
+run the session and snapshot tests with built-in MTP enabled:
+
+```sh
+DS4_TEST_MODEL=/absolute/path/model.gguf DS4_TEST_GLM_MTP=1 ./ds4_test
+python3 tests/test_qwen4_mtp_limits.py --model /absolute/path/model.gguf
+```
+
+There is no depth-verification target: the one inherited from upstream drove
+an external MTP support GGUF, which this child does not accept.

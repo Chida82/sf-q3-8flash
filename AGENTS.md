@@ -76,6 +76,10 @@ make test-qwen4-ngrams           # tokenizer / n-gram changes
 python3 tests/test_model_download.py
 ```
 
+`make cpu` links the CPU-reference build over the same four binary names, so a
+model-backed run straight after it fails with "requires Metal or single-GPU
+CUDA". Rebuild with `make` before touching the model.
+
 For vision changes, run the model-less Python metric tests first, then
 `make test-qwen4-vision` with `DS4_QWEN4_SNAPSHOT`, `DS4_QWEN4_MMPROJ`, and
 `DS4_QWEN4_IMAGE`. For server changes, always run `./ds4_test --server`; add the
@@ -84,7 +88,8 @@ smallest existing server integration test matching the changed protocol.
 Before a PR, when local GGUFs exist:
 
 ```sh
-make mtp-verify-depth DS4_TEST_MODEL=/absolute/path/model.gguf
+DS4_TEST_MODEL=/absolute/path/model.gguf DS4_TEST_GLM_MTP=1 ./ds4_test
+python3 tests/test_qwen4_mtp_limits.py --model /absolute/path/model.gguf
 ./sf-q3-8flash-eval -m /absolute/path/model.gguf --suite core
 ./sf-q3-8flash-bench -m /absolute/path/model.gguf
 ```

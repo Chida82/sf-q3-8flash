@@ -28,7 +28,7 @@ QWEN4_KERNEL_TEST := tests/test_qwen4_kernels
         test-qwen4-vision test-qwen4-moe-mm-specialize test-qwen4-prefill-reuse \
         test-q8-prefill-variants test-qwen4-ngrams test-ssd-cache \
         test-metal-session-batch test-metal-moe-prefill test-metal-dense-mpp \
-        test-metal-ssd-experts test-metal-command-memory mtp-verify-depth \
+        test-metal-ssd-experts test-metal-command-memory \
         metal-decode-schedule-bench metal-prefill-variant-bench session-concurrency-bench \
         test-download-model test-quality-api
 
@@ -42,7 +42,6 @@ help:
 	@echo "  make test-qwen4-kernels    Run Qwen3.8 Metal kernel tests"
 	@echo "  make test-qwen4-q2         Run exact low-bit decode and prefill parity"
 	@echo "  make test-qwen4-vision     Compare vision with HF (requires snapshot, mmproj, image)"
-	@echo "  make mtp-verify-depth      Test built-in MTP (skips without the main GGUF)"
 	@echo "  make clean                 Remove build outputs"
 
 $(BIN): ds4_cli.o ds4_help.o ds4_prompt_prefix.o linenoise.o $(CORE_OBJS)
@@ -267,12 +266,6 @@ test: all ds4_test q4k-dot-test mxfp4-dot-test test-session-state tests/test_lay
 	./tests/test_sampling
 	python3 tests/test_model_download.py
 
-mtp-verify-depth: ds4_test
-	@if [ ! -f "$(DS4_TEST_MODEL)" ]; then \
-		echo "mtp-verify-depth: skipped, missing model $(DS4_TEST_MODEL)"; \
-	else \
-		DS4_TEST_MODEL="$(DS4_TEST_MODEL)" DS4_TEST_GLM_MTP=1 ./ds4_test --mtp-verify-depth; \
-	fi
 
 gguf-tools/quality-testing/score_official: gguf-tools/quality-testing/score_official.c $(CORE_OBJS) rax.o
 	$(CC) $(QUALITY_CFLAGS) -I. -o $@ $^ $(METAL_LDLIBS)
