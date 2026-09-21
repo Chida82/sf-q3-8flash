@@ -19173,14 +19173,6 @@ int ds4_gpu_indexer_topk_tensor(ds4_gpu_tensor *selected, const ds4_gpu_tensor *
     return ds4_gpu_indexer_topk_tensor_impl(selected, scores, n_comp, n_tokens, top_k, 0, 0);
 }
 
-int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,
-                                    uint32_t width, uint32_t rows, uint32_t start, uint32_t ratio) {
-    if ((ratio != 1u && ratio != 2u) || !rows || rows > UINT32_MAX - start ||
-        width > INT32_MAX || rows > INT32_MAX || (start + rows) / ratio > width ||
-        (start + 1u) / ratio < 1024u) return 0;
-    return ds4_gpu_indexer_topk_tensor_impl(selected, scores, width, rows, 512u, start, ratio);
-}
-
 int ds4_gpu_argmax_tensor(
         ds4_gpu_tensor       *out_idx,
         const ds4_gpu_tensor *logits,
@@ -21148,16 +21140,6 @@ int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out,
                             uint64_t n_tok) {
     return ds4_gpu_matmul_f16_tensor_impl(out, model_map, model_size,
         weight_offset, in_dim, out_dim, x, n_tok, false);
-}
-
-int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
-                                 const void *model_map, uint64_t model_size,
-                                 uint64_t weight_offset, uint32_t width,
-                                 uint32_t outputs, uint32_t rows,
-                                 const ds4_gpu_tensor *in) {
-    if (!width || !outputs || !rows || rows > 8192u || !model_map) return 0;
-    return ds4_gpu_matmul_f16_tensor_impl(out, model_map, model_size,
-        weight_offset, width, outputs, in, rows, true);
 }
 
 int ds4_gpu_matmul_f16_pair_tensor(
@@ -36169,111 +36151,6 @@ int ds4_gpu_glm53_indexer_scores_batch_tensor(
     return ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
             scores, q, weights, indexer_key_cache, n_rows, n_tokens, pos0,
             pool_size, n_head, head_dim, scale, cache_f16, false);
-}
-
-int ds4_gpu_dsv41_tensor_ops_available(void) {
-    return ds4_gpu_mpp_available() && !g_quality_mode;
-}
-
-static uint64_t ds4_gpu_dsv41_indexer_flags_bytes(uint32_t source_rows, uint32_t rows) {
-    return (((uint64_t)rows + ((uint64_t)source_rows + 63u) / 64u) * 4u + 255u) & ~UINT64_C(255);
-}
-
-uint64_t ds4_gpu_dsv41_indexer_packed_bytes(uint32_t source_rows, uint32_t rows) {
-    return ds4_gpu_dsv41_indexer_flags_bytes(source_rows, rows) +
-        (uint64_t)rows * 32u * 128u * 2u + (((uint64_t)source_rows + 63u) / 64u) * 64u * 128u * 2u;
-}
-
-int ds4_gpu_dsv41_indexer_pack(ds4_gpu_tensor *packed,
-                              const ds4_gpu_tensor *q, const ds4_gpu_tensor *keys,
-                              uint32_t source_rows, uint32_t rows) {
-    if (!source_rows || source_rows > INT32_MAX || !rows || rows > INT32_MAX ||
-        !ds4_gpu_dsv41_tensor_ops_available()) return 0;
-    const ds4_gpu_tensor *tensors[] = {q, keys, packed};
-    const uint64_t bytes[] = {(uint64_t)rows * 32u * 128u * 4u,
-        (uint64_t)source_rows * 128u * 4u, ds4_gpu_dsv41_indexer_packed_bytes(source_rows, rows)};
-    for (uint32_t i = 0; i < 3; i++)
-        if (!tensors[i] || !ds4_gpu_tensor_buffer(tensors[i]) || ds4_gpu_tensor_bytes(tensors[i]) < bytes[i])
-            return 0;
-    @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_indexer_pack");
-        if (!pipeline) return 0;
-        int owned = 0;
-        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
-        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
-        if (!enc) return 0;
-        const uint32_t args[] = {source_rows, rows, 0, 0};
-        const uint64_t flags_bytes = ds4_gpu_dsv41_indexer_flags_bytes(source_rows, rows);
-        const uint64_t offset = ds4_gpu_tensor_offset(packed);
-        [enc setComputePipelineState:pipeline];
-        [enc setBytes:args length:sizeof(args) atIndex:0];
-        [enc setBuffer:ds4_gpu_tensor_buffer(q) offset:ds4_gpu_tensor_offset(q) atIndex:1];
-        [enc setBuffer:ds4_gpu_tensor_buffer(keys) offset:ds4_gpu_tensor_offset(keys) atIndex:2];
-        [enc setBuffer:ds4_gpu_tensor_buffer(packed) offset:offset atIndex:3];
-        [enc setBuffer:ds4_gpu_tensor_buffer(packed) offset:offset + flags_bytes atIndex:4];
-        [enc setBuffer:ds4_gpu_tensor_buffer(packed) offset:offset + flags_bytes + (uint64_t)rows * 8192u atIndex:5];
-        [enc setThreadgroupMemoryLength:16 atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows + ((NSUInteger)source_rows + 63u) / 64u, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        ds4_gpu_end_compute_encoder(cb, enc);
-        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 index input packing");
-    }
-}
-
-int ds4_gpu_dsv41_indexer_scores_packed(ds4_gpu_tensor *scores,
-                                      const ds4_gpu_tensor *q,
-                                      const ds4_gpu_tensor *weights,
-                                      const ds4_gpu_tensor *keys,
-                                      const ds4_gpu_tensor *packed,
-                                      uint32_t source_rows, uint32_t rows,
-                                      uint32_t start, uint32_t ratio,
-                                      uint32_t packed_rows, uint32_t offset) {
-    if ((ratio != 1u && ratio != 2u) || !source_rows || source_rows > INT32_MAX || !rows ||
-        !packed_rows || packed_rows > INT32_MAX ||
-        rows > UINT32_MAX - start || (start + rows) / ratio > source_rows ||
-        offset > packed_rows || rows > packed_rows - offset ||
-        !ds4_gpu_dsv41_tensor_ops_available()) return 0;
-    const ds4_gpu_tensor *tensors[] = {q, weights, keys, scores, packed};
-    const uint64_t bytes[] = {(uint64_t)rows * 32u * 128u * 4u, (uint64_t)rows * 32u * 4u,
-        (uint64_t)source_rows * 128u * 4u, (uint64_t)rows * source_rows * 4u,
-        ds4_gpu_dsv41_indexer_packed_bytes(source_rows, packed_rows)};
-    for (uint32_t i = 0; i < 5; i++)
-        if (!tensors[i] || !ds4_gpu_tensor_buffer(tensors[i]) || ds4_gpu_tensor_bytes(tensors[i]) < bytes[i])
-            return 0;
-    @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_indexer_scores_packed");
-        if (!pipeline) return 0;
-        int owned = 0;
-        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
-        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
-        if (!enc) return 0;
-        const uint32_t args[] = {source_rows, rows, start, ratio}, range[] = {packed_rows, offset};
-        const uint64_t flags_bytes = ds4_gpu_dsv41_indexer_flags_bytes(source_rows, packed_rows);
-        const uint64_t base = ds4_gpu_tensor_offset(packed);
-        [enc setComputePipelineState:pipeline];
-        [enc setBytes:args length:sizeof(args) atIndex:0];
-        [enc setBytes:range length:sizeof(range) atIndex:1];
-        for (NSUInteger i = 0; i < 5; i++)
-            [enc setBuffer:ds4_gpu_tensor_buffer(tensors[i]) offset:ds4_gpu_tensor_offset(tensors[i]) atIndex:i + 2];
-        [enc setBuffer:ds4_gpu_tensor_buffer(packed) offset:base + flags_bytes atIndex:7];
-        [enc setBuffer:ds4_gpu_tensor_buffer(packed) offset:base + flags_bytes + (uint64_t)packed_rows * 8192u atIndex:8];
-        [enc setThreadgroupMemoryLength:32u * 64u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)source_rows + 63u) / 64u, rows, 1)
-             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        ds4_gpu_end_compute_encoder(cb, enc);
-        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 packed index scores");
-    }
-}
-
-int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
-                                     const ds4_gpu_tensor *q,
-                                     const ds4_gpu_tensor *weights,
-                                     const ds4_gpu_tensor *keys,
-                                     uint32_t source_rows, uint32_t rows,
-                                     uint32_t start, uint32_t ratio) {
-    if (ratio != 1u && ratio != 2u) return 0;
-    return ds4_gpu_glm_indexer_scores_batch_grouped_tensor(scores, q, weights,
-        keys, source_rows, rows, start, ratio, 32, 128, 1.0f / 64.0f, false, true);
 }
 
 int ds4_gpu_glm_qk_lowrank_typed_tensor(

@@ -4,9 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+/* sf-ablate(build): C++ linkage guard removed; this child has no C++ translation unit. */
 
 #define DS4_IMAGE_MAX_ENCODED_BYTES (64u * 1024u * 1024u)
 #define DS4_IMAGE_MAX_DIMENSION 16384u
@@ -150,8 +148,6 @@ int ds4_deepseek4_attention_bounds(
         uint32_t   window,
         uint32_t  *bounds);
 
-#ifdef __cplusplus
-}
-#endif
+/* sf-ablate(build): C++ linkage guard removed; this child has no C++ translation unit. */
 
 #endif

@@ -1,6 +1,5 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
-#include "ds4_gpu_args.h"
 #include "ds4_ssd.h"
 #include "ds4_tp.h"
 
@@ -23,8 +22,6 @@ static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s MODEL manifest.tsv OUT.tsv [ctx] "
             "[--quality] [--rendered-prompt] "
-            "[--gpu-vram N[,N,...]|auto] [--gpu-devices N[,N,...]] "
-            "[--cuda-tensor-parallel] "
             "[--ssd-streaming] [--ssd-streaming-cold] "
             "[--ssd-streaming-cache-experts N|NGB] "
             "[--ssd-streaming-preload-experts N] "
@@ -657,9 +654,6 @@ int main(int argc, char **argv) {
     bool ctx_set = false;
     bool quality = false;
     bool rendered_prompt = false;
-    const char *gpu_vram_arg = NULL;
-    const char *gpu_devices_arg = NULL;
-    bool cuda_tensor_parallel = false;
     bool ssd_streaming = false;
     bool ssd_streaming_cold = false;
     uint32_t ssd_streaming_cache_experts = 0;
@@ -697,12 +691,6 @@ int main(int argc, char **argv) {
             quality = true;
         } else if (!strcmp(arg, "--rendered-prompt")) {
             rendered_prompt = true;
-        } else if (!strcmp(arg, "--gpu-vram")) {
-            gpu_vram_arg = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--gpu-devices")) {
-            gpu_devices_arg = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--cuda-tensor-parallel")) {
-            cuda_tensor_parallel = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
@@ -750,16 +738,12 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (tp.role == DS4_TP_WORKER || dist.role == DS4_DISTRIBUTED_WORKER) {
-        die("score_official: start workers with ./ds4");
+        die("score_official: start workers with ./sf-q3-8flash");
     }
 
     ds4_engine_options opt = {
         .model_path = model_path,
-#ifdef __APPLE__
         .backend = DS4_BACKEND_METAL,
-#else
-        .backend = DS4_BACKEND_CUDA,
-#endif
         .n_threads = 0,
         .context_size = ctx_size,
         .placement_ctx_hint = ctx_size,
@@ -770,7 +754,6 @@ int main(int argc, char **argv) {
         .ssd_streaming_preload_experts = ssd_streaming_preload_experts,
         .warm_weights = false,
         .quality = quality,
-        .cuda_tensor_parallel = cuda_tensor_parallel,
         .ssd_streaming = ssd_streaming,
         .ssd_streaming_cold = ssd_streaming_cold,
         .distributed = dist,
@@ -788,32 +771,7 @@ int main(int argc, char **argv) {
     }
 
     ds4_engine *engine = NULL;
-    if (gpu_vram_arg || gpu_devices_arg) {
-#ifdef __APPLE__
-        die("score_official: CUDA GPU placement is unavailable on macOS");
-#else
-        ds4_gpu_config gpu_cfg = {0};
-        bool skip_cuda = false;
-        char gpu_err[256];
-        if (parse_gpu_vram_arg(gpu_vram_arg, gpu_devices_arg,
-                               &gpu_cfg, &skip_cuda,
-                               gpu_err, sizeof(gpu_err)) != 0) {
-            fprintf(stderr, "score_official: %s\n", gpu_err);
-            return 2;
-        }
-        if (skip_cuda) {
-            die("score_official: --gpu-vram 0 is not supported");
-        }
-        if (ds4_engine_create_with_gpu_config(&engine, &opt, &gpu_cfg) != 0) {
-            die("failed to open model");
-        }
-#endif
-    } else {
-        if (cuda_tensor_parallel) {
-            die("score_official: --cuda-tensor-parallel requires --gpu-vram or --gpu-devices");
-        }
-        if (ds4_engine_open(&engine, &opt) != 0) die("failed to open model");
-    }
+    if (ds4_engine_open(&engine, &opt) != 0) die("failed to open model");
 
     if (tp.role == DS4_TP_LEADER) {
         ds4_tp_identity tp_id = {

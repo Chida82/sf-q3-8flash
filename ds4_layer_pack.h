@@ -15,9 +15,7 @@ typedef struct {
     int    n_gpus;
 } ds4_layer_pack_config;
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+/* sf-ablate(build): C++ linkage guard removed; this child has no C++ translation unit. */
 
 /* Compute a monotonic-contiguous layer placement.
  *
@@ -70,8 +68,6 @@ void ds4_layer_pack_print(FILE *out,
                           const size_t *gpu_budget_bytes,
                           int n_gpus);
 
-#ifdef __cplusplus
-}
-#endif
+/* sf-ablate(build): C++ linkage guard removed; this child has no C++ translation unit. */
 
 #endif /* DS4_LAYER_PACK_H */

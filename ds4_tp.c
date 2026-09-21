@@ -109,10 +109,7 @@ typedef struct {
     int (*query_device)(struct ibv_context *, struct ibv_device_attr *);
     int (*query_port)(struct ibv_context *, uint8_t, struct ibv_port_attr *);
     int (*query_gid)(struct ibv_context *, uint8_t, int, union ibv_gid *);
-#ifdef __linux__
-    int (*query_gid_ex)(struct ibv_context *, uint32_t, uint32_t,
-                        struct ibv_gid_entry *, uint32_t, size_t);
-#endif
+/* sf-ablate(build): block 'ifdef __linux__' removed; this child builds on macOS only. */
     struct ibv_pd *(*alloc_pd)(struct ibv_context *);
     int (*dealloc_pd)(struct ibv_pd *);
     struct ibv_mr *(*reg_mr)(struct ibv_pd *, void *, size_t, int);
@@ -729,8 +726,7 @@ static int tp_rdma_load_api(ds4_tp_verbs_api *api) {
 #ifdef __APPLE__
     void *h = dlopen("/usr/lib/librdma.dylib", RTLD_NOW | RTLD_LOCAL);
     if (!h) h = dlopen("librdma.dylib", RTLD_NOW | RTLD_LOCAL);
-#else
-    void *h = dlopen("libibverbs.so.1", RTLD_NOW | RTLD_LOCAL);
+/* sf-ablate(build): branch 'else' removed; this child builds on macOS with Metal only. */
 #endif
     if (!h) return 0;
 #define TP_SYM(field, name) \
@@ -746,9 +742,7 @@ static int tp_rdma_load_api(ds4_tp_verbs_api *api) {
     TP_SYM(query_device, "ibv_query_device");
     TP_SYM(query_port, "ibv_query_port");
     TP_SYM(query_gid, "ibv_query_gid");
-#ifdef __linux__
-    TP_SYM(query_gid_ex, "_ibv_query_gid_ex");
-#endif
+/* sf-ablate(build): block 'ifdef __linux__' removed; this child builds on macOS only. */
     TP_SYM(alloc_pd, "ibv_alloc_pd");
     TP_SYM(dealloc_pd, "ibv_dealloc_pd");
     TP_SYM(reg_mr, "ibv_reg_mr");
@@ -774,50 +768,12 @@ static int tp_rdma_probe(ds4_tp_verbs_api *api) {
     return num > 0;
 }
 
-#ifdef __linux__
-/* Prefer the RoCEv2 GID belonging to the control socket's direct-link address.
- * Device order need not agree between hosts with several crossed NIC ports. */
-static int tp_rdma_linux_gid(ds4_tp *tp, struct ibv_context *ctx,
-                              const struct ibv_port_attr *port,
-                              union ibv_gid *gid, int *index) {
-    struct sockaddr_storage local = {0};
-    socklen_t len = sizeof(local);
-    union ibv_gid address = {0};
-    bool have_address = getsockname(tp->control_fd, (struct sockaddr *)&local, &len) == 0;
-    if (have_address && local.ss_family == AF_INET) {
-        address.raw[10] = address.raw[11] = 0xff;
-        memcpy(address.raw + 12, &((struct sockaddr_in *)&local)->sin_addr, 4);
-    } else if (have_address && local.ss_family == AF_INET6) {
-        memcpy(address.raw, &((struct sockaddr_in6 *)&local)->sin6_addr, 16);
-    } else {
-        have_address = false;
-    }
-    int best = 0;
-    const int first = tp->opt.rdma_gid_index_set ? tp->opt.rdma_gid_index : 0;
-    if (first < 0 || first >= port->gid_tbl_len || first > UINT8_MAX) return 0;
-    const int end = tp->opt.rdma_gid_index_set ? first + 1 : port->gid_tbl_len;
-    for (int i = first; i < end && i <= UINT8_MAX; i++) {
-        struct ibv_gid_entry entry = {0};
-        if (tp->rdma.api.query_gid_ex(ctx, 1, (uint32_t)i, &entry, 0, sizeof(entry)) ||
-            entry.gid_type != IBV_GID_TYPE_ROCE_V2) continue;
-        const union ibv_gid zero = {0};
-        if (!memcmp(entry.gid.raw, zero.raw, sizeof(zero.raw))) continue;
-        const int score = have_address && !memcmp(entry.gid.raw, address.raw, 16) ? 2 : 1;
-        if (score > best) {
-            *gid = entry.gid;
-            *index = i;
-            best = score;
-        }
-    }
-    return best;
-}
-#endif
+/* sf-ablate(build): block 'ifdef __linux__' removed; this child builds on macOS only. */
 
 static enum ibv_qp_type tp_rdma_qp_type(void) {
 #ifdef __APPLE__
     return IBV_QPT_UC;
-#else
-    return IBV_QPT_RC;
+/* sf-ablate(build): branch 'else' removed; this child builds on macOS with Metal only. */
 #endif
 }
 
@@ -835,38 +791,6 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     const char *want_name = tp->opt.rdma_device;
     char states[256] = "";
 #ifdef __linux__
-    int best = 0, candidates = 0;
-    for (int i = 0; i < num; i++) {
-        const char *name = r->api.get_device_name(devs[i]);
-        if (want_name && strcmp(want_name, name)) continue;
-        struct ibv_context *ctx = r->api.open_device(devs[i]);
-        if (!ctx) continue;
-        struct ibv_port_attr pa = {0};
-        union ibv_gid gid;
-        int index = -1;
-        const int score = !r->api.query_port(ctx, 1, &pa) && pa.state == IBV_PORT_ACTIVE &&
-            pa.link_layer == IBV_LINK_LAYER_ETHERNET ? tp_rdma_linux_gid(tp, ctx, &pa, &gid, &index) : 0;
-        if (score) candidates++;
-        if (score > best) {
-            if (r->ctx) r->api.close_device(r->ctx);
-            r->ctx = ctx;
-            r->port = pa;
-            r->gid = gid;
-            r->gid_index = index;
-            best = score;
-            snprintf(states, sizeof(states), "%s", name);
-        } else {
-            r->api.close_device(ctx);
-        }
-    }
-    r->api.free_device_list(devs);
-    if (!best || (!want_name && best == 1 && candidates > 1)) {
-        tp_set_err(err, errlen,
-            "tp rdma: %s; use the direct RoCE address for --coordinator, or select --rdma-device and --rdma-gid-index",
-            best ? "multiple active ports, none matches the control address" : "no active RoCEv2 GID for the requested device/index");
-        return 0;
-    }
-    fprintf(stderr, "ds4-tp: rdma device %s, RoCEv2 GID %d, RC\n", states, r->gid_index);
 #else
     for (int i = 0; i < num && !r->ctx; i++) {
         const char *name = r->api.get_device_name(devs[i]);

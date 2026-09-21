@@ -5,9 +5,7 @@
 #include <stdint.h>
 #include "ds4_qwen4_vision.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+/* sf-ablate(build): C++ linkage guard removed; this child has no C++ translation unit. */
 
 /* =========================================================================
  * GPU Tensor and Command Lifetime.
@@ -166,14 +164,7 @@ void ds4_gpu_kv_norm_task_end_concurrent(void);
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
 int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label);
-#ifdef DS4_ROCM_BUILD
-int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
-                                             uint64_t offset,
-                                             void *data,
-                                             uint64_t bytes,
-                                             uint64_t event_value,
-                                             const char *label);
-#endif
+/* sf-ablate(rocm): block 'ifdef DS4_ROCM_BUILD' removed; this child has no ROCm backend. */
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
@@ -200,9 +191,7 @@ int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_q8_cache_suppressed(void);
 void ds4_gpu_set_q8_cache_suppressed(int suppressed);
-#ifdef DS4_ROCM_BUILD
-void ds4_gpu_release_q8_f16_cache(void);
-#endif
+/* sf-ablate(rocm): block 'ifdef DS4_ROCM_BUILD' removed; this child has no ROCm backend. */
 
 /* Model-file ranges assigned to CUDA devices by the multi-GPU placement
  * planner. Metal keeps these declarations for the shared engine interface. */
@@ -227,7 +216,6 @@ int ds4_gpu_device_cache_support_tensors(int device_id,
 uint64_t ds4_gpu_tier_free_vram(int logical_tier);
 int ds4_gpu_lookup_cache(uint64_t source_offset, uint64_t bytes,
                          int *out_device_id, void **out_device_ptr);
-int ds4_gpu_lookup_cache_device(uint64_t source_offset, uint64_t bytes);
 
 int ds4_gpu_pro_q4_expert_table_auto_available(void);
 int ds4_gpu_preload_q4_expert_tables(const void *model_map, uint64_t model_size,
@@ -261,9 +249,7 @@ enum {
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
-#else
-static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }
-static inline int ds4_gpu_device_is_m5_apple_silicon(void) { return 0; }
+/* sf-ablate(build): branch 'else' removed; this child builds on macOS with Metal only. */
 #endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
@@ -357,15 +343,7 @@ typedef struct ds4_gpu_stream_expert_table {
     uint64_t    gate_expert_bytes;
     uint64_t    down_expert_bytes;
 } ds4_gpu_stream_expert_table;
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
-/* Optional CUDA look-ahead between completed layers, inside the existing
- * expert cache. The foreground owns slots; the reader cannot publish them
- * or evict the current layer's inputs. */
-int ds4_gpu_stream_expert_cache_prefetch(
-        const ds4_gpu_stream_expert_table *current,
-        const ds4_gpu_stream_expert_table *next);
-void ds4_gpu_stream_expert_cache_prefetch_finish(bool cancel);
-#endif
+/* sf-ablate(cuda): CUDA layer look-ahead declarations removed (Metal-only child). */
 /* Reset only the prompt-local eviction heuristic.  The resident SSD expert
  * cache itself is intentionally kept warm across sessions. */
 void ds4_gpu_stream_expert_cache_reset_route_hotness(void);
@@ -391,25 +369,8 @@ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
  * the caller retries synchronously). */
 void ds4_gpu_stream_expert_cache_note_service_thread(void);
 #endif
-#if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
-int ds4_gpu_stream_expert_cache_prepare_selected_batch(
-        const ds4_gpu_stream_expert_table *table,
-        const int32_t                     *selected_ids,
-        uint32_t                           n_tokens,
-        uint32_t                           n_selected);
-#endif
-#ifdef DS4_ROCM_BUILD
-int ds4_gpu_stream_expert_cache_load_layer(
-        const ds4_gpu_stream_expert_table *table);
-int ds4_gpu_stream_expert_cache_seed_from_layer_selected(
-        const ds4_gpu_stream_expert_table *table,
-        const ds4_gpu_tensor             *selected,
-        uint32_t                          n_tokens,
-        uint32_t                          n_seed_tokens,
-        uint32_t                          n_selected);
-int ds4_gpu_stream_expert_cache_finish_pending_batch(void);
-int ds4_gpu_stream_expert_cache_release_layer_cache(void);
-#endif
+/* sf-ablate(build): block 'if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))' removed; this child builds on macOS with Metal only. */
+/* sf-ablate(rocm): block 'ifdef DS4_ROCM_BUILD' removed; this child has no ROCm backend. */
 int ds4_gpu_stream_expert_cache_seed_experts(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *expert_ids,
@@ -2659,13 +2620,7 @@ int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         uint32_t                mid_token_stride);
 
 int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected);
-void ds4_gpu_set_glm_mtp_verify_mode(bool enabled);
-#ifdef DS4_ROCM_BUILD
-int ds4_gpu_dspark_gfx1151_fast_path(void);
-void ds4_gpu_set_dspark_verify_mode(bool enabled);
-#elif !defined(__APPLE__)
-int ds4_gpu_device_is_spark(void);
-#endif
+/* sf-ablate(rocm): block 'ifdef DS4_ROCM_BUILD' removed; this child has no ROCm backend. */
 
 int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(
         ds4_gpu_tensor       *out_hc,
@@ -3432,8 +3387,6 @@ int ds4_gpu_qwen4_mtp_stage_tensor(
 int ds4_gpu_qwen4_mtp_combine_tensor(
         ds4_gpu_tensor *R_out, const ds4_gpu_tensor *proj, uint32_t n_embd, uint32_t n_hc);
 
-#ifdef __cplusplus
-}
-#endif
+/* sf-ablate(build): C++ linkage guard removed; this child has no C++ translation unit. */
 
 #endif

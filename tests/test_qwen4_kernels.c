@@ -584,9 +584,7 @@ static void test_hc(arena_t *a, uint32_t E, uint32_t rank, uint32_t T, uint32_t 
     require_ok(q8 ? ds4_gpu_matmul_q8_0_tensor(glo, a->base, a->size, down_off, dim, rank, gxn, T)
              : f16 ? ds4_gpu_matmul_f16_tensor(glo, a->base, a->size, down_off, dim, rank, gxn, T)
                    : ds4_gpu_matmul_f32_tensor(glo, a->base, a->size, down_off, dim, rank, gxn, T), "hc down gemv");
-#else
-    require_ok(ds4_gpu_qwen4_dense_mm_tensor(glo, gxn, a->base, a->size,
-                    down_off, wtype, T, dim, rank), "hc down projection");
+/* sf-ablate(build): branch 'else' removed; this child builds on macOS with Metal only. */
 #endif
     require_ok(ds4_gpu_qwen4_hc_gate_mix_tensor(gmixed, gxn, glo, a->base, a->size, up_off, up_type, T, E, hc, rank),
                "hc gate mix");
@@ -815,8 +813,7 @@ static void test_idx_score_mm(uint32_t T, uint32_t n, uint32_t pos0) {
 
 #ifdef __APPLE__
 static int cmp_desc_idx(void *ctx, const void *a, const void *b) {
-#else
-static int cmp_desc_idx(const void *a, const void *b, void *ctx) {
+/* sf-ablate(build): branch 'else' removed; this child builds on macOS with Metal only. */
 #endif
     const float *sc = ctx;
     const int32_t ia = *(const int32_t *)a, ib = *(const int32_t *)b;
@@ -845,8 +842,7 @@ static void test_idx_select(uint32_t T, uint32_t n, uint32_t k, uint32_t visible
         for (uint32_t b = 0; b < n; b++) order[b] = (int32_t)b;
 #ifdef __APPLE__
         qsort_r(order, n, 4, sc + (uint64_t)t * n, cmp_desc_idx);
-#else
-        qsort_r(order, n, 4, cmp_desc_idx, sc + (uint64_t)t * n);
+/* sf-ablate(build): branch 'else' removed; this child builds on macOS with Metal only. */
 #endif
         /* the k selected must equal the reference top-k as a set */
         int32_t *g = got + (uint64_t)t * k;
@@ -893,18 +889,7 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
         cnt[t] = n;
     }
     free(blocks);
-#ifndef __APPLE__
-    for (uint32_t t = 0; t < T; t++) {
-        const float amplitude = t % 3 == 0 ? 64 : t % 3 == 1 ? 0.00001f : 1;
-        for (uint32_t i = 0; i < H * D; i++) q[(uint64_t)t * H * D + i] *= amplitude;
-        if (sparse && T > 2 && t % 7 == 0) cnt[t] = 0;
-        else if (sparse && T > 2 && t % 11 == 1) {
-            cnt[t] = 1;
-            sel[(uint64_t)t * sel_stride] = -1;
-        } else if (sparse && cnt[t] && t + 1 < T)
-            sel[(uint64_t)t * sel_stride] = (int32_t)(pos0 + t + 1);
-    }
-#endif
+/* sf-ablate(build): block 'ifndef __APPLE__' removed; this child builds on macOS with Metal only. */
     ds4_gpu_tensor *gq = upload(q, qn), *ggate = upload(gate, qn);
     ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc(kvn * 2), *gv = ds4_gpu_tensor_alloc(kvn * 2);
     ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * sel_stride * 4), *gcnt = ds4_gpu_tensor_alloc(T * 4);
@@ -929,45 +914,7 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
     snprintf(name, sizeof(name), "attn mm T=%u H=%u pos0=%u %s%s", T, H, pos0, sparse ? "sparse" : "dense", split ? " split" : "");
 #ifdef __APPLE__
     require_ok(worst <= 4e-3 * scale, name);
-#else
-    require_ok(worst <= 3e-5 * scale, name);
-    /* Check selected rows against the definition, independently of both GPU
-     * kernels. Include the first, middle and last token and KV head group. */
-    double *scores = malloc((size_t)cap * sizeof(*scores));
-    require_ok(scores != NULL, "attention CPU reference allocation");
-    double cpu_error = 0, scalar_error = 0, cpu_scale = 0;
-    for (uint32_t ti = 0; ti < 3; ti++) for (uint32_t hi = 0; hi < 3; hi++) {
-        const uint32_t t = ti == 0 ? 0 : ti == 1 ? T/2 : T-1;
-        const uint32_t h = hi == 0 ? 0 : hi == 1 ? H/2 : H-1;
-        const uint32_t kh = h/(H/Hkv), n = sparse ? cnt[t] : pos0+t+1;
-        double peak = -INFINITY, denom = 0, acc[256] = {0};
-        for (uint32_t j = 0; j < n; j++) {
-            const uint32_t pos = sparse ? (uint32_t)sel[(uint64_t)t*sel_stride+j] : j;
-            double dot = 0;
-            if (pos > pos0+t) { scores[j] = -INFINITY; continue; }
-            for (uint32_t d = 0; d < D; d++)
-                dot += (double)q[((uint64_t)t*H+h)*D+d] * (double)kc[((uint64_t)pos*Hkv+kh)*D+d];
-            scores[j] = dot * 0.0625;
-            peak = fmax(peak,scores[j]);
-        }
-        for (uint32_t j = 0; j < n; j++) {
-            const uint32_t pos = sparse ? (uint32_t)sel[(uint64_t)t*sel_stride+j] : j;
-            if (pos > pos0+t) continue;
-            const double weight = exp(scores[j]-peak);
-            denom += weight;
-            for (uint32_t d = 0; d < D; d++) acc[d] += weight * (double)vc[((uint64_t)pos*Hkv+kh)*D+d];
-        }
-        for (uint32_t d = 0; d < D; d++) {
-            const uint64_t i = ((uint64_t)t*H+h)*D+d;
-            const double expected = denom > 0 ? acc[d]/denom/(1+exp(-(double)gate[i])) : 0;
-            cpu_error = fmax(cpu_error,fabs((double)got[i]-expected));
-            scalar_error = fmax(scalar_error,fabs((double)ref[i]-expected));
-            cpu_scale = fmax(cpu_scale,fabs(expected));
-        }
-    }
-    free(scores);
-    require_ok(cpu_error <= 3e-5 * fmax(cpu_scale,1e-8), "attention double reference");
-    printf("  %-44s CPU max|d|=%.2e scalar=%.2e (scale %.2e)\n", name, cpu_error, scalar_error, cpu_scale);
+/* sf-ablate(build): branch 'else' removed; this child builds on macOS with Metal only. */
 #endif
     if (T <= 8u && !split) require_ok(worst == 0.0, "short attention tails keep decode arithmetic");
     printf("  %-44s ok  max|d|=%.2e (scale %.2e)\n", name, worst, scale);
@@ -981,21 +928,7 @@ static void test_attn_mm(uint32_t T, uint32_t pos0, bool sparse) {
     test_attn_mm_keys(T, pos0, sparse, 6, 24, false);
 }
 
-#ifndef __APPLE__
-static void test_attn_groups(void) {
-    test_attn_mm_keys(32, 4093, false, 6, 24, false);
-    test_attn_mm_keys(33, 8193, true, 511, 24, false);
-    test_attn_mm_keys(32, 97, false, 6, 2, false);
-    test_attn_mm_keys(33, 100, true, 6, 32, false);
-    test_attn_mm_keys(33, 100, true, 6, 34, false);
-    test_attn_mm_keys(1, 510, false, 6, 24, true);
-    test_attn_mm_keys(1, 511, false, 6, 24, true);
-    test_attn_mm_keys(1, 2052, false, 6, 24, true);
-    test_attn_mm_keys(2, 8193, true, 511, 24, true);
-    test_attn_mm_keys(8, 8193, true, 511, 32, true);
-    test_attn_mm_keys(2, 32769, false, 6, 24, true);
-}
-#endif
+/* sf-ablate(build): block 'ifndef __APPLE__' removed; this child builds on macOS with Metal only. */
 
 /* ---- PLE ---- */
 
@@ -2178,23 +2111,7 @@ static void test_hc_norm_reuse_case(arena_t *a, uint32_t type, uint32_t E,
         require_ok(mode == 2u ? unsetenv("DS4_QWEN4_HC_NORM_REUSE") == 0
                              : setenv("DS4_QWEN4_HC_NORM_REUSE", mode ? "1" : "0", 1) == 0,
                    "select forced or automatic HC norm");
-#ifndef __APPLE__
-        /* CUDA uses its original one-token kernel as an independent dispatch
-         * control, not the Metal-only environment switch above. */
-        if (mode == 0u && T > 8u) {
-            for (uint32_t t = 0; t < T; t++) {
-                ds4_gpu_tensor *r = ds4_gpu_tensor_view(gR,t*dim*4,dim*4);
-                ds4_gpu_tensor *x = ds4_gpu_tensor_view(gxn[mode],t*dim*4,dim*4);
-                const uint64_t partials = (uint64_t)hc*CH*n_inject;
-                ds4_gpu_tensor *in = n_inject ? ds4_gpu_tensor_view(ginj[mode],t*partials*4,partials*4) : NULL;
-                require_ok(r && x && (!n_inject || in),"HC norm decode control views");
-                require_ok(ds4_gpu_qwen4_hc_norm_tensor(x,in,r,a->base,a->size,
-                    gamma_off,inject_off,type,1,E,hc,n_inject,eps),"HC norm decode control");
-                ds4_gpu_tensor_free(in); ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(r);
-            }
-            continue;
-        }
-#endif
+/* sf-ablate(build): block 'ifndef __APPLE__' removed; this child builds on macOS with Metal only. */
         require_ok(ds4_gpu_qwen4_hc_norm_tensor(gxn[mode], ginj[mode], gR, a->base, a->size,
                    gamma_off, inject_off, type, T, E, hc, n_inject, eps), "HC norm dispatch");
     }
@@ -3347,79 +3264,7 @@ static void test_multi_gemv(arena_t *a, uint32_t E, uint32_t T) {
     ds4_gpu_tensor_free(gx); free(x);
 }
 
-#ifndef __APPLE__
-/* Check half-operand expert tiles independently at every CUDA tile width.
- * The existing tests above still bound their error versus unrounded weights. */
-static void test_half_expert_tiles(arena_t *a, uint32_t T, uint32_t type, uint32_t dtype, uint32_t F) {
-    const uint32_t E = 256, NE = 4, NS = 2, NO = 3, cap = T+7, guard = 16;
-    const uint32_t DF = dtype == 10 ? (F+255u)/256u*256u : F;
-    double *gw, *uw, *dw;
-    uint64_t go = arena_tier(a,type,(uint64_t)NE*F,E,&gw);
-    uint64_t uo = arena_tier(a,type,(uint64_t)NE*F,E,&uw);
-    uint64_t d = arena_tier(a,dtype,(uint64_t)NE*E,DF,&dw);
-    float *x = rand_vec((uint64_t)T*E,1.0f);
-    int32_t *sel = malloc((uint64_t)T*NS*4);
-    require_ok(sel != NULL,"half tile selections allocation");
-    for (uint32_t t = 0; t < T; t++) { sel[t*NS] = 0; sel[t*NS+1] = 1+t%2; }
-    ds4_gpu_tensor *gx = upload(x,(uint64_t)T*E);
-    ds4_gpu_tensor *gs = ds4_gpu_tensor_alloc((uint64_t)T*NS*4);
-    ds4_gpu_tensor *gl = ds4_gpu_tensor_alloc((uint64_t)NE*cap*4);
-    ds4_gpu_tensor *gc = ds4_gpu_tensor_alloc(NE*4);
-    uint64_t nm = (uint64_t)T*NO*F, np = (uint64_t)T*NO*E;
-    ds4_gpu_tensor *gm = upload(NULL,nm+guard), *gp = upload(NULL,np+guard);
-    require_ok(gs && gl && gc && ds4_gpu_tensor_write(gs,0,sel,(uint64_t)T*NS*4),"half tile selection upload");
-    const float sentinel = -1234.5f;
-    require_ok(ds4_gpu_tensor_fill_f32(gm,sentinel,nm+guard) &&
-               ds4_gpu_tensor_fill_f32(gp,sentinel,np+guard),"half tile sentinels");
-    require_ok(ds4_gpu_qwen4_moe_build_lists_tensor(gl,gc,gs,T,NS,NE,cap),"half tile list build");
-    int32_t counts[NE];
-    require_ok(ds4_gpu_tensor_read(gc,0,counts,sizeof(counts)),"half tile counts read");
-    require_ok(counts[0] == (int32_t)T && counts[1]+counts[2] == (int32_t)T && counts[3] == 0,
-               "half tile hot and empty experts");
-    require_ok(ds4_gpu_qwen4_moe_mm_mid_tensor(gm,gx,gl,gc,a->base,a->size,go,uo,type,NE,T,NS,NO,E,F,cap),"half tile mid");
-    require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(gp,gm,gl,gc,a->base,a->size,d,dtype,NE,T,NS,NO,F,E,cap),"half tile down");
-    float *mid = download(gm,nm+guard), *part = download(gp,np+guard);
-    for (uint64_t i = nm; i < nm+guard; i++) require_ok(mid[i] == sentinel,"half tile mid tail");
-    for (uint64_t i = np; i < np+guard; i++) require_ok(part[i] == sentinel,"half tile down tail");
-    for (uint32_t t = 0; t < T; t++) {
-        for (uint32_t f = 0; f < F; f++) require_ok(mid[((uint64_t)t*NO+NS)*F+f] == sentinel,"half tile reserved mid slot");
-        for (uint32_t e = 0; e < E; e++) require_ok(part[((uint64_t)t*NO+NS)*E+e] == sentinel,"half tile reserved down slot");
-    }
-    const uint32_t samples[] = {0,1,31,32,63,64,127,128,1023,T-1};
-    float got[sizeof(samples)/sizeof(samples[0])*NS*(E+F)];
-    double ref[sizeof(got)/sizeof(got[0])];
-    uint32_t n = 0;
-    for (uint32_t j = 0; j < sizeof(samples)/sizeof(samples[0]); j++) {
-        uint32_t t = samples[j];
-        if (t >= T) continue;
-        for (uint32_t s = 0; s < NS; s++) {
-            uint32_t e = sel[t*NS+s];
-            for (uint32_t f = 0; f < F; f++) {
-                double g = 0, u = 0;
-                for (uint32_t k = 0; k < E; k++) {
-                    double v = (_Float16)x[(uint64_t)t*E+k];
-                    g += (double)(_Float16)(float)gw[((uint64_t)e*F+f)*E+k]*v;
-                    u += (double)(_Float16)(float)uw[((uint64_t)e*F+f)*E+k]*v;
-                }
-                got[n] = mid[((uint64_t)t*NO+s)*F+f]; ref[n++] = silu_d(g)*u;
-            }
-            for (uint32_t r = 0; r < E; r++) {
-                double v = 0;
-                for (uint32_t k = 0; k < F; k++)
-                    v += (double)(_Float16)(float)dw[((uint64_t)e*E+r)*DF+k]*
-                         (double)(_Float16)mid[((uint64_t)t*NO+s)*F+k];
-                got[n] = part[((uint64_t)t*NO+s)*E+r]; ref[n++] = v;
-            }
-        }
-    }
-    char name[96];
-    snprintf(name,sizeof(name),"half expert reference type=%u/%u T=%u F=%u",type,dtype,T,F);
-    check_close(name,got,ref,n,3e-5);
-    free(mid); free(part); free(sel); free(x); free(gw); free(uw); free(dw);
-    ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gs); ds4_gpu_tensor_free(gl);
-    ds4_gpu_tensor_free(gc); ds4_gpu_tensor_free(gm); ds4_gpu_tensor_free(gp);
-}
-#endif
+/* sf-ablate(build): block 'ifndef __APPLE__' removed; this child builds on macOS with Metal only. */
 
 /* dense tiled GEMM against a double reference for f32, f16 and q8_0 rows */
 /* The decode-batch Q8 GEMM: reference in double, and the same sums the
@@ -3477,46 +3322,7 @@ static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T
     ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gx);
 }
 
-#ifndef __APPLE__
-/* Cross the former 64 MiB output-tile limit with odd output strides. Reuse
- * 17 independent input rows so the full CPU oracle stays inexpensive. */
-static void test_dense_mm_large(arena_t *a, uint32_t wtype) {
-    const uint32_t K = 64, M = 2051, T = 8201, patterns = 17, guard = 64;
-    const uint64_t count = (uint64_t)T*M;
-    double *weights;
-    const uint64_t off = wtype == 8
-        ? arena_q8_0(a, M, K, &weights, 0.05f)
-        : arena_f16(a, (uint64_t)M*K, &weights, 0.05f);
-    float *rows = rand_vec((uint64_t)patterns*K, 1.0f);
-    float *x = malloc((uint64_t)T*K*sizeof(*x));
-    double *dots = calloc((uint64_t)patterns*M, sizeof(*dots));
-    double *ref = malloc((count+guard)*sizeof(*ref));
-    require_ok(x && dots && ref && rows, "large dense allocations");
-    for (uint32_t p = 0; p < patterns; p++)
-        for (uint32_t m = 0; m < M; m++)
-            for (uint32_t k = 0; k < K; k++)
-                dots[(uint64_t)p*M+m] += weights[(uint64_t)m*K+k]*rows[p*K+k];
-    for (uint32_t t = 0; t < T; t++) {
-        memcpy(x+(uint64_t)t*K, rows+(t%patterns)*K, K*sizeof(*x));
-        memcpy(ref+(uint64_t)t*M, dots+(t%patterns)*M, M*sizeof(*ref));
-    }
-    for (uint32_t i = 0; i < guard; i++) ref[count+i] = 17.25;
-    ds4_gpu_tensor *gx = upload(x, (uint64_t)T*K);
-    ds4_gpu_tensor *out = upload(NULL, count+guard);
-    for (unsigned repeat = 0; repeat < 2; repeat++) {
-        require_ok(ds4_gpu_tensor_fill_f32(out, 17.25f, count+guard), "large dense guard fill");
-        require_ok(ds4_gpu_qwen4_dense_mm_tensor(out, gx, a->base, a->size,
-            off, wtype, T, K, M), "large dense projection");
-        check_tensor(wtype == 8 ? "large Q8 dense output" : "large F16 dense output",
-                     out, ref, count, 3e-5);
-        float got_guard[64];
-        require_ok(ds4_gpu_tensor_read(out, count*4u, got_guard, sizeof(got_guard)), "large dense guard read");
-        for (unsigned i = 0; i < guard; i++) require_ok(got_guard[i] == 17.25f, "large dense output guard");
-    }
-    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(gx);
-    free(ref); free(dots); free(x); free(rows); free(weights);
-}
-#endif
+/* sf-ablate(build): block 'ifndef __APPLE__' removed; this child builds on macOS with Metal only. */
 
 int main(void) {
     arena_t arena;
@@ -3528,25 +3334,7 @@ int main(void) {
     require_ok(ds4_gpu_init(), "GPU initialization");
     require_ok(ds4_gpu_set_model_map(arena.base, arena.size), "model map registration");
 
-#ifndef __APPLE__
-    if (getenv("DS4_TEST_QWEN4_ATTN_GROUPS")) { test_attn_groups(); return 0; }
-    if (getenv("DS4_TEST_QWEN4_DENSE_ONLY")) {
-        test_dense_mm_large(&arena, 1u);
-        test_dense_mm_large(&arena, 8u);
-        test_dense_mm(&arena, 10240, 1700, 32, 8u);
-        test_dense_mm(&arena, 320, 10240, 40, 1u);
-        test_dense_mm(&arena, 67, 97, 35, 1u);
-        test_dense_mm(&arena, 96, 129, 35, 8u);
-        return 0;
-    }
-    if (getenv("DS4_TEST_QWEN4_EXPERT_TILES")) {
-        test_half_expert_tiles(&arena,33,16,10,64);
-        test_half_expert_tiles(&arena,33,12,39,64);
-        test_half_expert_tiles(&arena,2049,16,10,192);
-        test_half_expert_tiles(&arena,2049,12,39,192);
-        return 0;
-    }
-#endif
+/* sf-ablate(build): block 'ifndef __APPLE__' removed; this child builds on macOS with Metal only. */
     if (getenv("DS4_TEST_QWEN4_DECODE_FUSIONS")) { test_decode_fusions(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {
         test_moe_types(&arena, 8, 6, 2560, 640, 1, 16u, 10u);
@@ -3617,9 +3405,7 @@ int main(void) {
     test_attn_mm(4, 128, false);
     test_attn_mm(8, 128, false);
     test_attn_mm(9, 128, false);
-#ifndef __APPLE__
-    test_attn_groups();
-#endif
+/* sf-ablate(build): block 'ifndef __APPLE__' removed; this child builds on macOS with Metal only. */
     test_gdn(&arena, 2, 6, 32, 7);
     test_gdn(&arena, 2, 6, 64, 9);
     test_gdn(&arena, 2, 6, 96, 17);
@@ -3663,31 +3449,7 @@ int main(void) {
     test_dense_mm(&arena, 10240, 320, 33, 1u);
     test_dense_mm(&arena, 320, 10240, 40, 1u);
     test_dense_mm(&arena, 2560, 100, 9, 8u);
-#ifndef __APPLE__
-    test_half_expert_tiles(&arena,33,16,10,64);
-    test_half_expert_tiles(&arena,2049,16,10,64);
-    test_half_expert_tiles(&arena,8193,16,10,64);
-    test_half_expert_tiles(&arena,33,12,39,64);
-    test_half_expert_tiles(&arena,2049,12,39,64);
-    test_half_expert_tiles(&arena,8193,12,39,64);
-    test_half_expert_tiles(&arena,2049,16,10,192);
-    test_half_expert_tiles(&arena,2049,12,39,192);
-    test_dense_mm(&arena, 2560, 100, 37, 8u);
-    test_dense_mm(&arena, 10240, 1700, 32, 8u);
-    test_dense_mm_large(&arena, 1u);
-    test_dense_mm_large(&arena, 8u);
-    test_dense_mm(&arena, 67, 97, 35, 1u);
-    test_dense_mm(&arena, 96, 129, 35, 8u);
-    test_dense_mm(&arena, 32, 7, 1, 8u);
-    test_dense_mm(&arena, 96, 9, 1, 8u);
-    test_dense_mm(&arena, 68, 9, 1, 1u);
-    test_dense_mm(&arena, 67, 7, 1, 1u);
-    for (uint32_t T = 2; T <= 8; T++) {
-        test_dense_mm(&arena, 96, 9, T, 8u);
-        test_dense_mm(&arena, 68, 9, T, 1u);
-        test_dense_mm(&arena, 67, 7, T, 1u);
-    }
-#endif
+/* sf-ablate(build): block 'ifndef __APPLE__' removed; this child builds on macOS with Metal only. */
     test_dense_mm(&arena, 64, 32, 70, 0u);
     printf("multi gemv\n");
     test_multi_gemv(&arena, 2560, 2);

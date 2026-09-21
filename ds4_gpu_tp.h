@@ -6,9 +6,7 @@
 #define DS4_GPU_TENSOR_DEFINED
 typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 #endif
-#ifdef __cplusplus
-extern "C" {
-#endif
+/* sf-ablate(build): C++ linkage guard removed; this child has no C++ translation unit. */
 
 /* Metal queues each gate on its service thread and orders GPU arrival/release
  * with events or flags. CUDA waits for its local stream and calls the exchange
@@ -51,7 +49,5 @@ void ds4_gpu_tp_keepalive_pause(int paused);
  * the output-projection partials at the big gate. */
 void ds4_gpu_tp_set_attn_head_split(int enabled);
 
-#ifdef __cplusplus
-}
-#endif
+/* sf-ablate(build): C++ linkage guard removed; this child has no C++ translation unit. */
 #endif
