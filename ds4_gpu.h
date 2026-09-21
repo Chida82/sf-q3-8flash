@@ -156,7 +156,6 @@ void ds4_gpu_tp_flag_fold_request(uint32_t layer, uint32_t gate);
  * to run only its q task now and fold the kv task into the KV staging
  * kernel of the same layer; flush runs it standalone if nothing consumed it. */
 void ds4_gpu_dsv4_qkv_norm_defer_kv_next(void);
-int ds4_gpu_kv_norm_task_pending(void);
 int ds4_gpu_kv_norm_task_flush(void);
 int ds4_gpu_kv_norm_task_begin_concurrent(void);
 void ds4_gpu_kv_norm_task_end_concurrent(void);
@@ -165,6 +164,8 @@ int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
 int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label);
 /* sf-ablate(rocm): block 'ifdef DS4_ROCM_BUILD' removed; this child has no ROCm backend. */
+/* sf-ablate(glm): GLM-5.3 Metal kernel wrappers removed; unreferenced after the
+ * GLM branches went from ds4.c (verified with nm against every object and source). */
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
@@ -656,25 +657,7 @@ int ds4_gpu_matmul_q8_0_decode_mpp_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
-int ds4_gpu_matmul_q8_0_decode_mpp_model_view_tensor(
-        ds4_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint64_t                n_tok);
 
-int ds4_gpu_matmul_q8_0_rows_scalar_tensor(
-        ds4_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint64_t                n_tok);
 
 int ds4_gpu_matmul_quant_tensor(
         ds4_gpu_tensor       *out,
@@ -1271,16 +1254,6 @@ int ds4_gpu_glm_kv_lora_rms_norm_tensor(
         uint32_t              kv_lora_dim,
         float                 eps);
 
-int ds4_gpu_glm_k_b_project_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *kv_norm,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              weight_offset,
-        uint32_t              n_tokens,
-        uint32_t              kv_lora_dim,
-        uint32_t              qk_nope,
-        uint32_t              n_head);
 
 int ds4_gpu_glm_k_b_project_typed_tensor(
         ds4_gpu_tensor       *out,
@@ -1446,12 +1419,6 @@ int ds4_gpu_glm_fill_selected_range_tensor(
         ds4_gpu_tensor *selected,
         uint32_t        n_selected);
 
-int ds4_gpu_glm_fill_selected_range_batch_tensor(
-        ds4_gpu_tensor *selected,
-        uint32_t        n_tokens,
-        uint32_t        pos0,
-        uint32_t        n_selected,
-        uint32_t        pad_row);
 
 int ds4_gpu_glm_indexer_rope_tail_tensor(
         ds4_gpu_tensor *x,
@@ -1506,28 +1473,7 @@ int ds4_gpu_glm53_indexer_scores_batch_tensor(
         float                 scale,
         bool                  cache_f16);
 
-int ds4_gpu_glm_qk_lowrank_q8_0_tensor(
-        ds4_gpu_tensor       *qk_low,
-        const ds4_gpu_tensor *q,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              weight_offset,
-        uint32_t              n_head,
-        uint32_t              kv_lora_dim,
-        uint32_t              qk_nope,
-        uint32_t              qk_dim);
 
-int ds4_gpu_glm_qk_lowrank_q8_0_batch_tensor(
-        ds4_gpu_tensor       *qk_low,
-        const ds4_gpu_tensor *q,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              weight_offset,
-        uint32_t              n_tokens,
-        uint32_t              n_head,
-        uint32_t              kv_lora_dim,
-        uint32_t              qk_nope,
-        uint32_t              qk_dim);
 
 int ds4_gpu_glm_qk_lowrank_typed_tensor(
         ds4_gpu_tensor       *qk_low,
@@ -1554,16 +1500,6 @@ int ds4_gpu_glm_qk_lowrank_typed_batch_tensor(
         uint32_t              qk_nope,
         uint32_t              qk_dim);
 
-int ds4_gpu_glm_value_project_q8_0_batch_heads_tensor(
-        ds4_gpu_tensor       *heads,
-        const ds4_gpu_tensor *lora,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              weight_offset,
-        uint32_t              n_tokens,
-        uint32_t              n_head,
-        uint32_t              kv_lora_dim,
-        uint32_t              value_dim);
 
 int ds4_gpu_glm_value_project_typed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -1577,31 +1513,6 @@ int ds4_gpu_glm_value_project_typed_batch_heads_tensor(
         uint32_t              kv_lora_dim,
         uint32_t              value_dim);
 
-int ds4_gpu_glm_attention_indexed_decode_tensor(
-        ds4_gpu_tensor       *heads,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *qk_low,
-        const ds4_gpu_tensor *kv_lora_cache,
-        const ds4_gpu_tensor *k_rope_cache,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              value_weight_offset,
-        const ds4_gpu_tensor *selected,
-        uint32_t              n_selected,
-        uint32_t              cache_cap,
-        bool                  cache_f16,
-        uint32_t              n_head,
-        uint32_t              kv_lora_dim,
-        uint32_t              qk_nope,
-        uint32_t              qk_rope,
-        uint32_t              value_dim,
-        uint32_t              n_ctx_orig,
-        float                 freq_base,
-        float                 freq_scale,
-        float                 ext_factor,
-        float                 attn_factor,
-        float                 beta_fast,
-        float                 beta_slow);
 
 int ds4_gpu_rope_tail_decode_rows_tensor(
         ds4_gpu_tensor                     *x,
@@ -1646,36 +1557,6 @@ int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
         float                 beta_fast,
         float                 beta_slow);
 
-int ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
-        ds4_gpu_tensor       *heads,
-        ds4_gpu_tensor       *partial_lora,
-        ds4_gpu_tensor       *partial_ms,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *qk_low,
-        const ds4_gpu_tensor *kv_lora_cache,
-        const ds4_gpu_tensor *k_rope_cache,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              value_weight_offset,
-        const ds4_gpu_tensor *selected,
-        uint32_t              n_selected,
-        bool                  selected_rows_valid,
-        uint32_t              cache_cap,
-        bool                  cache_f16,
-        uint32_t              n_head,
-        uint32_t              kv_lora_dim,
-        uint32_t              qk_nope,
-        uint32_t              qk_rope,
-        uint32_t              value_dim,
-        uint32_t              n_ctx_orig,
-        uint32_t              block_rows,
-        uint32_t              n_blocks,
-        float                 freq_base,
-        float                 freq_scale,
-        float                 ext_factor,
-        float                 attn_factor,
-        float                 beta_fast,
-        float                 beta_slow);
 
 int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         ds4_gpu_tensor       *heads,
@@ -1709,32 +1590,6 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         float                 beta_fast,
         float                 beta_slow);
 
-int ds4_gpu_glm_attention_indexed_batch_tensor(
-        ds4_gpu_tensor       *heads,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *qk_low,
-        const ds4_gpu_tensor *kv_lora_cache,
-        const ds4_gpu_tensor *k_rope_cache,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              value_weight_offset,
-        const ds4_gpu_tensor *selected,
-        uint32_t              n_tokens,
-        uint32_t              n_selected,
-        uint32_t              cache_cap,
-        bool                  cache_f16,
-        uint32_t              n_head,
-        uint32_t              kv_lora_dim,
-        uint32_t              qk_nope,
-        uint32_t              qk_rope,
-        uint32_t              value_dim,
-        uint32_t              n_ctx_orig,
-        float                 freq_base,
-        float                 freq_scale,
-        float                 ext_factor,
-        float                 attn_factor,
-        float                 beta_fast,
-        float                 beta_slow);
 
 int ds4_gpu_glm_attention_indexed_batch_typed_tensor(
         ds4_gpu_tensor       *heads,
@@ -1764,11 +1619,6 @@ int ds4_gpu_glm_attention_indexed_batch_typed_tensor(
         float                 beta_fast,
         float                 beta_slow);
 
-int ds4_gpu_sort_i32_rows_asc_tensor(
-        ds4_gpu_tensor       *dst,
-        const ds4_gpu_tensor *src,
-        uint32_t              row_width,
-        uint32_t              n_rows);
 
 int ds4_gpu_glm_attention_indexed_batch_lora_tensor(
         ds4_gpu_tensor       *lora_out,
@@ -2166,19 +2016,6 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
-int ds4_gpu_attention_noncausal_raw_batch_heads_tensor(
-        ds4_gpu_tensor       *heads,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv,
-        uint32_t                n_tokens,
-        uint32_t                n_raw,
-        uint32_t                raw_cap,
-        uint32_t                raw_start,
-        uint32_t                n_head,
-        uint32_t                head_dim);
 
 int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -2482,27 +2319,6 @@ int ds4_gpu_router_select_batch_tensor(
  * image IDs in one batch. Text rows keep the normal/hash route; image rows use
  * the checkpoint's visual selection bias. Routing weights always come from
  * the original, unbiased scores. */
-int ds4_gpu_router_select_batch_visual_tensor(
-        ds4_gpu_tensor       *selected,
-        ds4_gpu_tensor       *weights,
-        ds4_gpu_tensor       *probs,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                bias_offset,
-        uint64_t                hash_offset,
-        uint32_t                hash_rows,
-        bool                    has_bias,
-        bool                    hash_mode,
-        const void             *vision_map,
-        uint64_t                vision_size,
-        uint64_t                visual_bias_offset,
-        const ds4_gpu_tensor *logits,
-        const ds4_gpu_tensor *tokens,
-        uint32_t                vocab_size,
-        uint32_t                n_expert,
-        uint32_t                n_expert_used,
-        float                   expert_weight_scale,
-        uint32_t                n_tokens);
 
 int ds4_gpu_glm_router_select_tensor(
         ds4_gpu_tensor       *selected,

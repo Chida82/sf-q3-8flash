@@ -71,9 +71,9 @@ verify() {
 
 mkdir -p "$OUT_DIR"
 OUT="$OUT_DIR/$FILE"
-if [ -s "$OUT" ]; then
+if [ -L "$OUT" ] && [ -s "$OUT" ]; then
     verify "$OUT"
-    echo "Already downloaded: $OUT"
+    echo "Already downloaded: $OUT -> $(readlink "$OUT")"
 else
     HF=$(find_hf || true)
     [ -n "$HF" ] || {
@@ -82,13 +82,21 @@ else
     }
     echo "Downloading $FILE from https://huggingface.co/$REPO"
     echo "Run this command again to resume an interrupted download."
+    # The CLI owns the shared Hub cache: it deduplicates, resumes and verifies
+    # there. Without --local-dir it prints the cached path instead of copying
+    # the file, so this repository only ever gains symlinks (SPEC.md §C).
     if [ -n "$TOKEN" ]; then
-        "$HF" download "$REPO" "$FILE" --repo-type model --local-dir "$OUT_DIR" --token "$TOKEN"
+        CACHED=$("$HF" download "$REPO" "$FILE" --repo-type model --token "$TOKEN")
     else
-        "$HF" download "$REPO" "$FILE" --repo-type model --local-dir "$OUT_DIR"
+        CACHED=$("$HF" download "$REPO" "$FILE" --repo-type model)
     fi
-    [ -s "$OUT" ] || { echo "Download finished but $OUT is missing" >&2; exit 1; }
+    [ -n "$CACHED" ] && [ -s "$CACHED" ] || {
+        echo "Download finished but the Hugging Face CLI reported no cached file" >&2
+        exit 1
+    }
+    ln -sfn "$CACHED" "$OUT"
     verify "$OUT"
+    echo "Linked $OUT -> $CACHED"
 fi
 
 if [ "$LINK" -eq 1 ]; then
