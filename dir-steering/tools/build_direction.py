@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Build a DS4 directional-steering vector from paired prompt sets.
 
-The extractor asks ds4 to dump one hidden activation row per normal transformer
+The extractor asks sf-q3-8flash to dump one hidden activation row per normal transformer
 layer, averages the target and control rows, and writes a flat f32 file.
-At runtime ds4 applies:
+At runtime sf-q3-8flash applies:
 
     y = y - scale * direction[layer] * dot(direction[layer], y)
 
@@ -23,8 +23,6 @@ from pathlib import Path
 
 
 MODEL_PROFILES = {
-    "deepseek-v4-flash": (43, 4096),
-    "glm-5.3-flash": (45, 4096),
     "qwen3.8-flash-next": (48, 2560),
 }
 
@@ -66,7 +64,7 @@ def run_capture(
     n_embd: int,
     work: Path,
 ) -> list[list[float]]:
-    """Run ds4 once and return the last prompt-row dump for every layer."""
+    """Run sf-q3-8flash once and return the last prompt-row dump for every layer."""
     prompt_path = work / "prompt.txt"
     prompt_path.write_text(prompt, encoding="utf-8")
     dump_prefix = work / "dump"
@@ -92,7 +90,7 @@ def run_capture(
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     if result.returncode != 0:
         error = result.stderr.decode("utf-8", errors="replace")
-        raise RuntimeError(f"ds4 activation capture failed:\n{error}")
+        raise RuntimeError(f"sf-q3-8flash activation capture failed:\n{error}")
 
     rows: list[list[float]] = []
     for layer in range(n_layer):
@@ -116,10 +114,10 @@ def add_rows(total: list[list[float]], rows: list[list[float]], n_layer: int) ->
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ds4", default="./ds4", help="path to the ds4 CLI")
+    ap.add_argument("--ds4", default="./sf-q3-8flash", help="path to the sf-q3-8flash CLI")
     ap.add_argument("--model", default="qwen3.8-flash-next.gguf", help="GGUF model path")
     ap.add_argument("--profile", choices=MODEL_PROFILES,
-                    default="deepseek-v4-flash",
+                    default="qwen3.8-flash-next",
                     help="model shape and chat-template profile")
     ap.add_argument("--good-file", required=True,
                     help="desired/target prompts, one per line")

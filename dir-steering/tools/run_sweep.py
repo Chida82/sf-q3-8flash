@@ -23,7 +23,7 @@ def read_prompts(path: Path) -> list[str]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ds4", default="./ds4")
+    ap.add_argument("--ds4", default="./sf-q3-8flash")
     ap.add_argument("--model", default="qwen3.8-flash-next.gguf")
     ap.add_argument("--direction", required=True,
                     help="flat f32 vector file produced by build_direction.py")

@@ -14,8 +14,8 @@ import urllib.request
 from pathlib import Path
 
 
-MODEL = "deepseek-v4-flash"
-ENDPOINT = "https://api.deepseek.com/chat/completions"
+MODEL = "qwen/qwen3.8-flash"
+ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 
 
 PROMPTS = [
@@ -263,7 +263,7 @@ def main() -> int:
         raise SystemExit("--temperature must be between 0 and 2")
 
     openrouter = "openrouter.ai" in args.endpoint
-    api_key_env = args.api_key_env or ("OPENROUTER_API_KEY" if openrouter else "DEEPSEEK_API_KEY")
+    api_key_env = args.api_key_env or "OPENROUTER_API_KEY"
     api_key = os.environ.get(api_key_env)
     if not api_key:
         raise SystemExit(f"{api_key_env} is not set")
