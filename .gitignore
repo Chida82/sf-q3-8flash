@@ -46,6 +46,8 @@
 /tests/test_cuda_tp
 /tests/test_cuda_tp_repack
 /tests/test_metal_tp_bulk
+/tests/test_metal_tp_cancel
+/tests/test_qwen4_prefill
 /tests/test_glm53_kda
 /tests/test_glm53_vision_engine
 /tests/test_glm_attention

@@ -122,6 +122,9 @@ tests/test_tp_rdma: tests/test_tp_rdma.c $(filter-out ds4_tp.o,$(CPU_CORE_OBJS))
 tests/test_tp_tcp: tests/test_tp_tcp.c $(filter-out ds4_tp.o,$(CPU_CORE_OBJS))
 	$(CC) $(CFLAGS) -I. -o $@ $^ $(LDLIBS)
 
+tests/test_tp_link: tests/test_tp_link.c ds4_tp.h ds4.h $(CPU_CORE_OBJS)
+	$(CC) $(CFLAGS) -I. -o $@ $< $(CPU_CORE_OBJS) $(LDLIBS)
+
 test-session-state: tests/test_session_state tests/test_tp_commands tests/test_tp_rdma tests/test_tp_tcp
 	./tests/test_session_state
 	./tests/test_tp_commands
@@ -194,6 +197,15 @@ test-mxfp4-metal: check-mxfp4-half-lut tests/test_mxfp4_metal
 
 tests/test_metal_session_batch: tests/test_metal_session_batch.c $(CORE_OBJS)
 	$(CC) $(CFLAGS) -I. -o $@ $^ $(METAL_LDLIBS)
+
+tests/test_metal_tp_cancel: tests/test_metal_tp_cancel.c ds4.h ds4_tp.h $(CORE_OBJS)
+	$(CC) $(CFLAGS) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
+
+tests/test_metal_tp_bulk: tests/test_metal_tp_bulk.c ds4_gpu.h ds4_tp.h $(CORE_OBJS)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
+
+tests/test_qwen4_prefill: tests/test_qwen4_prefill.c ds4.h $(CORE_OBJS)
+	$(CC) $(QUALITY_CFLAGS) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
 
 test-metal-session-batch: tests/test_metal_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_session_batch
@@ -290,5 +302,6 @@ clean:
 	rm -f tests/test_q4k_dot tests/test_mxfp4_dot tests/test_session_state tests/test_tp_commands tests/test_tp_rdma tests/test_tp_tcp
 	rm -f tests/test_layer_pack tests/test_prompt_prefix tests/test_sampling tests/test_qwen4_ngrams tests/test_qwen4_ngram_state
 	rm -f tests/test_qwen4_kernels tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_qwen4_vision
+	rm -f tests/test_metal_tp_bulk tests/test_metal_tp_cancel tests/test_tp_link tests/test_qwen4_prefill
 	rm -f tests/test_mxfp4_metal tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_metal_ssd_experts tests/test_metal_command_memory tests/test_ssd_cache tests/test_quality_api
 	rm -f speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/session_concurrency_bench
