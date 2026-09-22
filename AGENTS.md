@@ -182,3 +182,10 @@ When in doubt, prove it: build with the symbol removed, or add a one-line
   of `#error`/`#warning` guards or of `#else` fallbacks whose condition is true
   in the tested configuration. Check those with a negative compile, never with
   the oracle alone.
+- The Metal shader compiler cannot report dead device code from inside the
+  process: on a successful compile `newLibraryWithSource:` leaves `error` nil,
+  so warnings never surface (verified with a deliberately unused probe
+  function and an injected `-Wunused-function` pragma). `MTLCompileOptions`
+  takes no warning flags and `xcrun metal` is not in the Command Line Tools.
+  For kernels the only oracle is the host: the set of names `ds4_metal.m` can
+  form; for device helpers there is none short of installing Xcode.
