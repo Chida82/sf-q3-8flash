@@ -2,7 +2,10 @@
 
 `sf-q3-8flash` is a specialized fork of [ds4 / DwarfStar](https://github.com/antirez/ds4)
 by Salvatore Sanfilippo and contributors, reduced to **Qwen3.8 Flash Next** on
-**Apple Metal**. Upstream base commit: `8db1d1d` (updated at every sync).
+**Apple Metal**. The upstream commit this fork sits on is not written here:
+ask git, which cannot go stale --
+`git describe --tags --match 'sync-*' --abbrev=0` for the last sync, or
+`git merge-base HEAD upstream/main` for the base itself.
 Everything that works here works because of ds4, llama.cpp and GGML; see
 `LICENSE` and the acknowledgements below.
 

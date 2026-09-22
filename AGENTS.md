@@ -23,6 +23,7 @@ relevant document under `docs/` before changing a subsystem.
 | Speculation | Built-in Qwen MTP (`--mtp`); no external support model or DSpark |
 | Steering | `--dir-steering-file`, FFN/attention scales, `/steer`, `dir-steering/` |
 | Distributed | TP/RDMA/pipeline plumbing stays, even where Qwen currently rejects a mode |
+| Upstream base | never written down: `git describe --tags --match 'sync-*' --abbrev=0` names the last sync, `git merge-base HEAD upstream/main` the base. A SHA typed into a file is a second source of truth that goes stale (SPEC.md §A) |
 
 Do not add `ds4-agent`, CUDA, ROCm, another model, or generic model-selection
 layers. External coding agents talk to `sf-q3-8flash-server`; see
@@ -76,9 +77,12 @@ make test-qwen4-ngrams           # tokenizer / n-gram changes
 python3 tests/test_model_download.py
 ```
 
-`make cpu` links the CPU-reference build over the same four binary names, so a
-model-backed run straight after it fails with "requires Metal or single-GPU
-CUDA". Rebuild with `make` before touching the model.
+`make cpu` builds the CPU-reference binaries under their own names
+(`sf-q3-8flash-cpu`, `-cpu-server`, `-cpu-bench`, `-cpu-eval`). Upstream links
+them over the four default names, which make cannot tell apart from a Metal
+link: a plain `make` afterwards relinks nothing and the next model run dies
+with "requires Metal". The separate names remove that state; do not merge a
+sync that restores the shared names.
 
 For vision changes, run the model-less Python metric tests first, then
 `make test-qwen4-vision` with `DS4_QWEN4_SNAPSHOT`, `DS4_QWEN4_MMPROJ`, and
@@ -173,9 +177,18 @@ When in doubt, prove it: build with the symbol removed, or add a one-line
 
 ## Misleading-name traps that already cost time
 
-- `make cpu` links the CPU-reference build over the same four binary names;
-  the next model-backed run then fails with "requires Metal or single-GPU
-  CUDA". Rebuild with `make` first.
+- The second-reasoning-pass streaming guard cannot engage here. Upstream's
+  `stream_needs_second_reasoning_guard()` ends in
+  `model_syntax != SERVER_MODEL_SYNTAX_QWEN`, and `server_model_syntax` has
+  exactly one value in this child, which `request_init` sets. The two inherited
+  `test_*_stream_reroutes_second_reasoning_pass` tests asserted the guard fires
+  and were removed at the sync to `0aaea5a`; the machinery they covered is now
+  dead here and is a candidate for a later, separately measured ablation.
+
+- `make cpu` used to link over the four default binary names, so a Metal run
+  after it failed with "requires Metal or single-GPU CUDA" and `make` would not
+  relink: the binaries were newer than every object. Documenting it was not
+  enough -- it cost hours twice -- so the CPU flavour now has its own names.
 - `mtp-verify-depth` (removed) exercised the external MTP support model, not
   built-in MTP, so it could only skip or fail here.
 - A preprocessor-output diff (`cc -E -P` before/after) cannot see the removal

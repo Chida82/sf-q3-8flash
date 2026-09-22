@@ -5,9 +5,8 @@
 3. Run `make test-qwen4-kernels test-qwen4-q2 test-qwen4-prefill-reuse`.
 4. Run `python3 tests/test_model_download.py`.
 5. With Q2 or Q4 available, run the built-in MTP, checkpoint/rewind, steering,
-   eval, benchmark, and server smoke tests listed in `AGENTS.md`. Note that
-   `make cpu` overwrites the four Metal binaries with CPU-only builds of the
-   same name: rebuild with `make` before any model-backed run.
+   eval, benchmark, and server smoke tests listed in `AGENTS.md`. `make cpu`
+   writes `sf-q3-8flash-cpu*` and no longer touches the Metal binaries.
 6. With the projector and checkpoint available, run the Qwen vision parity test.
 7. Run StarForge's parity oracle: tokens identical, speed delta within 2%.
 8. Check `./sf-q3-8flash --help`, server port 8004, default model symlink, home,

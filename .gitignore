@@ -2,6 +2,10 @@
 /sf-q3-8flash-server
 /sf-q3-8flash-bench
 /sf-q3-8flash-eval
+/sf-q3-8flash-cpu
+/sf-q3-8flash-cpu-server
+/sf-q3-8flash-cpu-bench
+/sf-q3-8flash-cpu-eval
 /ds4_test
 /qwen3.8-flash-next.gguf
 /TODO.md
@@ -58,6 +62,7 @@
 /tests/test_qwen4_moe_mm_specialize
 /tests/test_qwen4_vision
 /tests/test_deepseek4_vision_image
+/tests/test_image_decode
 /tests/test_deepseek41_metal
 /tests/test_deepseek41_cuda
 /tests/test_cuda_q8_rows

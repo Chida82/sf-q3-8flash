@@ -568,7 +568,7 @@ typedef struct {
     uint64_t rope_orig_ctx;
 } ds4_shape;
 
-/* sf-ablate(models): only Qwen3.8 production and mini-test shapes remain. */
+/* sf-ablate(ds4): only Qwen3.8 production and mini-test shapes remain. */
 /* Qwen3.8-Flash-Next: 48 trunk layers (3 GDN + 1 gated GQA attention with
  * a QSA indexer, repeating) plus one MTP block, four hyper-connection
  * streams, and a hashed n-gram PLE layer at trunk index 1.  n_layer counts
@@ -4427,7 +4427,7 @@ static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) 
     }
 
     const uint32_t ratio = ds4_layer_compress_ratio(il);
-    /* sf-ablate(deepseek41): V4.1-only compressor and Engram requirements removed. */
+    /* sf-ablate(ds41): V4.1-only compressor and Engram requirements removed. */
     if (ratio != 0 &&
         (!l->attn_compressor_ape ||
          !l->attn_compressor_kv ||
@@ -4531,7 +4531,7 @@ static void weights_validate_layout(
         tensor_expect_dense_quant_layout(l->attn_output_a,  2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
         tensor_expect_dense_quant_layout(l->attn_output_b,  2, out_low_dim, DS4_N_EMBD, 0);
 
-        /* sf-ablate(deepseek41): V4.1 grouped-output and Engram layout checks removed. */
+        /* sf-ablate(ds41): V4.1 grouped-output and Engram layout checks removed. */
         if (ratio != 0) {
             const uint32_t coff = ratio == 4 ? 2u : 1u;
             const uint64_t comp_width = (uint64_t)coff * DS4_N_HEAD_DIM;
@@ -5137,7 +5137,7 @@ static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_
     l->attn_sinks      = required_tensorf(m, "blk.%u.attn_sinks.weight", il);
     l->attn_output_a   = required_tensorf(m, "blk.%u.attn_output_a.weight", il);
     l->attn_output_b   = required_tensorf(m, "blk.%u.attn_output_b.weight", il);
-    /* sf-ablate(deepseek41): V4.1-only weight binding removed. */
+    /* sf-ablate(ds41): V4.1-only weight binding removed. */
     if (compress_ratio != 0) {
         l->attn_compressor_ape  = required_tensorf(m, "blk.%u.attn_compressor_ape.weight", il);
         l->attn_compressor_kv   = required_tensorf(m, "blk.%u.attn_compressor_kv.weight", il);
@@ -44726,7 +44726,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
     }
-    /* sf-ablate(deepseek41): V4.1-only runtime admission and Engram path removed. */
+    /* sf-ablate(ds41): V4.1-only runtime admission and Engram path removed. */
     if (engine_warm_full_model(opt)) model_warm_weights(&e->model);
     if (opt->vision_path && opt->vision_path[0]) {
 #ifdef DS4_NO_GPU
@@ -44804,7 +44804,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         opt->tp.role != DS4_TP_NONE &&
         !e->ssd_streaming;
     const int tp_shard_rank = opt->tp.role == DS4_TP_WORKER ? 1 : 0;
-    /* sf-ablate(deepseek41): V4.1 CUDA tensor-parallel admission removed. */
+    /* sf-ablate(ds41): V4.1 CUDA tensor-parallel admission removed. */
     if (tp_shard && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         uint32_t bad_layer = 0;
         uint32_t bad_type = 0;
@@ -47558,6 +47558,23 @@ bool ds4_session_vision_state_matches(
     return s && s->checkpoint_valid &&
            s->checkpoint_image_count == image_count &&
            ds4_session_vision_prefix_matches(s, images, image_count);
+}
+
+bool ds4_session_vision_fingerprint_prefix_matches(
+        const ds4_session     *s,
+        const ds4_vision_span *images,
+        size_t                 image_count) {
+    if (!s || !s->checkpoint_valid) return false;
+    if ((image_count != 0 && !images)) return false;
+    if (s->checkpoint_image_count > image_count) return false;
+    for (size_t i = 0; i < s->checkpoint_image_count; i++) {
+        const ds4_vision_identity *old = &s->checkpoint_images[i];
+        const ds4_vision_span *current = &images[i];
+        if (old->token_count != current->embedding.token_count ||
+            memcmp(old->fingerprint, current->embedding.fingerprint,
+                   sizeof(old->fingerprint)) != 0) return false;
+    }
+    return true;
 }
 
 bool ds4_session_rebase_vision_state(const ds4_session *s,
@@ -53204,6 +53221,43 @@ void ds4_session_rewind(ds4_session *s, int pos) {
 
 int ds4_session_pos(ds4_session *s) {
     return s->checkpoint.len;
+}
+
+bool ds4_session_checkpoint_valid(const ds4_session *s) {
+    return s && s->checkpoint_valid;
+}
+
+ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n) {
+    ds4_session *s = xcalloc(1, sizeof(*s));
+    for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, tokens[i]);
+    s->checkpoint_valid = true;
+    return s;
+}
+
+void ds4_session_free_test_checkpoint(ds4_session *s) {
+    if (!s) return;
+    token_vec_free(&s->checkpoint);
+    free(s->checkpoint_images);
+    free(s);
+}
+
+void ds4_session_set_test_images(ds4_session *s,
+                                 const ds4_vision_span *images, size_t n) {
+    if (!s) return;
+    free(s->checkpoint_images);
+    s->checkpoint_images = NULL;
+    s->checkpoint_image_count = 0;
+    if (n == 0 || !images) return;
+    s->checkpoint_images = xcalloc(n, sizeof(*s->checkpoint_images));
+    for (size_t i = 0; i < n; i++) {
+        s->checkpoint_images[i].token_start = images[i].token_start;
+        s->checkpoint_images[i].token_count =
+            images[i].embedding.token_count;
+        memcpy(s->checkpoint_images[i].fingerprint,
+               images[i].embedding.fingerprint,
+               sizeof(s->checkpoint_images[i].fingerprint));
+    }
+    s->checkpoint_image_count = n;
 }
 
 int ds4_session_ctx(ds4_session *s) {
