@@ -88,6 +88,29 @@ ds4_eval_cpu.o: ds4_eval.c
 
 rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
+
+# sf: header dependencies. Upstream's generic %.o rule tracks only the .c, so a
+# change to ds4.h left objects built against the old struct layout; the server
+# unit tests then read TP fields at the wrong offset until `make clean`. Each
+# object lists the headers it includes directly plus those pulled in by ds4.h.
+DS4_CORE_HDRS := ds4.h ds4_tool_text.h ds4_distributed.h ds4_image.h ds4_tp.h \
+                 ds4_layer_pack.h ds4_gpu_mgpu.h ds4_gpu.h ds4_gpu_tp.h ds4_qwen4_vision.h \
+                 ds4_streaming_hotlist.inc ds4_qwen4_unicode.inc
+ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: $(DS4_CORE_HDRS)
+ds4_metal.o: $(DS4_CORE_HDRS)
+ds4_cli.o ds4_cli_cpu.o: ds4.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_prompt_prefix.h linenoise.h
+ds4_server.o ds4_server_cpu.o: ds4.h ds4_tool_text.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds4_tp.h rax.h
+ds4_bench.o ds4_bench_cpu.o: ds4.h ds4_distributed.h ds4_help.h ds4_tp.h
+ds4_eval.o ds4_eval_cpu.o: ds4.h ds4_distributed.h ds4_eval_cases.h ds4_help.h ds4_tp.h
+ds4_eval_cases.o: ds4_eval_cases.h
+ds4_help.o: ds4_help.h ds4.h
+ds4_kvstore.o: ds4_kvstore.h ds4.h
+ds4_prompt_prefix.o: ds4_prompt_prefix.h
+ds4_tp.o: ds4_tp.h ds4_gpu.h ds4.h
+ds4_distributed.o: ds4_distributed.h ds4.h
+ds4_ssd.o: ds4_ssd.h
+ds4_image.o: ds4_image.h
+ds4_layer_pack.o: ds4_layer_pack.h
 ds4_test.o: tests/ds4_test.c ds4_server.c ds4.c ds4.h ds4_help.h ds4_kvstore.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ $<
 
