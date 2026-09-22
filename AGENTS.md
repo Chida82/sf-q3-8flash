@@ -165,6 +165,7 @@ them on the strength of the name alone.
 | `spec_frontier_*`, `metal_graph_dspark_cache_*`, `g->dspark_cache_*` | snapshot/rollback frontier used by `ds4_session_tp_spec_cycle` (TP plumbing, SPEC.md §B). Qwen's own `--mtp` path never reaches it | runtime probes: zero hits with `--mtp`, with depth pinned to 2, and with `DS4_MTP_FORCE_SNAPSHOT` |
 | `dspark_exact_sampling` | the `--mtp-exact-sampling` flag for built-in MTP; not DSpark | `ds4_cli.c`, `ds4_server.c` handlers |
 | `dsv4_*.metal`, `kernel_dsv4_*` | DeepSeek-derived kernels that the Qwen graph reuses (hc, kv, rope, misc) | every kernel in those files is referenced from `ds4_metal.m` |
+| `metal/*.metal` kernels that no string literal names | usually template bodies, instantiated through `typedef decltype(...)` plus `template [[host_name("...")]] kernel alias_t body<...>;` | a search for `"kernel_x"` misses them; check `\bkernel_x<` and `decltype(kernel_x` before calling a kernel dead. Every name reaches `newFunctionWithName:` from a literal or a switch of literals, so the formable set is exactly the literal set plus the four `kernel_flash_attn_ext_*` format patterns; after that audit only 11 instantiations were dead |
 | `ds4_deepseek4_attention_bounds` and the `deepseek4.*` GGUF key readers | shared attention-bounds helper and metadata readers | called from the Qwen path |
 
 When in doubt, prove it: build with the symbol removed, or add a one-line
