@@ -40146,7 +40146,7 @@ typedef struct {
 
 /* sf-ablate(vision): GLM/DeepSeek vision and KDA Metal paths removed. */
 
-/* sf-ablate(dsv41): V4.1 Metal wrappers removed. */
+/* sf-ablate(ds41): V4.1 Metal wrappers removed. */
 
 /* Qwen3.8-Flash-Next kernels (metal/qwen4.metal): one dispatch per wrapper,
  * weights bound from the model map by offset, transients as ds4_gpu_tensors.

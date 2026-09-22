@@ -37,7 +37,7 @@ all: $(BIN) $(BIN)-server $(BIN)-bench $(BIN)-eval
 help:
 	@echo "sf-q3-8flash build targets:"
 	@echo "  make                       Build the four Metal binaries"
-	@echo "  make cpu                   Build the four CPU-reference binaries"
+	@echo "  make cpu                   Build the four CPU-reference binaries ($(BIN)-cpu*)"
 	@echo "  make test                  Run model-less tests"
 	@echo "  make test-qwen4-kernels    Run Qwen3.8 Metal kernel tests"
 	@echo "  make test-qwen4-q2         Run exact low-bit decode and prefill parity"
@@ -56,12 +56,17 @@ $(BIN)-bench: ds4_bench.o ds4_help.o $(CORE_OBJS)
 $(BIN)-eval: ds4_eval.o ds4_eval_cases.o ds4_help.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
+# The CPU-reference build gets its own four names. Linking it over the default
+# names, as upstream does, leaves make unable to tell the flavours apart: a
+# plain `make` afterwards finds the binaries newer than every object, relinks
+# nothing, and the next model run dies with "Qwen3.8 requires Metal". Separate
+# names make that state unreachable instead of documented.
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_cases.o \
      ds4_help.o ds4_prompt_prefix.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
-	$(CC) $(CFLAGS) -o $(BIN) ds4_cli_cpu.o ds4_help.o ds4_prompt_prefix.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o $(BIN)-server ds4_server_cpu.o ds4_help.o ds4_kvstore.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o $(BIN)-bench ds4_bench_cpu.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o $(BIN)-eval ds4_eval_cpu.o ds4_eval_cases.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $(BIN)-cpu ds4_cli_cpu.o ds4_help.o ds4_prompt_prefix.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $(BIN)-cpu-server ds4_server_cpu.o ds4_help.o ds4_kvstore.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $(BIN)-cpu-bench ds4_bench_cpu.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $(BIN)-cpu-eval ds4_eval_cpu.o ds4_eval_cases.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -128,6 +133,12 @@ ds4_cpu_test_hooks.o: ds4.c
 
 tests/test_sampling: tests/test_sampling.c ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -fno-finite-math-only -DDS4_TEST_HOOKS -I. -o $@ $^ $(LDLIBS)
+
+tests/test_image_decode.o: tests/test_image_decode.c ds4_image.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_image_decode: tests/test_image_decode.o ds4_image.o
+	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 tests/test_session_state.o: tests/test_session_state.c
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
@@ -280,13 +291,14 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 test: all ds4_test q4k-dot-test mxfp4-dot-test test-session-state tests/test_layer_pack \
-      tests/test_prompt_prefix tests/test_sampling test-qwen4-ngrams
+      tests/test_prompt_prefix tests/test_sampling tests/test_image_decode test-qwen4-ngrams
 	./$(BIN)-eval --validate-cases
 	./$(BIN)-eval --self-test-extractors
 	./ds4_test --server
 	./tests/test_layer_pack
 	./tests/test_prompt_prefix
 	./tests/test_sampling
+	./tests/test_image_decode
 	python3 tests/test_model_download.py
 
 
@@ -315,8 +327,10 @@ session-concurrency-bench: speed-bench/session_concurrency_bench
 
 clean:
 	rm -f $(BIN) $(BIN)-server $(BIN)-bench $(BIN)-eval ds4_test *.o tests/*.o speed-bench/*.o
+	rm -f $(BIN)-cpu $(BIN)-cpu-server $(BIN)-cpu-bench $(BIN)-cpu-eval
 	rm -f tests/test_q4k_dot tests/test_mxfp4_dot tests/test_session_state tests/test_tp_commands tests/test_tp_rdma tests/test_tp_tcp
 	rm -f tests/test_layer_pack tests/test_prompt_prefix tests/test_sampling tests/test_qwen4_ngrams tests/test_qwen4_ngram_state
+	rm -f tests/test_image_decode
 	rm -f tests/test_qwen4_kernels tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_qwen4_vision
 	rm -f tests/test_metal_tp_bulk tests/test_metal_tp_cancel tests/test_tp_link tests/test_qwen4_prefill
 	rm -f tests/test_mxfp4_metal tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_metal_ssd_experts tests/test_metal_command_memory tests/test_ssd_cache tests/test_quality_api
