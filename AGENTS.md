@@ -163,7 +163,7 @@ them on the strength of the name alone.
 
 | Name family | What it really is | Evidence |
 |---|---|---|
-| `glm_graph_*`, `glm_gpu_graph`, `glm_dense_*`, `glm_debug_*` | the shared Metal graph host: workspace, tensor views, env toggles, matmul wrappers. Qwen3.8 runs on it | ~1,200 references remain after every GLM-5.3 branch was removed; the build depends on them |
+| `glm_graph_env_present`, `glm_graph_env_value`, `glm_debug_dump_prefill_logits`, `glm_dense_cache_len` | env-toggle readers and small helpers that the Qwen path calls; not a GLM graph. The GLM graph itself (`ds4_glm_gpu_graph`, its memory guards and streaming planner) is gone | a coverage run with the model counts 528 calls to `glm_graph_env_present` and 16 to `glm_graph_env_value`; freezing the family to Qwen took `glm_graph_*` from 359 references to 118, and the compiler proved the rest unused |
 | `glm_mtp`, `glm_mtp_timing`, `glm_mtp_have` | the built-in MTP switch. `--mtp` sets `engine.glm_mtp`; Qwen speculation is off without it | `ds4_cli.c` `--mtp` handler; `ds4_session_eval_speculative*` Qwen branch |
 | `spec_frontier_*`, `metal_graph_dspark_cache_*`, `g->dspark_cache_*` | snapshot/rollback frontier used by `ds4_session_tp_spec_cycle` (TP plumbing, SPEC.md §B). Qwen's own `--mtp` path never reaches it | runtime probes: zero hits with `--mtp`, with depth pinned to 2, and with `DS4_MTP_FORCE_SNAPSHOT` |
 | `dspark_exact_sampling` | the `--mtp-exact-sampling` flag for built-in MTP; not DSpark | `ds4_cli.c`, `ds4_server.c` handlers |
@@ -175,6 +175,16 @@ When in doubt, prove it: build with the symbol removed, or add a one-line
 `fprintf` probe and run the model. A probe result outranks any name.
 
 ## Misleading-name traps that already cost time
+
+- The DeepSeek graph (`ds4_gpu_graph`, `s->graph`, `metal_graph_*`) is not
+  Qwen's graph. Qwen sessions run on `ds4_qwen4_gpu_graph`:
+  `ds4_session_create` returns from the Qwen branch before
+  `metal_graph_alloc_raw_cap`, so `s->graph` stays zeroed, and engine open
+  rejects TP, pipeline execution, SSD streaming and power throttling for Qwen.
+  Anything that builds the DeepSeek graph on Qwen weights crashes (the removed
+  `--imatrix-*` and `--metal-graph-*-test` all did). What remains of that graph
+  is kept on purpose for the TP and pipeline plumbing (SPEC.md §B), not because
+  Qwen executes it; do not read it as evidence of what Qwen does.
 
 - The second-reasoning-pass streaming guard cannot engage here. Upstream's
   `stream_needs_second_reasoning_guard()` ends in
