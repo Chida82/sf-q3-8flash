@@ -58,9 +58,6 @@ typedef struct {
     ds4_think_mode think_mode;
     bool head_test;
     bool first_token_test;
-    bool metal_graph_test;
-    bool metal_graph_full_test;
-    bool metal_graph_prompt_test;
 } cli_generation_options;
 
 typedef struct {
@@ -1132,21 +1129,6 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     build_prompt(engine, &cfg->gen, &prompt);
 
     int rc = 0;
-    if (cfg->gen.metal_graph_test) {
-        rc = ds4_engine_metal_graph_test(engine, &prompt);
-        ds4_tokens_free(&prompt);
-        return rc;
-    }
-    if (cfg->gen.metal_graph_full_test) {
-        rc = ds4_engine_metal_graph_full_test(engine, &prompt);
-        ds4_tokens_free(&prompt);
-        return rc;
-    }
-    if (cfg->gen.metal_graph_prompt_test) {
-        rc = ds4_engine_metal_graph_prompt_test(engine, &prompt, cfg->gen.ctx_size);
-        ds4_tokens_free(&prompt);
-        return rc;
-    }
     if (cfg->gen.dump_logits_path) {
         rc = run_logits_dump(engine, cfg, &prompt);
         ds4_tokens_free(&prompt);
@@ -2079,15 +2061,7 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.head_test = true;
         } else if (!strcmp(arg, "--first-token-test")) {
             c.gen.first_token_test = true;
-        } else if (!strcmp(arg, "--metal-graph-test")) {
-            c.gen.metal_graph_test = true;
-            c.engine.backend = DS4_BACKEND_METAL;
-        } else if (!strcmp(arg, "--metal-graph-full-test")) {
-            c.gen.metal_graph_full_test = true;
-            c.engine.backend = DS4_BACKEND_METAL;
-        } else if (!strcmp(arg, "--metal-graph-prompt-test")) {
-            c.gen.metal_graph_prompt_test = true;
-            c.engine.backend = DS4_BACKEND_METAL;
+        /* sf-ablate(ds4): --metal-graph-{,full-,prompt-}test removed; they crashed on Qwen weights. */
         } else if (!strcmp(arg, "--metal-graph-generate")) {
             fprintf(stderr, "ds4: --metal-graph-generate was removed; --metal is the graph path\n");
             exit(2);
@@ -2177,7 +2151,6 @@ int main(int argc, char **argv) {
     }
     cfg.engine.inspect_only = cfg.inspect;
     cfg.engine.first_token_test = cfg.gen.first_token_test;
-    cfg.engine.metal_graph_test = cfg.gen.metal_graph_test;
     cfg.engine.context_size = cfg.gen.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
     ds4_engine *engine = NULL;

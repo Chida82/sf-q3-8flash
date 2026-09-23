@@ -164,7 +164,6 @@ typedef struct {
     /* Server batch mode serializes execution and can share prefill scratch. */
     bool share_session_prefill_workspace;
     bool first_token_test;
-    bool metal_graph_test;
     bool load_slice;
     uint32_t load_layer_start;
     uint32_t load_layer_end;
@@ -315,9 +314,6 @@ int ds4_dump_chat_tokenization(const char *model_path,
                                FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
-int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
-int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt);
-int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, int ctx_size);
 
 void ds4_tokens_push(ds4_tokens *tv, int token);
 void ds4_tokens_free(ds4_tokens *tv);
