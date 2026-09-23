@@ -6279,7 +6279,8 @@ static bool test_mpp_eq_case_selected(const char *id) {
 static int test_load_mpp_cases(ds4_engine *engine, test_mpp_eq_case *cases, int cap) {
     const char *path = getenv("DS4_TEST_VECTOR_FILE");
     if (!path || !path[0]) {
-        path = "tests/test-vectors/flash-0731/official.vec";
+        /* sf-ablate(ds4): the DeepSeek official.vec fixture was not kept; this test needs only its prompts, now in tests/metal-equivalence. */
+        path = "tests/metal-equivalence/cases.vec";
     }
     FILE *fp = fopen(path, "rb");
     TEST_ASSERT(fp != NULL);

@@ -1,0 +1,21 @@
+# Cases for ds4_test --metal-tensor-equivalence.
+# The Metal-4-disabled route is the reference and the auto route the
+# candidate, both on the loaded Qwen3.8 model. Only id, ctx, steps and the
+# prompt file are read; there are no expected tokens or logprobs.
+# The prompts are upstream's tests/test-vectors/flash-0731/prompts, verbatim.
+# case <id> <ctx> <steps> <prompt-file>
+
+case short_italian_fact 16384 4 tests/metal-equivalence/prompts/short_italian_fact.txt
+end
+
+case short_code_completion 4096 1 tests/metal-equivalence/prompts/short_code_completion.txt
+end
+
+case short_reasoning_plain 4096 1 tests/metal-equivalence/prompts/short_reasoning_plain.txt
+end
+
+case long_memory_archive 16384 4 tests/metal-equivalence/prompts/long_memory_archive.txt
+end
+
+case long_code_audit 16384 4 tests/metal-equivalence/prompts/long_code_audit.txt
+end
