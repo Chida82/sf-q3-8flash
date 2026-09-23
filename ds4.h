@@ -305,13 +305,6 @@ int ds4_engine_generate_argmax(ds4_engine *e, const ds4_tokens *prompt,
                                void *emit_ud,
                                ds4_session_progress_fn progress,
                                void *progress_ud);
-int ds4_engine_collect_imatrix(ds4_engine *e,
-                               const char *dataset_path,
-                               const char *output_path,
-                               int ctx_size,
-                               int max_prompts,
-                               int max_tokens,
-                               int min_expert_samples);
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
 int ds4_dump_chat_tokenization(const char *model_path,

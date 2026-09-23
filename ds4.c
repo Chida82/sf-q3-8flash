@@ -28622,341 +28622,7 @@ static bool metal_graph_eval_token_raw_swa_top(
 
 
 
-/* =========================================================================
- * Imatrix Collection.
- * =========================================================================
- *
- * The 2-bit DS4 quants care most about routed MoE experts.  For expert gate
- * and up matrices the matmul input is the FFN-normalized activation row.  For
- * expert down matrices the matmul input is the routed SwiGLU row after route
- * weighting.  During Metal prefill those tensors are already materialized as
- * `batch_ffn_norm`, `batch_router_selected`, and `batch_routed_mid`, so the
- * collector observes the exact release graph without changing inference math.
- *
- * The output is llama.cpp's legacy imatrix `.dat` format.  Entries are packed
- * by expert: one tensor entry contains `n_expert * n_columns` floats and the
- * quantizer slices the vector for each expert.
- */
-typedef struct {
-    float *gate_up_sum2;   /* [active layer][active expert][hidden] */
-    float *down_sum2;      /* [active layer][active expert][expert FFN] */
-    uint32_t gate_up_count[DS4_MAX_LAYER][DS4_MAX_EXPERT];
-    uint32_t down_count[DS4_MAX_LAYER][DS4_MAX_EXPERT];
-    float *ffn_norm_buf;
-    float *routed_mid_buf;
-    uint16_t *routed_mid_f16_buf;
-    int   *selected_buf;
-    float *sq_tmp;
-    uint32_t cap_tokens;
-    uint64_t observed_tokens;
-    uint64_t observed_routes;
-    uint32_t chunks;
-    const char *dataset_path;
-} ds4_imatrix_collector;
-
-struct ds4_glm_gpu_graph;
-
-static bool imatrix_collector_init(ds4_imatrix_collector *c, uint32_t cap_tokens, const char *dataset_path) {
-    memset(c, 0, sizeof(*c));
-    c->cap_tokens = cap_tokens ? cap_tokens : 1u;
-    c->dataset_path = dataset_path;
-    const size_t gate_n = (size_t)DS4_N_LAYER * DS4_N_EXPERT * DS4_N_EMBD;
-    const size_t down_n = (size_t)DS4_N_LAYER * DS4_N_EXPERT * DS4_N_FF_EXP;
-    c->gate_up_sum2 = xcalloc(gate_n, sizeof(c->gate_up_sum2[0]));
-    c->down_sum2 = xcalloc(down_n, sizeof(c->down_sum2[0]));
-    c->ffn_norm_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EMBD * sizeof(c->ffn_norm_buf[0]));
-    c->routed_mid_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(c->routed_mid_buf[0]));
-    c->routed_mid_f16_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(c->routed_mid_f16_buf[0]));
-    c->selected_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * sizeof(c->selected_buf[0]));
-    c->sq_tmp = xmalloc((size_t)DS4_N_EMBD * sizeof(c->sq_tmp[0]));
-    return c->gate_up_sum2 && c->down_sum2 && c->ffn_norm_buf &&
-           c->routed_mid_buf && c->routed_mid_f16_buf && c->selected_buf && c->sq_tmp;
-}
-
-static void imatrix_collector_free(ds4_imatrix_collector *c) {
-    if (!c) return;
-    free(c->gate_up_sum2);
-    free(c->down_sum2);
-    free(c->ffn_norm_buf);
-    free(c->routed_mid_buf);
-    free(c->routed_mid_f16_buf);
-    free(c->selected_buf);
-    free(c->sq_tmp);
-    memset(c, 0, sizeof(*c));
-}
-
-static float *imatrix_gate_up_ptr(ds4_imatrix_collector *c, uint32_t il, uint32_t expert) {
-    return c->gate_up_sum2 + ((size_t)il * DS4_N_EXPERT + expert) * DS4_N_EMBD;
-}
-
-static float *imatrix_down_ptr(ds4_imatrix_collector *c, uint32_t il, uint32_t expert) {
-    return c->down_sum2 + ((size_t)il * DS4_N_EXPERT + expert) * DS4_N_FF_EXP;
-}
-
-static bool imatrix_collect_tensor_batch(
-        ds4_imatrix_collector *c,
-        ds4_gpu_tensor        *ffn_norm,
-        ds4_gpu_tensor        *routed_mid,
-        ds4_gpu_tensor        *router_selected,
-        bool                   routed_mid_is_f16,
-        uint32_t               il,
-        uint32_t               n_tokens) {
-    if (!c || n_tokens == 0) return true;
-    if (!ffn_norm || !routed_mid || !router_selected ||
-        n_tokens > c->cap_tokens) return false;
-
-    const uint64_t norm_bytes = (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
-    const uint64_t mid_elems = (uint64_t)n_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP;
-    const uint64_t mid_bytes = mid_elems *
-        (routed_mid_is_f16 ? sizeof(uint16_t) : sizeof(float));
-    const uint64_t sel_bytes = (uint64_t)n_tokens * DS4_N_EXPERT_USED * sizeof(int);
-    void *mid_dst = routed_mid_is_f16
-        ? (void *)c->routed_mid_f16_buf
-        : (void *)c->routed_mid_buf;
-    if (ds4_gpu_tensor_read(ffn_norm, 0, c->ffn_norm_buf, norm_bytes) == 0 ||
-        ds4_gpu_tensor_read(routed_mid, 0, mid_dst, mid_bytes) == 0 ||
-        ds4_gpu_tensor_read(router_selected, 0, c->selected_buf, sel_bytes) == 0)
-    {
-        return false;
-    }
-
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        const float *x = c->ffn_norm_buf + (size_t)t * DS4_N_EMBD;
-        for (uint32_t i = 0; i < DS4_N_EMBD; i++) c->sq_tmp[i] = x[i] * x[i];
-
-        for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
-            const int expert = c->selected_buf[(size_t)t * DS4_N_EXPERT_USED + slot];
-            if (expert < 0 || (uint32_t)expert >= DS4_N_EXPERT) continue;
-
-            float *gate_up = imatrix_gate_up_ptr(c, il, (uint32_t)expert);
-            for (uint32_t i = 0; i < DS4_N_EMBD; i++) gate_up[i] += c->sq_tmp[i];
-            c->gate_up_count[il][expert]++;
-
-            float *down = imatrix_down_ptr(c, il, (uint32_t)expert);
-            const size_t mid_off = ((size_t)t * DS4_N_EXPERT_USED + slot) * DS4_N_FF_EXP;
-            if (routed_mid_is_f16) {
-                const uint16_t *mid = c->routed_mid_f16_buf + mid_off;
-                for (uint32_t i = 0; i < DS4_N_FF_EXP; i++) {
-                    const float v = f16_to_f32(mid[i]);
-                    down[i] += v * v;
-                }
-            } else {
-                const float *mid = c->routed_mid_buf + mid_off;
-                for (uint32_t i = 0; i < DS4_N_FF_EXP; i++) down[i] += mid[i] * mid[i];
-            }
-            c->down_count[il][expert]++;
-            c->observed_routes++;
-        }
-    }
-    c->observed_tokens += n_tokens;
-    c->chunks++;
-    return true;
-}
-
-static bool imatrix_collect_layer_batch(
-        ds4_imatrix_collector *c,
-        ds4_gpu_graph         *g,
-        uint32_t               il,
-        uint32_t               n_tokens) {
-    if (!g) return false;
-    return imatrix_collect_tensor_batch(c,
-                                        metal_graph_batch_ffn_norm(g),
-                                        metal_graph_batch_routed_mid(g),
-                                        metal_graph_batch_router_selected(g),
-                                        g->batch_routed_mid_is_f16,
-                                        il,
-                                        n_tokens);
-}
-
-static void imatrix_write_i32(FILE *fp, int32_t v) {
-    if (fwrite(&v, sizeof(v), 1, fp) != 1) ds4_die("failed to write imatrix");
-}
-
-static void imatrix_write_entry(
-        FILE       *fp,
-        const char *name,
-        const float *sum2,
-        const uint32_t *counts,
-        uint32_t n_expert,
-        uint32_t n_col) {
-    const int32_t len = (int32_t)strlen(name);
-    const int32_t ncall = 1;
-    const int32_t nval = (int32_t)((uint64_t)n_expert * n_col);
-    imatrix_write_i32(fp, len);
-    if (fwrite(name, 1, (size_t)len, fp) != (size_t)len) ds4_die("failed to write imatrix name");
-    imatrix_write_i32(fp, ncall);
-    imatrix_write_i32(fp, nval);
-
-    float *tmp = xmalloc((size_t)n_col * sizeof(tmp[0]));
-    for (uint32_t e = 0; e < n_expert; e++) {
-        const uint32_t count = counts[e];
-        const float *src = sum2 + (size_t)e * n_col;
-        if (count == 0) {
-            memset(tmp, 0, (size_t)n_col * sizeof(tmp[0]));
-        } else {
-            const float inv = 1.0f / (float)count;
-            for (uint32_t i = 0; i < n_col; i++) tmp[i] = src[i] * inv;
-        }
-        if (fwrite(tmp, sizeof(tmp[0]), n_col, fp) != n_col) ds4_die("failed to write imatrix values");
-    }
-    free(tmp);
-}
-
-static bool imatrix_collector_save(
-        const ds4_imatrix_collector *c,
-        const ds4_weights           *weights,
-        const char                  *path) {
-    FILE *fp = fopen(path, "wb");
-    if (!fp) {
-        fprintf(stderr, "ds4: failed to open imatrix output %s: %s\n", path, strerror(errno));
-        return false;
-    }
-
-    int32_t entries = 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        if (weights->layer[il].ffn_gate_exps) entries += 3;
-    }
-    imatrix_write_i32(fp, entries);
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const ds4_layer_weights *layer = &weights->layer[il];
-        if (!layer->ffn_gate_exps || !layer->ffn_up_exps ||
-            !layer->ffn_down_exps) continue;
-        char name[256];
-        snprintf(name, sizeof(name), "%.*s", (int)layer->ffn_gate_exps->name.len, layer->ffn_gate_exps->name.ptr);
-        imatrix_write_entry(fp, name,
-                            c->gate_up_sum2 + (size_t)il * DS4_N_EXPERT * DS4_N_EMBD,
-                            c->gate_up_count[il],
-                            DS4_N_EXPERT,
-                            DS4_N_EMBD);
-        snprintf(name, sizeof(name), "%.*s", (int)layer->ffn_up_exps->name.len, layer->ffn_up_exps->name.ptr);
-        imatrix_write_entry(fp, name,
-                            c->gate_up_sum2 + (size_t)il * DS4_N_EXPERT * DS4_N_EMBD,
-                            c->gate_up_count[il],
-                            DS4_N_EXPERT,
-                            DS4_N_EMBD);
-        snprintf(name, sizeof(name), "%.*s", (int)layer->ffn_down_exps->name.len, layer->ffn_down_exps->name.ptr);
-        imatrix_write_entry(fp, name,
-                            c->down_sum2 + (size_t)il * DS4_N_EXPERT * DS4_N_FF_EXP,
-                            c->down_count[il],
-                            DS4_N_EXPERT,
-                            DS4_N_FF_EXP);
-    }
-
-    const int32_t chunks = (int32_t)c->chunks;
-    imatrix_write_i32(fp, chunks);
-    const char *dataset = c->dataset_path ? c->dataset_path : "";
-    const int32_t dataset_len = (int32_t)strlen(dataset);
-    imatrix_write_i32(fp, dataset_len);
-    if (dataset_len && fwrite(dataset, 1, (size_t)dataset_len, fp) != (size_t)dataset_len) {
-        ds4_die("failed to write imatrix dataset name");
-    }
-
-    if (fclose(fp) != 0) {
-        fprintf(stderr, "ds4: failed to close imatrix output %s: %s\n", path, strerror(errno));
-        return false;
-    }
-    return true;
-}
-
-static uint32_t imatrix_collector_min_samples(
-        const ds4_imatrix_collector *c,
-        const ds4_weights           *weights,
-        uint32_t                     layer_limit) {
-    bool found = false;
-    uint32_t min_samples = UINT32_MAX;
-    if (layer_limit > DS4_N_LAYER) layer_limit = DS4_N_LAYER;
-    for (uint32_t il = 0; il < layer_limit; il++) {
-        if (!weights->layer[il].ffn_gate_exps) continue;
-        for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
-            uint32_t samples = c->gate_up_count[il][expert];
-            if (c->down_count[il][expert] < samples) {
-                samples = c->down_count[il][expert];
-            }
-            if (samples < min_samples) min_samples = samples;
-            found = true;
-        }
-    }
-    return found ? min_samples : 0;
-}
-
-static void imatrix_collector_report_coverage(
-        const ds4_imatrix_collector *c,
-        const ds4_weights           *weights,
-        uint32_t                     layer_limit) {
-    uint32_t layers = 0;
-    uint32_t covered = 0;
-    uint32_t possible = 0;
-    uint32_t min_layer = DS4_N_EXPERT;
-    uint32_t max_layer = 0;
-    uint32_t min_samples = UINT32_MAX;
-    uint32_t max_samples = 0;
-    uint32_t under_four = 0;
-    uint32_t under_eight = 0;
-    if (layer_limit > DS4_N_LAYER) layer_limit = DS4_N_LAYER;
-    for (uint32_t il = 0; il < layer_limit; il++) {
-        if (!weights->layer[il].ffn_gate_exps) continue;
-        uint32_t layer_covered = 0;
-        for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
-            uint32_t samples = c->gate_up_count[il][expert];
-            if (c->down_count[il][expert] < samples) {
-                samples = c->down_count[il][expert];
-            }
-            if (samples != 0) {
-                layer_covered++;
-            }
-            if (samples < min_samples) min_samples = samples;
-            if (samples > max_samples) max_samples = samples;
-            if (samples < 4) under_four++;
-            if (samples < 8) under_eight++;
-        }
-        layers++;
-        covered += layer_covered;
-        possible += DS4_N_EXPERT;
-        if (layer_covered < min_layer) min_layer = layer_covered;
-        if (layer_covered > max_layer) max_layer = layer_covered;
-    }
-    if (layers == 0) {
-        min_layer = 0;
-        min_samples = 0;
-    }
-    fprintf(stderr,
-            "ds4: imatrix expert coverage %u/%u (%.2f%%), "
-            "per sparse layer min=%u max=%u, samples min=%u max=%u, "
-            "under4=%u under8=%u\n",
-            covered,
-            possible,
-            possible ? 100.0 * (double)covered / (double)possible : 0.0,
-            min_layer,
-            max_layer,
-            min_samples,
-            max_samples,
-            under_four,
-            under_eight);
-    if (under_eight != 0) {
-        uint32_t shown = 0;
-        fprintf(stderr, "ds4: imatrix expert slots under 8 samples:");
-        for (uint32_t samples = 0; samples < 8 && shown < 256; samples++) {
-            for (uint32_t il = 0; il < layer_limit && shown < 256; il++) {
-                if (!weights->layer[il].ffn_gate_exps) continue;
-                for (uint32_t expert = 0;
-                     expert < DS4_N_EXPERT && shown < 256;
-                     expert++) {
-                    uint32_t count = c->gate_up_count[il][expert];
-                    if (c->down_count[il][expert] < count) {
-                        count = c->down_count[il][expert];
-                    }
-                    if (count != samples) continue;
-                    fprintf(stderr, " %u:%u=%u", il, expert, count);
-                    shown++;
-                }
-            }
-        }
-        if (shown < under_eight) {
-            fprintf(stderr, " ... (%u more)", under_eight - shown);
-        }
-        fputc('\n', stderr);
-    }
-}
+/* sf-ablate(quant): routed-MoE imatrix collector removed; it ran the DeepSeek graph, which segfaults on Qwen weights, and this child never quantizes. */
 
 static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
     memset(g->layer_n_comp, 0, sizeof(g->layer_n_comp));
@@ -29311,7 +28977,6 @@ static bool metal_graph_prefill_layer_major(
         uint32_t               n_tokens,
         float                 *logits,
         bool                   show_progress,
-        ds4_imatrix_collector *imatrix,
         ds4_session_progress_fn display_progress,
         void                  *display_progress_ud) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
@@ -29352,7 +29017,7 @@ static bool metal_graph_prefill_layer_major(
     const bool callback_split = display_progress != NULL && n_tokens >= 32;
     const bool split_commands = g->ssd_streaming ||
                                 split_profile || throttle || callback_split ||
-                                n_tokens > 2048 || imatrix != NULL;
+                                n_tokens > 2048;
     const bool profile =
         glm_graph_env_present("DS4_ROCM_GRAPH_PREFILL_PROFILE",
                               "DS4_METAL_GRAPH_PREFILL_PROFILE") ||
@@ -29364,7 +29029,6 @@ static bool metal_graph_prefill_layer_major(
     const uint32_t pipeline_mb = metal_graph_cuda_prefill_pipeline_microbatch();
     if (!split_commands &&
         !profile &&
-        imatrix == NULL &&
         !g->prefill_has_visual &&
         metal_graph_cuda_prefill_pipeline_requested(g) &&
         pipeline_mb != 0 &&
@@ -29698,7 +29362,6 @@ static bool metal_graph_prefill_layer_major(
                         il,
                         n_tokens);
             }
-            if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, (uint32_t)n_tokens);
             layer_elapsed = (t_attn_done - t_attn0) + (t_ffn_done - t_ffn0);
 
             encode_s += (t_attn_encoded - t_attn0) + (t_ffn_encoded - t_ffn0);
@@ -29746,7 +29409,6 @@ static bool metal_graph_prefill_layer_major(
                         il,
                         n_tokens);
             }
-            if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, (uint32_t)n_tokens);
             layer_elapsed = t_done - t_chunk0;
             if (profile) {
                 encode_s += t_encoded - t_chunk0;
@@ -29958,7 +29620,6 @@ static bool metal_graph_prefill_raw_swa(
                                            (uint32_t)n_tokens,
                                            logits,
                                            show_progress,
-                                           NULL,
                                            display_progress,
                                            display_progress_ud);
 }
@@ -29985,7 +29646,6 @@ static bool metal_graph_prefill_chunked_range(
         void                  *progress_ud,
         ds4_session_progress_fn display_progress,
         void                  *display_progress_ud,
-        ds4_imatrix_collector *imatrix,
         ds4_session_cancel_fn  cancel,
         void                  *cancel_ud,
         bool                  *cancelled) {
@@ -29995,9 +29655,8 @@ static bool metal_graph_prefill_chunked_range(
     if (g->ssd_streaming && start == 0) {
         ds4_gpu_stream_expert_cache_reset_route_hotness();
     }
-    if (!imatrix &&
-        metal_graph_use_streaming_decode_prefill_range(g, weights,
-                                                       start, n_tokens)) {
+    if (metal_graph_use_streaming_decode_prefill_range(g, weights,
+                                                   start, n_tokens)) {
         return metal_graph_prefill_decode_streaming_range(g,
                                                           model,
                                                           weights,
@@ -30058,7 +29717,6 @@ static bool metal_graph_prefill_chunked_range(
                                                   chunk,
                                                   chunk_logits,
                                                   show_progress,
-                                                  imatrix,
                                                   display_progress,
                                                   display_progress_ud);
         if (!ok) {
@@ -30122,7 +29780,6 @@ static bool metal_graph_prefill_chunked(
                                              progress_ud,
                                              display_progress,
                                              display_progress_ud,
-                                             NULL,
                                              cancel,
                                              cancel_ud,
                                              cancelled);
@@ -34189,7 +33846,6 @@ typedef struct ds4_glm_gpu_graph {
     bool ssd_streaming_cold;
     bool generic_routed_moe;
     bool glm53;
-    ds4_imatrix_collector *imatrix;
     ds4_gpu_tensor *directional_steering_dirs_by_tier[DS4_MAX_GPUS];
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
@@ -40727,240 +40383,7 @@ int ds4_dump_chat_tokenization(const char *model_path,
     return 0;
 }
 
-#ifndef DS4_NO_GPU
-static bool imatrix_read_text_file(const char *path, char **out, size_t *len_out) {
-    *out = NULL;
-    *len_out = 0;
-    struct stat st;
-    if (stat(path, &st) != 0) {
-        fprintf(stderr, "ds4: failed to stat imatrix dataset %s: %s\n", path, strerror(errno));
-        return false;
-    }
-    if (st.st_size < 0 || (uint64_t)st.st_size > SIZE_MAX - 1) {
-        fprintf(stderr, "ds4: imatrix dataset is too large: %s\n", path);
-        return false;
-    }
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        fprintf(stderr, "ds4: failed to open imatrix dataset %s: %s\n", path, strerror(errno));
-        return false;
-    }
-    size_t n = (size_t)st.st_size;
-    char *buf = xmalloc(n + 1);
-    if (n != 0 && fread(buf, 1, n, fp) != n) {
-        fprintf(stderr, "ds4: failed to read imatrix dataset %s\n", path);
-        fclose(fp);
-        free(buf);
-        return false;
-    }
-    if (fclose(fp) != 0) {
-        fprintf(stderr, "ds4: failed to close imatrix dataset %s: %s\n", path, strerror(errno));
-        free(buf);
-        return false;
-    }
-    buf[n] = '\0';
-    *out = buf;
-    *len_out = n;
-    return true;
-}
-
-static char *imatrix_trim_block(char *p, char *end) {
-    while (p < end && isspace((unsigned char)*p)) p++;
-    while (end > p && isspace((unsigned char)end[-1])) end--;
-    *end = '\0';
-    return p;
-}
-
-static char *imatrix_find_marker(char *dataset, char *cursor, const char *marker) {
-    const size_t marker_len = strlen(marker);
-    char *p = cursor;
-    while ((p = strstr(p, marker)) != NULL) {
-        if (p == dataset || p[-1] == '\n') return p;
-        p += marker_len;
-    }
-    return NULL;
-}
-
-#endif
-
-int ds4_engine_collect_imatrix(ds4_engine *e,
-                               const char *dataset_path,
-                               const char *output_path,
-                               int ctx_size,
-                               int max_prompts,
-                               int max_tokens,
-                               int min_expert_samples) {
-#ifdef DS4_NO_GPU
-    (void)e;
-    (void)dataset_path;
-    (void)output_path;
-    (void)ctx_size;
-    (void)max_prompts;
-    (void)max_tokens;
-    (void)min_expert_samples;
-    fprintf(stderr, "ds4: imatrix collection requires a graph backend build\n");
-    return 1;
-#else
-    if (!e || !dataset_path || !output_path) return 1;
-    if (e->backend != DS4_BACKEND_METAL || !e->metal_ready) {
-        fprintf(stderr, "ds4: imatrix collection currently requires --metal\n");
-        return 1;
-    }
-    if (ctx_size <= 0) ctx_size = 32768;
-
-    char *dataset = NULL;
-    size_t dataset_len = 0;
-    if (!imatrix_read_text_file(dataset_path, &dataset, &dataset_len)) return 1;
-
-    /* sf-ablate(glm): GLM-5.3 branch removed; this child only ever runs the Qwen3.8 family. */
-
-    const ds4_model *model = &e->model;
-    const ds4_weights *weights = &e->weights;
-    const uint32_t prefill_cap =
-        metal_graph_prefill_cap_for_prompt(ctx_size, e->prefill_chunk);
-    const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
-
-    ds4_gpu_graph g;
-    /* diagnostic single-tier callsite; placement=NULL. */
-    bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size,
-                                        prefill_cap, false, NULL, false, NULL);
-    if (!ok) {
-        fprintf(stderr, "ds4: failed to allocate imatrix Metal graph runtime\n");
-        free(dataset);
-        return 1;
-    }
-    g.quality = e->quality;
-    g.ssd_streaming = e->ssd_streaming;
-    g.ssd_streaming_cold = e->ssd_streaming_cold;
-    g.streaming_preload_experts = e->ssd_streaming_preload_experts;
-    g.power_percent = (uint32_t)e->power_percent;
-
-    ds4_imatrix_collector collector;
-    if (!imatrix_collector_init(&collector, prefill_cap, dataset_path)) {
-        fprintf(stderr, "ds4: failed to allocate imatrix collector\n");
-        metal_graph_free(&g);
-        free(dataset);
-        return 1;
-    }
-
-    fprintf(stderr,
-            "ds4: collecting routed-MoE imatrix from %s (model=%s, layers=%u, experts=%u, ctx=%d, chunk=%u)\n",
-            dataset_path, DS4_MODEL_SHAPE_NAME, DS4_N_LAYER, DS4_N_EXPERT, ctx_size, prefill_cap);
-
-    int prompts_done = 0;
-    int tokens_done = 0;
-    bool sample_target_reached = false;
-    char *cursor = dataset;
-    const char *marker_lit = "===== DS4_IMATRIX_PROMPT";
-    while (*cursor) {
-        char *start = cursor;
-        char *marker = imatrix_find_marker(dataset, cursor, marker_lit);
-        if (marker) {
-            char *nl = strchr(marker, '\n');
-            if (!nl) break;
-            start = nl + 1;
-        } else if (prompts_done != 0) {
-            break;
-        }
-
-        char *next = imatrix_find_marker(dataset, start, marker_lit);
-        char *end = next ? next : dataset + dataset_len;
-        char saved = *end;
-        char *prompt_text = imatrix_trim_block(start, end);
-        if (prompt_text[0] != '\0') {
-            token_vec prompt = {0};
-            ds4_tokenize_rendered_chat(e, prompt_text, &prompt);
-            if (prompt.len > ctx_size) prompt.len = ctx_size;
-            if (max_tokens > 0 && prompt.len > max_tokens - tokens_done) {
-                prompt.len = max_tokens - tokens_done;
-            }
-            if (prompt.len > 0) {
-                if (!metal_graph_reset_prefill_state(&g)) {
-                    fprintf(stderr, "ds4: failed to reset imatrix graph state\n");
-                    ok = false;
-                } else if ((uint32_t)prompt.len > prefill_cap) {
-                    ok = metal_graph_prefill_chunked_range(&g, model, weights,
-                                                           &prompt, 0,
-                                                           (uint32_t)prompt.len,
-                                                           NULL, false,
-                                                           NULL, NULL,
-                                                           NULL, NULL,
-                                                           &collector,
-                                                           NULL, NULL, NULL);
-                } else {
-                    ok = metal_graph_prefill_layer_major(&g, model, weights,
-                                                         &prompt, 0,
-                                                         (uint32_t)prompt.len,
-                                                         NULL, false,
-                                                         &collector,
-                                                         NULL, NULL);
-                }
-                if (!ok) {
-                    fprintf(stderr, "ds4: imatrix prefill failed at prompt %d\n", prompts_done + 1);
-                    token_vec_free(&prompt);
-                    *end = saved;
-                    break;
-                }
-                prompts_done++;
-                tokens_done += prompt.len;
-                sample_target_reached = min_expert_samples > 0 &&
-                    imatrix_collector_min_samples(&collector,
-                                                 weights,
-                                                 DS4_N_LAYER) >=
-                        (uint32_t)min_expert_samples;
-                if (prompts_done % 10 == 0) {
-                    fprintf(stderr,
-                            "ds4: imatrix prompts=%d tokens=%d routes=%llu "
-                            "min_samples=%u\r",
-                            prompts_done,
-                            tokens_done,
-                            (unsigned long long)collector.observed_routes,
-                            imatrix_collector_min_samples(&collector,
-                                                         weights,
-                                                         DS4_N_LAYER));
-                    fflush(stderr);
-                }
-            }
-            token_vec_free(&prompt);
-        }
-        *end = saved;
-        if (sample_target_reached) break;
-        if (!next) break;
-        cursor = next;
-        if (max_prompts > 0 && prompts_done >= max_prompts) break;
-        if (max_tokens > 0 && tokens_done >= max_tokens) break;
-    }
-    fputc('\n', stderr);
-
-    if (ok) {
-        imatrix_collector_report_coverage(&collector, weights, DS4_N_LAYER);
-        if (min_expert_samples > 0 && !sample_target_reached) {
-            fprintf(stderr,
-                    "ds4: imatrix minimum expert sample target %d "
-                    "was not reached\n",
-                    min_expert_samples);
-            ok = false;
-        }
-    }
-    if (ok) {
-        ok = imatrix_collector_save(&collector, weights, output_path);
-        if (ok) {
-            fprintf(stderr,
-                    "ds4: wrote imatrix %s from %d prompts, %d tokens, %llu routed expert observations\n",
-                    output_path,
-                    prompts_done,
-                    tokens_done,
-                    (unsigned long long)collector.observed_routes);
-        }
-    }
-
-    imatrix_collector_free(&collector);
-    metal_graph_free(&g);
-    free(dataset);
-    return ok ? 0 : 1;
-#endif
-}
+/* sf-ablate(quant): ds4_engine_collect_imatrix removed with the collector (see metal_graph_reset_prefill_state). */
 
 #ifndef DS4_NO_GPU
 static bool ds4_session_greedy_splitkv_replay_exact(
@@ -47223,7 +46646,6 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                                  logits,
                                                  false,
                                                  NULL,
-                                                 NULL,
                                                  NULL);
         } else if (n_tokens == 1) {
             ok = metal_graph_eval_token_raw_swa(g,
@@ -47251,7 +46673,6 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                                      n_tokens,
                                                      logits,
                                                      false,
-                                                     NULL,
                                                      NULL,
                                                      NULL);
             }
@@ -48011,7 +47432,6 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                                         &progress,
                                                         s->display_progress,
                                                         s->display_progress_ud,
-                                                        NULL,
                                                         ds4_session_cancelled_cb,
                                                         s,
                                                         &cancelled);
