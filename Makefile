@@ -100,7 +100,7 @@ linenoise.o: linenoise.c linenoise.h
 # object lists the headers it includes directly plus those pulled in by ds4.h.
 DS4_CORE_HDRS := ds4.h ds4_tool_text.h ds4_distributed.h ds4_image.h ds4_tp.h \
                  ds4_layer_pack.h ds4_gpu_mgpu.h ds4_gpu.h ds4_gpu_tp.h ds4_qwen4_vision.h \
-                 ds4_streaming_hotlist.inc ds4_qwen4_unicode.inc
+                 ds4_qwen4_unicode.inc
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: $(DS4_CORE_HDRS)
 ds4_metal.o: $(DS4_CORE_HDRS)
 ds4_cli.o ds4_cli_cpu.o: ds4.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_prompt_prefix.h linenoise.h

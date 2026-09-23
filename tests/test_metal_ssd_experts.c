@@ -264,7 +264,7 @@ int main(int argc, char **argv) {
     int ok = msync(model, bytes, MS_SYNC) == 0 && ds4_gpu_init();
     if (ok) ok = check_streaming_table_admission();
     ds4_gpu_set_quality(false);
-    ds4_gpu_set_glm_model(quant_type == 16);
+    /* sf-ablate(glm): GLM model mode removed; it only gated Q4 selected paths outside SSD streaming, and this test streams. */
     ds4_gpu_set_ssd_streaming(true);
     ds4_gpu_set_streaming_expert_cache_budget(16);
     ds4_gpu_set_streaming_expert_cache_expert_bytes(expert * 3);

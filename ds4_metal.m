@@ -811,7 +811,6 @@ static int g_stream_prefill_batch_selected_addr_building;
 static int g_glm_stream_expert_addr_table_building;
 static uint64_t g_model_residency_count;
 static int g_model_residency_added_to_queue;
-static int g_glm_model_mode;
 static int g_ssd_streaming_mode;
 static int g_glm_streaming_prefill_full_layer_runtime;
 static int g_metal4_runtime_available;
@@ -4592,10 +4591,6 @@ void ds4_gpu_print_memory_report(const char *label) {
 
 void ds4_gpu_set_quality(bool quality) {
     g_quality_mode = quality ? 1 : 0;
-}
-
-void ds4_gpu_set_glm_model(bool enabled) {
-    g_glm_model_mode = enabled ? 1 : 0;
 }
 
 void ds4_gpu_set_ssd_streaming(bool enabled) {
@@ -17710,7 +17705,6 @@ static bool ds4_gpu_q4_non_streaming_opt_in_enabled(void) {
 
 static bool ds4_gpu_q4_selected_paths_allowed(void) {
     if (g_ssd_streaming_mode) return true;
-    if (g_glm_model_mode) return false;
     return ds4_gpu_q4_non_streaming_opt_in_enabled();
 }
 
