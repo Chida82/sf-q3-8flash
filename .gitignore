@@ -82,8 +82,6 @@
 *.dSYM/
 __pycache__/
 *.pyc
-/gguf-tools/libds4quants.dylib
-/gguf-tools/libds4quants.so
 /misc/
 .*.swp
 .DS_Store

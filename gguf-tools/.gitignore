@@ -1,5 +1,3 @@
-deepseek4-quantize
-gguf-requantize-dense
 quality-testing/score_official
 quality-testing/data/*
 !quality-testing/data/README.md

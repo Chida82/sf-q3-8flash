@@ -56,7 +56,6 @@ once rather than patching one frontend.
   directly from the GGUF.
 - `ds4_qwen4_unicode.inc`: generated tokenizer classes; regenerate with
   `gguf-tools/gen_qwen4_unicode.py`, do not hand-edit.
-- `gguf-tools/qwen4_*`: conversion and packing.
 - `tests/test_qwen4_*`: focused model, MTP, state, steering, and vision tests.
 
 Historical internal names such as `glm_mtp` may still carry the shared built-in

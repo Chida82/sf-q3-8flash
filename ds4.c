@@ -2478,7 +2478,7 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
         if (ds4_streq(t->name, "per_layer_token_embd.weight")) {
             if (table || t->type != DS4_TENSOR_BF16 || t->ndim != 2 ||
                 !t->dim[0] || t->dim[0] > 160 || !t->dim[1] || t->dim[1] > UINT32_MAX)
-                ds4_die("Qwen requires original BF16 n-grams; repack with gguf-tools/qwen4_native_ngrams.py");
+                ds4_die("Qwen requires original BF16 n-grams; fetch the published GGUF with ./download.sh");
             table = t;
         } else {
             if (!t->bytes) ds4_die("unsupported Qwen resident tensor type");
@@ -2491,7 +2491,7 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
     if (!table) return;
     const long page = sysconf(_SC_PAGESIZE);
     if (page <= 0 || table->abs_offset % (uint64_t)page || resident_end > table->abs_offset)
-        ds4_die("Qwen n-grams must follow page-aligned weights; repack with gguf-tools/qwen4_native_ngrams.py");
+        ds4_die("Qwen n-grams must follow page-aligned weights; fetch the published GGUF with ./download.sh");
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     struct stat main_st, table_st;
     if (fd < 0) ds4_die_errno("cannot open n-gram table", path);
@@ -4288,7 +4288,7 @@ static void weights_validate_qwen4_layout(
         tensor_expect_qwen4_dense_layout(w->token_embd, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
     if (require_token_embd && !w->ple_embd)
-        ds4_die("Qwen GGUF lacks its n-grams; repack with gguf-tools/qwen4_native_ngrams.py");
+        ds4_die("Qwen GGUF lacks its n-grams; fetch the published GGUF with ./download.sh");
     if (w->ple_embd) {
         const uint32_t t = w->ple_embd->type;
         if (t != DS4_TENSOR_BF16) {
