@@ -153,11 +153,7 @@ int main(int argc, char **argv) {
     }
     ds4_engine *engine = NULL;
     ds4_engine_options opt = {.model_path = argv[1],
-#ifdef __APPLE__
         .backend = DS4_BACKEND_METAL,
-#else
-        .backend = DS4_BACKEND_CUDA,
-#endif
         .glm_mtp = true, .prefill_chunk = 32,
         .share_session_prefill_workspace = true, .placement_session_count_hint = 4};
     assert(ds4_engine_open(&engine, &opt) == 0);

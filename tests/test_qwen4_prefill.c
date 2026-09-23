@@ -50,11 +50,7 @@ int main(int argc, char **argv) {
     fclose(fp);
     ds4_engine_options opt = {.model_path = argv[1], .context_size = (int)max+8,
         .prefill_chunk = 1024, .glm_mtp = true, .dspark_exact_sampling = true,
-#ifdef __APPLE__
         .backend = DS4_BACKEND_METAL
-#else
-        .backend = DS4_BACKEND_CUDA
-#endif
     };
     ds4_engine *engine = NULL;
     assert(ds4_engine_open(&engine, &opt) == 0 && ds4_engine_is_qwen4(engine));

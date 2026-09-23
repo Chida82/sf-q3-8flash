@@ -139,17 +139,7 @@ static void check_backend_options(void) {
     assert(ds4_tp_validate_engine_options(&opt, err, sizeof(err)));
     opt.backend = DS4_BACKEND_CPU;
     assert(!ds4_tp_validate_engine_options(&opt, err, sizeof(err)));
-    opt.backend = DS4_BACKEND_CUDA;
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
-    assert(ds4_tp_validate_engine_options(&opt, err, sizeof(err)));
-    opt.ssd_streaming = true;
-    assert(!ds4_tp_validate_engine_options(&opt, err, sizeof(err)));
-    opt.ssd_streaming = false;
-    opt.cuda_tensor_parallel = true;
-    assert(!ds4_tp_validate_engine_options(&opt, err, sizeof(err)));
-#else
-    assert(!ds4_tp_validate_engine_options(&opt, err, sizeof(err)));
-#endif
+    /* sf-ablate(cuda): the CUDA-backend cases went with DS4_BACKEND_CUDA. */
     puts("TP backend and mutually exclusive placement options: ok");
 }
 

@@ -16,10 +16,10 @@
  * ds4_session_sync() reuse, extend, or rebuild the graph state.  Keep this
  * header narrow so HTTP/CLI code does not depend on tensor internals. */
 
+/* sf-ablate(cuda): DS4_BACKEND_CUDA (1) removed; the numbering is kept. */
 typedef enum {
-    DS4_BACKEND_METAL,
-    DS4_BACKEND_CUDA,
-    DS4_BACKEND_CPU,
+    DS4_BACKEND_METAL = 0,
+    DS4_BACKEND_CPU = 2,
 } ds4_backend;
 
 typedef enum {

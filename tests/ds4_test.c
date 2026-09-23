@@ -93,11 +93,7 @@ static void test_restore_canonical_streaming_prefill(
 static ds4_backend test_model_backend(void) {
     const char *backend = getenv("DS4_TEST_BACKEND");
     if (backend && !strcmp(backend, "cpu")) return DS4_BACKEND_CPU;
-#ifdef __APPLE__
     return DS4_BACKEND_METAL;
-#else
-    return DS4_BACKEND_CUDA;
-#endif
 }
 
 static ds4_engine *test_open_engine(bool quality) {

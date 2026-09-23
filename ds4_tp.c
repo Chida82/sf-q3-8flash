@@ -609,16 +609,8 @@ int ds4_tp_validate_engine_options(
         }
         return 1;
     }
-    bool supported_backend = opt->backend == DS4_BACKEND_METAL;
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
-    supported_backend |= opt->backend == DS4_BACKEND_CUDA;
-#endif
-    if (!supported_backend) {
-        tp_set_err(err, errlen, "network tensor parallelism requires Metal or supported CUDA models");
-        return 0;
-    }
-    if (opt->backend == DS4_BACKEND_CUDA && (opt->cuda_tensor_parallel || opt->ssd_streaming)) {
-        tp_set_err(err, errlen, "network CUDA TP requires one GPU per rank and resident expert shards");
+    if (opt->backend != DS4_BACKEND_METAL) {
+        tp_set_err(err, errlen, "network tensor parallelism requires Metal");
         return 0;
     }
     if (opt->distributed.role != DS4_DISTRIBUTED_NONE) {
