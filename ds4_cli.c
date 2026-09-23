@@ -1213,8 +1213,8 @@ static char *trim_inplace(char *s) {
 static void print_repl_help(void) {
     puts("Commands:");
     puts("  /help          Show this help.");
-    puts("  /think [N]     Use normal thinking, or V4.1 effort 0..100 (0 disables thinking).");
-    puts("  /think-max     Use maximum thinking (V4.1: 100; V4: requires ctx >= 393216).");
+    puts("  /think [N]     Use normal thinking, or effort level 0..100 (0 disables thinking).");
+    puts("  /think-max     Use maximum thinking (requires ctx >= 393216, otherwise high).");
     puts("  /nothink       Disable thinking mode.");
     puts("  /ctx N         Set context size for following prompts.");
     puts("  /power N       Set GPU duty cycle percentage, 1..100.");

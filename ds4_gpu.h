@@ -203,10 +203,6 @@ int ds4_gpu_device_cache_support_tensors(int device_id,
 uint64_t ds4_gpu_tier_free_vram(int logical_tier);
 
 int ds4_gpu_pro_q4_expert_table_auto_available(void);
-int ds4_gpu_preload_q4_expert_tables(const void *model_map, uint64_t model_size,
-                                     uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
-                                     uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
-                                     uint32_t n_total_expert);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_ssd_streaming(bool enabled);
@@ -341,10 +337,6 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected);
-int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
-        const ds4_gpu_stream_expert_table *table,
-        const ds4_gpu_tensor              *selected,
-        uint32_t                           n_selected);
 #ifdef __APPLE__
 /* The async selected-load worker registers itself so Metal cache paths never
  * wait on command buffers from that thread (they fail the load instead and
@@ -457,15 +449,6 @@ int ds4_gpu_embed_tokens_hc_tensor(
         uint32_t                n_tokens,
         uint32_t                n_embd,
         uint32_t                n_hc);
-
-int ds4_gpu_embed_token_q8_0_tensor(
-        ds4_gpu_tensor *out,
-        const void       *model_map,
-        uint64_t          model_size,
-        uint64_t          weight_offset,
-        uint32_t          n_vocab,
-        uint32_t          token,
-        uint32_t          n_embd);
 
 
 
@@ -1088,22 +1071,6 @@ int ds4_gpu_rope_tail_tensor(
 
 
 
-int ds4_gpu_rope_tail_decode_rows_tensor(
-        ds4_gpu_tensor                     *x,
-        const ds4_gpu_attention_decode_row *rows,
-        uint32_t                            n_rows,
-        uint32_t                            n_head,
-        uint32_t                            head_dim,
-        uint32_t                            n_rot,
-        uint32_t                            n_ctx_orig,
-        bool                                inverse,
-        float                               freq_base,
-        float                               freq_scale,
-        float                               ext_factor,
-        float                               attn_factor,
-        float                               beta_fast,
-        float                               beta_slow);
-
 
 
 
@@ -1131,14 +1098,6 @@ int ds4_gpu_kv_fp8_store_raw_tensor(
 
 /* Exact multi-session form of the decode KV finalizer. KV rows are
  * contiguous, while each output row is written to its session-private cache. */
-int ds4_gpu_kv_fp8_store_raw_decode_rows_tensor(
-        ds4_gpu_tensor        *kv,
-        ds4_gpu_tensor *const *raw_caches,
-        const uint32_t        *raw_caps,
-        const uint32_t        *raw_rows,
-        uint32_t               n_rows,
-        uint32_t               head_dim,
-        uint32_t               n_rot);
 
 /* Reference/raw-cache primitive kept for prefill and diagnostics.  Decode uses
  * ds4_gpu_kv_fp8_store_raw_tensor unless a diagnostic reference path is
@@ -1670,47 +1629,6 @@ int ds4_gpu_router_select_batch_tensor(
  * the checkpoint's visual selection bias. Routing weights always come from
  * the original, unbiased scores. */
 
-int ds4_gpu_glm_router_select_tensor(
-        ds4_gpu_tensor       *selected,
-        ds4_gpu_tensor       *weights,
-        ds4_gpu_tensor       *probs,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                bias_offset,
-        const ds4_gpu_tensor *logits,
-        uint32_t                n_expert,
-        uint32_t                n_expert_used,
-        float                   expert_weight_scale);
-
-
-int ds4_gpu_glm_routed_moe_one_tensor(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *mid,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                gate_offset,
-        uint64_t                up_offset,
-        uint64_t                down_offset,
-        uint32_t                gate_type,
-        uint32_t                up_type,
-        uint32_t                down_type,
-        uint64_t                gate_expert_bytes,
-        uint64_t                gate_row_bytes,
-        uint64_t                up_expert_bytes,
-        uint64_t                up_row_bytes,
-        uint64_t                down_expert_bytes,
-        uint64_t                down_row_bytes,
-        uint32_t                expert_in_dim,
-        uint32_t                expert_mid_dim,
-        uint32_t                out_dim,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *weights,
-        uint32_t                n_total_expert,
-        uint32_t                n_expert,
-        float                   swiglu_clamp,
-        uint32_t                layer_index,
-        const ds4_gpu_tensor *x,
-        bool                    force_resident);
 
 
 

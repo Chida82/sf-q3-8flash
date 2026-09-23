@@ -686,8 +686,6 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_N_EXPERT_USED             (g_ds4_shape.n_expert_used)
 #define DS4_N_EXPERT_SHARED           (g_ds4_shape.n_expert_shared)
 #define DS4_N_FF_EXP                  (g_ds4_shape.n_ff_exp)
-#define DS4_N_FF_DENSE                (g_ds4_shape.n_ff_dense)
-#define DS4_N_HASH_LAYER              (g_ds4_shape.n_hash_layer)
 #define DS4_N_SWA                     (g_ds4_shape.n_swa)
 #define DS4_N_INDEXER_HEAD            (g_ds4_shape.n_indexer_head)
 #define DS4_N_INDEXER_HEAD_DIM        (g_ds4_shape.n_indexer_head_dim)
@@ -696,12 +694,6 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_N_HC_SINKHORN_ITER        (g_ds4_shape.n_hc_sinkhorn_iter)
 #define DS4_N_NEXTN_PREDICT           (g_ds4_shape.n_nextn_predict)
 #define DS4_N_LEADING_DENSE           (g_ds4_shape.n_leading_dense)
-#define DS4_N_KV_LORA                 (g_ds4_shape.n_kv_lora)
-#define DS4_N_KEY_MLA                 (g_ds4_shape.n_key_mla)
-#define DS4_N_VALUE_MLA               (g_ds4_shape.n_value_mla)
-#define DS4_N_KDA_HEAD                (g_ds4_shape.n_kda_head)
-#define DS4_N_KDA_HEAD_DIM            (g_ds4_shape.n_kda_head_dim)
-#define DS4_N_KDA_CONV                (g_ds4_shape.n_kda_conv)
 #define DS4_RMS_EPS                   (g_ds4_shape.rms_eps)
 #define DS4_HC_EPS                    (g_ds4_shape.hc_eps)
 #define DS4_EXPERT_WEIGHT_SCALE       (g_ds4_shape.expert_weight_scale)
@@ -28682,10 +28674,6 @@ static uint32_t metal_graph_resume_prefill_min_tokens(void) {
 #define DS4_GLM53_INDEX_POOL_SIZE 4u
 #define DS4_GLM53_PREFILL_CHUNK_TOKENS 2048u
 
-static uint64_t glm_graph_compact_cache_elem_bytes(void) {
-    return DS4_GPU_GLM_COMPACT_CACHE_F16 ? sizeof(uint16_t) : sizeof(float);
-}
-
 
 
 
@@ -31016,201 +31004,7 @@ static double glm_graph_bytes_to_gib(uint64_t bytes) {
 #endif
 
 #ifndef DS4_NO_GPU
-typedef struct ds4_glm_gpu_graph {
-    const ds4_weights *weights;
-    uint32_t ctx_size;
-    uint32_t ctx_cap;
-    uint32_t normal_layers;
-    uint32_t layer_start;
-    uint32_t layer_end;
-    uint32_t layer_count;
-    uint64_t q_dim;
-    uint64_t q_nope;
-    uint64_t heads_dim;
-    uint64_t kv_raw_dim;
-    uint64_t dense_hidden_max;
-    uint64_t ffn_mid_elems;
-
-    ds4_gpu_tensor *cur;
-    ds4_gpu_tensor *next;
-    /* GLM-5.3 keeps four mHC residual streams. cur/next remain the plain
-     * one-stream scratch used by the attention and FFN implementations. */
-    ds4_gpu_tensor *hc_cur;
-    ds4_gpu_tensor *hc_next;
-    ds4_gpu_tensor *hc_flat;
-    ds4_gpu_tensor *hc_mix;
-    ds4_gpu_tensor *hc_split;
-    ds4_gpu_tensor *hc_post;
-    ds4_gpu_tensor *hc_comb;
-    ds4_gpu_tensor *hc_after_attn;
-    ds4_gpu_tensor *hc_output;
-    ds4_gpu_tensor *hc_mean_weights;
-    ds4_gpu_tensor *attn_norm;
-    ds4_gpu_tensor *q_rank;
-    ds4_gpu_tensor *q_rank_norm;
-    ds4_gpu_tensor *q;
-    ds4_gpu_tensor *kv_raw;
-    ds4_gpu_tensor *kv_norm;
-    ds4_gpu_tensor *k_nope;
-    ds4_gpu_tensor *value;
-    ds4_gpu_tensor *heads;
-    ds4_gpu_tensor *attn_out;
-    ds4_gpu_tensor *after_attn;
-    ds4_gpu_tensor *ffn_norm;
-    ds4_gpu_tensor *ffn_gate;
-    ds4_gpu_tensor *ffn_up;
-    ds4_gpu_tensor *ffn_mid;
-    ds4_gpu_tensor *routed_gate;
-    ds4_gpu_tensor *routed_up;
-    ds4_gpu_tensor *routed_down;
-    ds4_gpu_tensor *ffn_out;
-    ds4_gpu_tensor *ffn_sum;
-    ds4_gpu_tensor *kda_q;
-    ds4_gpu_tensor *kda_k;
-    ds4_gpu_tensor *kda_v;
-    ds4_gpu_tensor *kda_lowrank;
-    ds4_gpu_tensor *kda_raw_gate;
-    ds4_gpu_tensor *kda_raw_beta;
-    ds4_gpu_tensor *kda_output_gate;
-    ds4_gpu_tensor *kda_out;
-    ds4_gpu_tensor *layer_kda_conv_state[DS4_MAX_LAYER];
-    ds4_gpu_tensor *layer_kda_recurrent_state[DS4_MAX_LAYER];
-    ds4_gpu_tensor *router_logits;
-    ds4_gpu_tensor *router_probs;
-    ds4_gpu_tensor *router_selected;
-    ds4_gpu_tensor *router_weights;
-    ds4_gpu_tensor *output_norm;
-    ds4_gpu_tensor *logits;
-    ds4_gpu_tensor *batch_router_logits;
-    ds4_gpu_tensor *batch_router_probs;
-    ds4_gpu_tensor *batch_router_selected;
-    ds4_gpu_tensor *batch_router_weights;
-    ds4_gpu_tensor *prefill_seed_router_selected;
-    uint32_t prefill_seed_tokens;
-    bool prefill_seed_layer_captured[DS4_MAX_LAYER];
-
-    ds4_gpu_tensor *prefill_tokens;
-    ds4_gpu_tensor *batch_cur;
-    ds4_gpu_tensor *batch_next;
-    ds4_gpu_tensor *batch_attn_norm;
-    ds4_gpu_tensor *batch_q_rank;
-    ds4_gpu_tensor *batch_q_rank_norm;
-    ds4_gpu_tensor *batch_q;
-    ds4_gpu_tensor *batch_kv_raw;
-    ds4_gpu_tensor *batch_kv_norm;
-    ds4_gpu_tensor *batch_k_nope;
-    ds4_gpu_tensor *batch_value;
-    ds4_gpu_tensor *batch_heads;
-    ds4_gpu_tensor *batch_attn_out;
-    ds4_gpu_tensor *batch_after_attn;
-    ds4_gpu_tensor *batch_ffn_norm;
-    ds4_gpu_tensor *batch_ffn_gate;
-    ds4_gpu_tensor *batch_ffn_up;
-    ds4_gpu_tensor *batch_shared_mid;
-    ds4_gpu_tensor *batch_ffn_mid;
-    ds4_gpu_tensor *batch_routed_gate;
-    ds4_gpu_tensor *batch_routed_up;
-    ds4_gpu_tensor *batch_routed_down;
-    ds4_gpu_tensor *batch_ffn_out;
-    bool batch_routed_mid_is_f16;
-    uint32_t batch_cap;
-
-    /* GLM-5.3 layer-major prefill workspace. It is allocated at graph
-     * creation for the full supported prefill chunk. */
-    uint32_t glm53_prefill_cap;
-    ds4_gpu_tensor *batch_hc_cur;
-    ds4_gpu_tensor *batch_hc_next;
-    ds4_gpu_tensor *batch_hc_flat;
-    ds4_gpu_tensor *batch_hc_mix;
-    ds4_gpu_tensor *batch_hc_split;
-    ds4_gpu_tensor *batch_hc_after_attn;
-    ds4_gpu_tensor *batch_kda_q;
-    ds4_gpu_tensor *batch_kda_k;
-    ds4_gpu_tensor *batch_kda_v;
-    ds4_gpu_tensor *batch_kda_lowrank;
-    ds4_gpu_tensor *batch_kda_raw_gate;
-    ds4_gpu_tensor *batch_kda_raw_beta;
-    ds4_gpu_tensor *batch_kda_output_gate;
-    ds4_gpu_tensor *batch_kda_out;
-    ds4_gpu_tensor *session_batch_logits;
-    uint32_t session_batch_logits_cap;
-
-    uint32_t compact_cache_cap;
-    uint32_t indexed_prefill_cap;
-    uint32_t indexed_prefill_score_cap;
-    uint32_t indexer_full_layers;
-    ds4_gpu_tensor *indexer_k;
-    ds4_gpu_tensor *indexer_gate;
-    ds4_gpu_tensor *indexer_q;
-    ds4_gpu_tensor *indexer_weights;
-    ds4_gpu_tensor *indexer_scores;
-    ds4_gpu_tensor *indexer_pool_selected;
-    ds4_gpu_tensor *indexer_selected;
-    ds4_gpu_tensor *qk_low;
-    ds4_gpu_tensor *attn_partial_lora;
-    ds4_gpu_tensor *attn_partial_ms;
-    ds4_gpu_tensor *batch_indexer_k;
-    ds4_gpu_tensor *batch_indexer_gate;
-    ds4_gpu_tensor *batch_indexer_q;
-    ds4_gpu_tensor *batch_indexer_weights;
-    ds4_gpu_tensor *batch_indexer_scores;
-    ds4_gpu_tensor *batch_indexer_pool_selected;
-    ds4_gpu_tensor *batch_indexer_selected;
-    ds4_gpu_tensor *batch_qk_low;
-    ds4_gpu_tensor *batch_attn_lora;
-    ds4_gpu_tensor *layer_kv_lora_cache[DS4_MAX_LAYER];
-    ds4_gpu_tensor *layer_k_rope_cache[DS4_MAX_LAYER];
-    /* GLM MTP (nextn block) drafting: private compact caches for the nextn
-     * layer (slot = absolute position; only [mtp_min_pos..pos] is ever
-     * selected) plus small scratch. Allocated lazily on first draft. */
-    ds4_gpu_tensor *mtp_kv_lora_cache;
-    ds4_gpu_tensor *mtp_k_rope_cache;
-    ds4_gpu_tensor *mtp_concat;
-    ds4_gpu_tensor *mtp_selected;
-    ds4_gpu_tensor *mtp_state_backup;
-    float          *mtp_logits_host;
-    int             mtp_ready;
-    ds4_gpu_tensor *layer_indexer_key_cache[DS4_MAX_LAYER];
-    ds4_gpu_tensor *layer_indexer_tail_k[DS4_MAX_LAYER];
-    ds4_gpu_tensor *layer_indexer_tail_gate[DS4_MAX_LAYER];
-    ds4_gpu_tensor *layer_key_cache[DS4_MAX_LAYER];
-    ds4_gpu_tensor *layer_value_cache[DS4_MAX_LAYER];
-    bool full_kv_cache;
-    bool has_token_embd;
-    bool has_output_head;
-    bool quality;
-    bool ssd_streaming;
-    bool ssd_streaming_cold;
-    bool generic_routed_moe;
-    bool glm53;
-    ds4_gpu_tensor *directional_steering_dirs_by_tier[DS4_MAX_GPUS];
-    float directional_steering_attn_scale;
-    float directional_steering_ffn_scale;
-    bool streaming_static_decode_map_current;
-    /* Tensor parallelism (50/50 expert sharding): tp_world 2 means
-     * this rank computes only its contiguous half of the routed experts
-     * and exchanges the 24KB routed-FFN partial at one gate per sparse
-     * layer.  Views alias the engine's TP slab slots [layer*2 + FFN]. */
-    uint32_t tp_world;
-    uint32_t tp_rank;
-    ds4_gpu_tensor **tp_out;
-    ds4_gpu_tensor **tp_in;
-    /* Prefill batch gate bounce buffers (shared storage; grow on demand). */
-    ds4_gpu_tensor *tp_bounce_out;
-    ds4_gpu_tensor *tp_bounce_in;
-    /* CUDA multi-tier placement and device-local decode scratch mirrors. */
-    const int *placement;
-#define DS4_GLM_WS_SLOTS 29
-    ds4_gpu_tensor *ws_mirror[DS4_MAX_GPUS][DS4_GLM_WS_SLOTS];
-    ds4_gpu_tensor *ws_orig[DS4_GLM_WS_SLOTS];
-    int ws_ready;
-    int ws_tier;
-#define DS4_GLM_VERIFY_WS_SLOTS 28
-    ds4_gpu_tensor *verify_ws_mirror[DS4_MAX_GPUS][DS4_GLM_VERIFY_WS_SLOTS];
-    ds4_gpu_tensor *verify_ws_orig[DS4_GLM_VERIFY_WS_SLOTS];
-    int verify_ws_ready;
-    int verify_ws_tier;
-} ds4_glm_gpu_graph;
+/* sf-ablate(glm): ds4_glm_gpu_graph removed; no Qwen session ever allocates it (glm_graph_ready was never set). */
 
 
 
@@ -33628,14 +33422,6 @@ static uint32_t engine_planner_raw_cap(int ctx_size, uint32_t prefill_cap) {
     return raw_cap;
 }
 
-/* Mirrors the GPU cache-storage choice while remaining visible to the
- * DS4_NO_GPU placement tests. */
-#if defined(__APPLE__)
-#define DS4_PLANNER_ATTN_COMP_CACHE_F16 1
-#else
-#define DS4_PLANNER_ATTN_COMP_CACHE_F16 0
-#endif
-
 static uint32_t engine_placement_session_count(const ds4_engine *e) {
     return e && e->placement_session_count_hint > 1
         ? (uint32_t)e->placement_session_count_hint : 1u;
@@ -33888,8 +33674,6 @@ struct ds4_session {
     uint64_t glm_reserved_graph_bytes;
 #ifndef DS4_NO_GPU
     ds4_gpu_graph graph;
-    ds4_glm_gpu_graph glm_graph;
-    bool glm_graph_ready;
 #ifdef DS4_HAS_QWEN4_GPU
     ds4_qwen4_gpu_graph qwen4_graph;
     bool qwen4_graph_ready;
@@ -34367,12 +34151,7 @@ static void ds4_session_glm_reset_dense_cache(ds4_session *s) {
 
 static void ds4_session_glm_cap_dense_cache(ds4_session *s) {
     if (!s) return;
-    if (s->glm_graph_ready && !s->glm_graph.full_kv_cache) {
-        s->glm_dense_cache_len = 0;
-        return;
-    }
     uint32_t cap = s->checkpoint.len > 0 ? (uint32_t)s->checkpoint.len : 0;
-    if (s->glm_graph_ready && cap > s->glm_graph.ctx_cap) cap = s->glm_graph.ctx_cap;
     if (s->glm_dense_cache_len > cap) s->glm_dense_cache_len = cap;
 }
 
@@ -41896,29 +41675,6 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         ds4_session_sync_internal(s, prompt, err, errlen);
 #ifndef DS4_NO_GPU
     if (rc == 0) glm_debug_dump_prefill_logits(s->logits);
-    if (rc == 0) {
-        const char *kvp = getenv("DS4_GLM_KV_DUMP");
-        if (kvp && kvp[0] && s->glm_graph.layer_kv_lora_cache[0]) {
-            const ds4_glm_gpu_graph *g = &s->glm_graph;
-            const uint32_t rows = prompt ? (uint32_t)prompt->len : 0;
-            const uint64_t eb = glm_graph_compact_cache_elem_bytes();
-            const struct { const char *sfx; ds4_gpu_tensor *t; uint64_t rb; } kd[2] = {
-                { "lora0", g->layer_kv_lora_cache[0], DS4_N_KV_LORA * eb },
-                { "rope0", g->layer_k_rope_cache[0],  DS4_N_ROT * eb },
-            };
-            for (int i = 0; i < 2 && rows; i++) {
-                char fp[1024];
-                snprintf(fp, sizeof(fp), "%s.%s", kvp, kd[i].sfx);
-                void *buf = malloc(rows * kd[i].rb);
-                if (buf &&
-                    ds4_gpu_tensor_read(kd[i].t, 0, buf, rows * kd[i].rb)) {
-                    FILE *f = fopen(fp, "wb");
-                    if (f) { fwrite(buf, 1, rows * kd[i].rb, f); fclose(f); }
-                }
-                free(buf);
-            }
-        }
-    }
 #endif
     if (mirror) {
         int worker_status = 1;
