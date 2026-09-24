@@ -32,6 +32,7 @@ extern int cudaProfilerStop(void) __attribute__((weak));
 #endif
 
 #define DS4_BENCH_DEFAULT_SNAPSHOT_MAX_BYTES (UINT64_C(1) << 30)
+#define DS4_BENCH_MAX_FRONTIERS 64
 
 typedef struct {
     const char *model_path;
@@ -55,6 +56,8 @@ typedef struct {
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
     double step_mul;
+    int frontiers[DS4_BENCH_MAX_FRONTIERS];
+    int n_frontiers;
     const char *dump_frontier_logits_dir;
     ds4_dist_options dist;
     ds4_tp_options tp;
@@ -65,6 +68,7 @@ typedef struct {
     bool ssd_streaming_full_layers_set;
     bool show_output;
     bool teacher_forced_decode;
+    bool mtp;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -136,6 +140,30 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
         exit(2);
     }
     return argv[++*i];
+}
+
+/* --frontiers: a strictly increasing list of positive context frontiers. */
+static void parse_frontiers(const char *s, bench_config *c) {
+    c->n_frontiers = 0;
+    const char *p = s;
+    for (;;) {
+        char *end = NULL;
+        errno = 0;
+        const long v = strtol(p, &end, 10);
+        if (end == p || errno != 0 || v <= 0 || v > INT_MAX ||
+            (c->n_frontiers > 0 && v <= c->frontiers[c->n_frontiers - 1]) ||
+            c->n_frontiers == DS4_BENCH_MAX_FRONTIERS ||
+            (*end != ',' && *end != '\0')) {
+            fprintf(stderr,
+                    "ds4-bench: --frontiers must be at most %d strictly increasing positive "
+                    "token counts, e.g. 8192,8704,10752: %s\n",
+                    DS4_BENCH_MAX_FRONTIERS, s);
+            exit(2);
+        }
+        c->frontiers[c->n_frontiers++] = (int)v;
+        if (*end == '\0') return;
+        p = end + 1;
+    }
 }
 
 static ds4_backend parse_backend(const char *s, const char *opt) {
@@ -265,6 +293,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.step_incr = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--step-mul")) {
             c.step_mul = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--frontiers")) {
+            parse_frontiers(need_arg(&i, argc, argv, arg), &c);
         } else if (!strcmp(arg, "--gen-tokens") || !strcmp(arg, "--tokens") || !strcmp(arg, "-n")) {
             c.gen_tokens = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--csv")) {
@@ -330,6 +360,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.show_output = true;
         } else if (!strcmp(arg, "--teacher-forced-decode")) {
             c.teacher_forced_decode = true;
+        } else if (!strcmp(arg, "--mtp")) {
+            c.mtp = true;
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -339,6 +371,16 @@ static bench_config parse_options(int argc, char **argv) {
 
     if (!!c.prompt_path == !!c.chat_prompt_path) {
         fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file or --chat-prompt-file\n");
+        exit(2);
+    }
+    if (c.n_frontiers > 0) {
+        c.ctx_start = c.frontiers[0];
+        c.ctx_max = c.frontiers[c.n_frontiers - 1];
+    }
+    if (c.mtp && c.teacher_forced_decode) {
+        fprintf(stderr,
+                "ds4-bench: --mtp cannot be combined with "
+                "--teacher-forced-decode\n");
         exit(2);
     }
     if (c.ctx_start > c.ctx_max) {
@@ -409,7 +451,8 @@ static int write_frontier_logits_json(
         ds4_engine         *engine,
         ds4_session        *session,
         int                 frontier,
-        int                 previous) {
+        int                 previous,
+        const char         *suffix) {
     if (!cfg->dump_frontier_logits_dir) return 0;
 
     const int vocab = ds4_engine_vocab_size(engine);
@@ -427,9 +470,10 @@ static int write_frontier_logits_json(
     char path[PATH_MAX];
     const int n = snprintf(path,
                            sizeof(path),
-                           "%s/frontier_%06d.logits.json",
+                           "%s/frontier_%06d%s.logits.json",
                            cfg->dump_frontier_logits_dir,
-                           frontier);
+                           frontier,
+                           suffix);
     if (n <= 0 || (size_t)n >= sizeof(path)) {
         fprintf(stderr, "ds4-bench: frontier logits path is too long\n");
         free(logits);
@@ -480,6 +524,9 @@ static int write_frontier_logits_json(
 
 static int next_frontier(const bench_config *c, int cur) {
     if (cur >= c->ctx_max) return c->ctx_max;
+    for (int i = 0; i < c->n_frontiers; i++) {
+        if (c->frontiers[i] > cur) return c->frontiers[i];
+    }
     int next;
     if (c->step_mul == 1.0) {
         if (cur > INT_MAX - c->step_incr) next = c->ctx_max;
@@ -590,6 +637,7 @@ int main(int argc, char **argv) {
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .glm_mtp = cfg.mtp,
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
@@ -698,7 +746,15 @@ int main(int argc, char **argv) {
     const bool distributed =
         cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR ||
         cfg.tp.role == DS4_TP_LEADER;
-    const bool speculative = false; /* sf-ablate(specdec): benchmark has no external DSpark path. */
+    const bool speculative = cfg.mtp && ds4_engine_mtp_draft_tokens(engine) > 1;
+    if (cfg.mtp && !speculative) {
+        fprintf(stderr, "ds4-bench: --mtp did not enable built-in MTP (CPU backend or no MTP layer)\n");
+        if (out != stdout) fclose(out);
+        ds4_session_free(session);
+        ds4_tokens_free(&prompt);
+        close_engine(engine, tp_leader);
+        return 1;
+    }
     ds4_session_snapshot snap = {0};
     const uint64_t snapshot_max_bytes = bench_snapshot_max_bytes();
     bool warned_large_snapshot = false;
@@ -737,7 +793,7 @@ int main(int argc, char **argv) {
                     prefill_t0 * 1e3, prefill_t1 * 1e3);
         const int prefill_tokens = frontier - previous;
 
-        if (write_frontier_logits_json(&cfg, engine, session, frontier, previous) != 0) {
+        if (write_frontier_logits_json(&cfg, engine, session, frontier, previous, "") != 0) {
             rc = 1;
             break;
         }
@@ -794,6 +850,10 @@ int main(int argc, char **argv) {
             cuda_profile_tokens = 0;
         }
         bool generation_stop = false;
+        int mtp_calls = 0;
+        int mtp_tokens = 0;
+        int mtp_k_calls[4] = {0};
+        double mtp_k_sec[4] = {0};
         while (gen_done < cfg.gen_tokens && !generation_stop) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
@@ -837,12 +897,12 @@ int main(int argc, char **argv) {
                     }
                 }
                 if (ntok < 0) {
-                    fprintf(stderr, "ds4-bench: DSpark decode at frontier %d failed: %s\n", frontier, err);
+                    fprintf(stderr, "ds4-bench: MTP decode at frontier %d failed: %s\n", frontier, err);
                     rc = 1;
                     break;
                 }
                 if (ntok == 0) {
-                    fprintf(stderr, "ds4-bench: DSpark decode at frontier %d accepted no tokens\n", frontier);
+                    fprintf(stderr, "ds4-bench: MTP decode at frontier %d accepted no tokens\n", frontier);
                     rc = 1;
                     break;
                 }
@@ -873,6 +933,14 @@ int main(int argc, char **argv) {
                 gen_done++;
                 cycle_tokens++;
             }
+            if (speculative) {
+                mtp_calls++;
+                mtp_tokens += cycle_tokens;
+                if (ntok >= 1 && ntok <= 3) {
+                    mtp_k_calls[ntok]++;
+                    mtp_k_sec[ntok] += token_t1 - token_t0;
+                }
+            }
             if (gen_first_tokens == 0) {
                 gen_first_sec = token_t1 - token_t0;
                 gen_first_tokens = cycle_tokens;
@@ -894,8 +962,25 @@ int main(int argc, char **argv) {
             fprintf(stderr, "\"\n");
             fflush(stderr);
         }
+        if (cfg.show_output) {
+            fprintf(stderr, "ds4-bench: gen[ctx=%d] token ids:", frontier);
+            for (int i = 0; i < gen_token_count; i++) fprintf(stderr, " %d", gen_token_buf[i]);
+            fputc('\n', stderr);
+        }
         free(gen_token_buf);
         if (rc != 0) break;
+        if (speculative) {
+            fprintf(stderr, "ds4-bench: mtp[ctx=%d] cycles=%d tokens=%d", frontier, mtp_calls, mtp_tokens);
+            for (int k = 1; k <= 3; k++) {
+                fprintf(stderr, " k%d=%d/%.2fms", k, mtp_k_calls[k],
+                        mtp_k_calls[k] ? mtp_k_sec[k] * 1000.0 / mtp_k_calls[k] : 0.0);
+            }
+            fputc('\n', stderr);
+        }
+        if (write_frontier_logits_json(&cfg, engine, session, frontier, previous, ".decode") != 0) {
+            rc = 1;
+            break;
+        }
 
         if (!need_restore_after_generation) {
             /* Nothing later depends on the frontier state. */

@@ -54,6 +54,7 @@ void ds4_help_print(FILE *fp, ds4_help_tool tool, const char *topic) {
         fprintf(fp, "\nBenchmark:\n");
         fprintf(fp, "  --ctx-start N --ctx-max N     Context range\n");
         fprintf(fp, "  --step-incr N | --step-mul F  Context progression\n");
+        fprintf(fp, "  --frontiers N,N,...           Exact context frontiers (overrides the range)\n");
         fprintf(fp, "  --gen-tokens N                Decode tokens per measurement\n");
         fprintf(fp, "  --prompt-file FILE            Benchmark input\n");
         fprintf(fp, "  --csv FILE                    Write measurements\n");
