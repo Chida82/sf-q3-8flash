@@ -17,6 +17,14 @@ context: |
   Change names use <NN>-<kebab-name>, numbered in execution order.
   Performance changes must not lose precision: no KV-cache or activation
   quantization, and no route that changes greedy output.
+  Every performance change ends with tools/parity-check.sh sf-q3-8flash
+  passing (from the StarForge checkout) and an A/B run of
+  speed-bench/ab_bench.py against the start commit of the current segment of
+  speed-bench/perf-record.md, and appends the printed row there. If the
+  current segment has no start row yet, the change first writes it with an
+  A/A run on a worktree of the start commit. Steps inside a change are judged
+  with the same harness against the previous step. Work never happens on main:
+  main is only read, through a worktree.
 
 # Per-artifact rules (optional)
 # Add custom rules for specific artifacts.
