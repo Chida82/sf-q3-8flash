@@ -1,0 +1,41 @@
+schema: spec-driven
+
+# Project context (optional)
+# This is shown to AI when creating artifacts.
+# Add your tech stack, conventions, style guides, domain knowledge, etc.
+# Example:
+#   context: |
+#     Tech stack: TypeScript, React, Node.js
+#     We use conventional commits
+#     Domain: e-commerce platform
+context: |
+  Analyzed upstream ds4 PRs and the verdict on each of their commits live in
+  docs/upstream-prs.md. Proposals, designs and tasks consult it; a change that
+  adopts or rejects a commit updates that commit's line in the same branch.
+  Provenance of borrowed code goes in the registry and in commit messages, never
+  in source comments.
+  Change names use <NN>-<kebab-name>, numbered in execution order.
+  Performance changes must not lose precision: no KV-cache or activation
+  quantization, and no route that changes greedy output.
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing
