@@ -27,10 +27,11 @@ row, and the previous segment's rows stay as they are.
 
 ### Segment 1
 
-Start commit: the `main` commit on which `20-perf-bench-harness` lands (the
-first whose bench has `--mtp` and `--frontiers`). The first performance change
-after it writes the start row on its own branch: an A/A run on a worktree of
-that commit (`--a` and `--b` both the worktree).
+Start commit: `91f225a`, the `main` commit on which `20-perf-bench-harness`
+landed (the first whose bench has `--mtp` and `--frontiers`). Its row is an
+A/A run on a worktree of that commit (`--a` and `--b` both the worktree),
+written by `30-mtp-cycle`.
 
 | step | date | B commit | model | valid pairs | correctness | plain decode | plain prefill 8192 | plain prefill +512 | plain prefill +2048 | mtp-code decode | mtp-code tokens/cycle | mtp-code prefill 2048 | mtp-prose decode | mtp-prose tokens/cycle | mtp-prose prefill 2048 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| start (A/A) | 2026-09-24 | 91f225a | Qwen3.8-Flash-Next-Q4.gguf | 12 | PASS | 46.5 (+0.3%) | 1264.8 (+0.3%) | 875.9 (+0.1%) | 1023.1 (+0.2%) | 61.7 (-0.7%) | 1.83 (+0.0%) | 1288.5 (+0.6%) | 52.3 (-0.4%) | 1.51 (+0.0%) | 1277.6 (-3.2%) |
