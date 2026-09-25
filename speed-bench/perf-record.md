@@ -35,3 +35,4 @@ written by `30-mtp-cycle`.
 | step | date | B commit | model | valid pairs | correctness | plain decode | plain prefill 8192 | plain prefill +512 | plain prefill +2048 | mtp-code decode | mtp-code tokens/cycle | mtp-code prefill 2048 | mtp-prose decode | mtp-prose tokens/cycle | mtp-prose prefill 2048 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | start (A/A) | 2026-09-24 | 91f225a | Qwen3.8-Flash-Next-Q4.gguf | 12 | PASS | 46.5 (+0.3%) | 1264.8 (+0.3%) | 875.9 (+0.1%) | 1023.1 (+0.2%) | 61.7 (-0.7%) | 1.83 (+0.0%) | 1288.5 (+0.6%) | 52.3 (-0.4%) | 1.51 (+0.0%) | 1277.6 (-3.2%) |
+| perf/30-mtp-cycle | 2026-09-25 | fe126d3 | Qwen3.8-Flash-Next-Q4.gguf | 12 | PASS | 45.8 (+0.0%) | 1228.4 (-0.5%) | 831.8 (+0.0%) | 969.2 (-1.0%) | 68.5 (+12.4%) | 2.46 (+34.6%) | 1258.4 (-1.5%) | 51.1 (-2.4%) | 1.49 (-1.2%) | 1277.3 (-2.9%) |

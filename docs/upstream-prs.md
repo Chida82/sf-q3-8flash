@@ -58,7 +58,7 @@ activation quantization, and any route that changes greedy output, is `drop`.
 
 | PR | Title | State | Head analyzed | Commits | Updated | Analyzed | Summary |
 |---|---|---|---|---|---|---|---|
-| #1062 | Qwen3.8 Flash Next: batched decode and MTP across sessions on Metal | open | `1ab00b5` | 33 | 2026-09-16 | 2026-09-24 | 15 already in main, 8 in main modified; 5 adopted by `30-mtp-cycle` |
+| #1062 | Qwen3.8 Flash Next: batched decode and MTP across sessions on Metal | open | `1ab00b5` | 33 | 2026-09-16 | 2026-09-24 | 15 already in main, 8 in main modified; `30-mtp-cycle` took 4 (`acce8da`, `be4cec8`, `0a89a04`, `1cd83e3`) and dropped `926ee12` on measurement |
 | #1056 | Metal: optimize Qwen3.8 kernels, MTP state and SSD MoE scheduling | open | `b1af94b` | 30 | 2026-09-23 | 2026-09-24 | dense decode -> `40`, MTP ideas -> `30`, SSD -> `80`, IQ2/Q2_K -> `70`; chunk-invariant prefill dropped |
 | #1115 | Two fixes for Qwen3.8-Flash-Next | open | `c544020` | 3 | 2026-09-24 | 2026-09-24 | KV quantization dropped; template fix at next sync |
 | #1118 | server: make the idle prefill quantum configurable | open | `25def38` | 1 | 2026-09-24 | 2026-09-24 | open |
@@ -89,13 +89,13 @@ activation quantization, and any route that changes greedy output, is `drop`.
 | `70c4893` | Specialize the grouped MoE down pass on its pair count | already in main | same patch |
 | `8fc7612` | Walk both rows of a grouped down simdgroup together | already in main | same patch |
 | `20394dc` | Keep verify rows on the few-row matvec | already in main | same patch |
-| `acce8da` | Prime the MTP predictor with the prompt during prefill | adopt -> `30-mtp-cycle` | more drafts accepted after prefill; hand-port the tail flush over `548cdaf` and fix the stage call from `e2cba0b` |
+| `acce8da` | Prime the MTP predictor with the prompt during prefill | adopt -> `30-mtp-cycle` | taken. MTP decode on code +8.3% (tokens per cycle 1.83 -> 2.46), prose -1.5% (inside noise), MTP-mode prefill -4.0%. The tail flush runs in every trunk encoder, because the child's plain batch also takes MTP sessions |
 | `822de06` | Let a speculative batch commit three tokens per item | drop | helps only a batched server with one active slot; CLI and non-batched server already commit depth-3 cycles |
 | `832f4e4` | Read a decode token's n-gram rows concurrently | in main, modified | landed as `d0b7434` |
-| `be4cec8` | Run the three-row predictor on the decode kernel geometry | adopt -> `30-mtp-cycle` | shorter MTP cycle |
-| `926ee12` | Decide the draft depth from measured acceptance and cycle cost | adopt -> `30-mtp-cycle` | depth chosen by measured cost; dedupe `qwen4_ema` already landed with `3077786` |
-| `0a89a04` | Gather the predictor's next-token embeddings on the GPU | adopt -> `30-mtp-cycle` | removes a host round trip; rename to `qwen4_graph_begin_commands_if_needed`. Main's `e2cba0b` (from `13cccce`) gathers embeddings on the host (`qwen4_ref_row` -> `batch_head_x`) and stages row by row with the existing stage kernel, so the GPU id buffer (`mtp_next`) and the batched `qwen4_mtp_stage` must be re-added |
-| `1cd83e3` | Chain the second draft inside the predictor's submission | adopt -> `30-mtp-cycle` | one submission for both drafts |
+| `be4cec8` | Run the three-row predictor on the decode kernel geometry | adopt -> `30-mtp-cycle` | taken. At depth 3: MTP decode on code +2.4%, three-token cycles -3.2% |
+| `926ee12` | Decide the draft depth from measured acceptance and cycle cost | drop | measured after priming: MTP decode on code -8.9% (tokens per cycle 2.46 -> 1.80), prose -0.4%. It probes depth 3 on two cycles in sixteen, so in 128-token generations it rarely learns that depth 3 pays, where the window policy engages it |
+| `0a89a04` | Gather the predictor's next-token embeddings on the GPU | adopt -> `30-mtp-cycle` | taken. Bit-identical drafts, speed neutral; frees the 80 MiB priming arena. The batched predictor from `e2cba0b` was rewritten onto the id buffer |
+| `1cd83e3` | Chain the second draft inside the predictor's submission | adopt -> `30-mtp-cycle` | taken. Bit-identical drafts, +0.6% at depth 3 (the PR's figure); one drafting helper instead of four copies |
 | `13cccce` | Batch the predictor layer across a speculative batch's sessions | in main, modified | landed as `e2cba0b`; see `0a89a04` |
 | `4d8b5dd` | Apply the draft head prefix to the batched head, report verify margins | drop | no effect by default (`DS4_QWEN4_MTP_DRAFT_ROWS` is the full vocabulary); needs the `1cd83e3` argmax signature |
 | `b6c5936` | Give the batched output head the Q8 tile | in main, modified | landed as `643d4cb` |
@@ -118,7 +118,7 @@ activation quantization, and any route that changes greedy output, is `drop`.
 | `cdfc0d5` | Metal: reuse Qwen IQ2 and HC inputs on M1 Max | idea -> `40-dense-decode-kernels`; adopt -> `70-q2-kernels-m5` | HC input reuse as an idea for Q4; the IQ2 part gated to M5 after an A/B |
 | `496b153` | Metal: adapt Qwen SSD MoE tiles and specialize low-bit prefill | idea -> `60-q4-expert-prefill` | O7, tile width by tokens per expert, bitwise only; `70` checks the low-bit part |
 | `92f57fc` | Qwen: prepare MTP prefix caches and preserve predictor state | superseded by `acce8da` | #1062 primes the predictor during prefill |
-| `b86c8ae` | Metal: remove redundant Qwen MTP projections and expert work | idea -> `30-mtp-cycle` | optional cache-only priming |
+| `b86c8ae` | Metal: remove redundant Qwen MTP projections and expert work | idea -> `30-mtp-cycle` | taken as cache-only priming with the existing kernels: bit-identical, MTP-mode prefill +2.1%. Its M1 Max Q8 EH projection kernel is not taken |
 | `9e1429b` | Qwen: bound MTP staging to recover SSD expert cache capacity | adopt -> `80-qwen-ssd-streaming` | phase B |
 | `e2b4a47` | Metal: plan Qwen SSD expert cache evictions once per batch | adopt -> `80-qwen-ssd-streaming` | phase B |
 | `81b9ebb` | Metal: overlap Qwen MoE down and MTP verification with SSD reads | adopt -> `80-qwen-ssd-streaming` | phase B, with `d6cbc77` |
@@ -138,7 +138,7 @@ activation quantization, and any route that changes greedy output, is `drop`.
 | `9bff1ca` | perf(metal): reuse Qwen decode activations across four Q8 output rows | adopt -> `40-dense-decode-kernels` | 4-row Q8; extend the M1 gate to M5 after an A/B |
 | `11811b9` | perf(metal): reuse half operands for large Qwen SSD MoE prefill | idea -> `70-q2-kernels-m5` | M1 Max SSD-only upstream; check against the M5 tensor path |
 | `fd0c24a` | test(qwen): repair compact MoE checks after half-kernel extraction | idea -> `80-qwen-ssd-streaming` | test for the `2ba92ab` compact dispatch and the `11811b9` extraction; taken only with them |
-| `a6ad636` | test(qwen): add sparse and long-context MTP replay diagnostics | idea -> `30-mtp-cycle` | replay check for predictor priming; as written it needs SSD streaming |
+| `a6ad636` | test(qwen): add sparse and long-context MTP replay diagnostics | drop | as written it needs SSD streaming; in `30-mtp-cycle` the bitwise draft gate of the harness covers the cache-only priming it was meant to check |
 | `47ca2eb` | Metal: enable Qwen SSD prefill overlap on all devices | adopt -> `80-qwen-ssd-streaming` | phase B |
 | `028b43f` | Metal: stabilize Qwen HC arithmetic and extend M5 tuning to M6 | idea -> `40-dense-decode-kernels` | pins the F16 HC op order so the reuse kernels stay byte-identical; the M6 gate does not matter on M5 |
 | `b1af94b` | Merge antirez/main into qwen-kernel-opt | merge | - |

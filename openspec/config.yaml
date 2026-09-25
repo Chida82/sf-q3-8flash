@@ -25,6 +25,15 @@ context: |
   A/A run on a worktree of the start commit. Steps inside a change are judged
   with the same harness against the previous step. Work never happens on main:
   main is only read, through a worktree.
+  Code a change ports (from an upstream PR or elsewhere) or writes is not
+  final as it first lands. Every change that adds code plans two reviews
+  of it: a short one after each step, fixing only what would make the step
+  wrong or break a child rule, and a final pass over the whole region it
+  touched. The final pass checks it against AGENT.md and the surrounding
+  idiom, deletes what the change made dead, and recovers missed speed. It
+  applies what pays in correctness, speed or reading cost, keeping output
+  identical (bitwise where the change claims it). The refinements are
+  measured like a step and committed as their own commit.
 
 # Per-artifact rules (optional)
 # Add custom rules for specific artifacts.
