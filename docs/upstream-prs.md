@@ -59,7 +59,7 @@ activation quantization, and any route that changes greedy output, is `drop`.
 | PR | Title | State | Head analyzed | Commits | Updated | Analyzed | Summary |
 |---|---|---|---|---|---|---|---|
 | #1062 | Qwen3.8 Flash Next: batched decode and MTP across sessions on Metal | open | `1ab00b5` | 33 | 2026-09-16 | 2026-09-24 | 15 already in main, 8 in main modified; `30-mtp-cycle` took 4 (`acce8da`, `be4cec8`, `0a89a04`, `1cd83e3`) and dropped `926ee12` on measurement |
-| #1056 | Metal: optimize Qwen3.8 kernels, MTP state and SSD MoE scheduling | open | `b1af94b` | 30 | 2026-09-23 | 2026-09-24 | dense decode -> `40`, MTP ideas -> `30`, SSD -> `80`, IQ2/Q2_K -> `70`; chunk-invariant prefill dropped |
+| #1056 | Metal: optimize Qwen3.8 kernels, MTP state and SSD MoE scheduling | open | `b1af94b` | 30 | 2026-09-23 | 2026-09-24 | `40` took the HC reuse only (plain decode +0.8%; Q8 commits measured and dropped), MTP ideas -> `30`, SSD -> `80`, IQ2/Q2_K -> `70`; chunk-invariant prefill dropped |
 | #1115 | Two fixes for Qwen3.8-Flash-Next | open | `c544020` | 3 | 2026-09-24 | 2026-09-24 | KV quantization dropped; template fix at next sync |
 | #1118 | server: make the idle prefill quantum configurable | open | `25def38` | 1 | 2026-09-24 | 2026-09-24 | open |
 | #1047 | Metal: add SSD expert streaming for Qwen3.8 Flash Next | closed | `d6cbc77` | 3 | 2026-09-19 | 2026-09-24 | folded into #1056 |
@@ -115,7 +115,7 @@ activation quantization, and any route that changes greedy output, is `drop`.
 | `e37f185` | Metal: add bounded SSD expert streaming for Qwen3.8 Flash Next | adopt -> `80-qwen-ssd-streaming` | phase A: bounded expert cache; lift only the `ssd_streaming` rejection |
 | `85d37ae` | Metal: stage only selected Qwen experts for MTP and cache overflow | adopt -> `80-qwen-ssd-streaming` | phase B, needed for the Q2 pack |
 | `d6cbc77` | Metal: overlap Qwen decode expert reads with cached gate/up | adopt -> `80-qwen-ssd-streaming` | phase B, with `81b9ebb` |
-| `cdfc0d5` | Metal: reuse Qwen IQ2 and HC inputs on M1 Max | idea -> `40-dense-decode-kernels`; adopt -> `70-q2-kernels-m5` | HC input reuse as an idea for Q4; the IQ2 part gated to M5 after an A/B |
+| `cdfc0d5` | Metal: reuse Qwen IQ2 and HC inputs on M1 Max | adopt -> `40-dense-decode-kernels` (HC part); adopt -> `70-q2-kernels-m5` (IQ2 part) | `40` took the HC gate-mix reuse kernel for one decode token on M5 (F16, rank 320): byte-exact, plain decode +0.8% (12 pairs, bootstrap 95% CI +0.3..+1.5%), MTP unchanged. Not taken: the M1 Max gate, T >= 3 selection, the M1 benchmark scaffolding. The IQ2 part is gated to M5 after an A/B in `70` |
 | `496b153` | Metal: adapt Qwen SSD MoE tiles and specialize low-bit prefill | idea -> `60-q4-expert-prefill` | O7, tile width by tokens per expert, bitwise only; `70` checks the low-bit part |
 | `92f57fc` | Qwen: prepare MTP prefix caches and preserve predictor state | superseded by `acce8da` | #1062 primes the predictor during prefill |
 | `b86c8ae` | Metal: remove redundant Qwen MTP projections and expert work | idea -> `30-mtp-cycle` | taken as cache-only priming with the existing kernels: bit-identical, MTP-mode prefill +2.1%. Its M1 Max Q8 EH projection kernel is not taken |
@@ -125,22 +125,22 @@ activation quantization, and any route that changes greedy output, is `drop`.
 | `5cbdb6e` | Metal: pipeline Qwen SSD MoE prefill and reuse Q2_K down rows | adopt -> `80-qwen-ssd-streaming` | phase B; the Q2_K down-row reuse is ported by `70-q2-kernels-m5` |
 | `2960711` | Qwen: skip unused indexer queries in dense attention prefixes | open | Qwen prefill: drops the indexer query projection for chunks that stay entirely dense; chunks that cross the boundary keep the full projection, so rounding is preserved. No change covers attention prefill yet |
 | `2ba92ab` | Metal: compact streamed MoE prefill dispatches by active expert | adopt -> `80-qwen-ssd-streaming` | phase B |
-| `a50fecc` | Metal: streamline Q8 matrix-vector loads and reduction | adopt -> `40-dense-decode-kernels` | Q8 GEMV is about 53% of decode bytes; bitwise together with `04c0867` |
-| `bbbc012` | Metal: tune Qwen hyper-connection dispatches for M1 Max | idea -> `40-dense-decode-kernels` | with the `cdfc0d5` HC reuse |
+| `a50fecc` | Metal: streamline Q8 matrix-vector loads and reduction | drop | measured in `40` with `04c0867`: bit-identical on M5 (both oracles 0 bit differences) but neutral, plain decode +1.1% (4 pairs, CI -0.5..+3.2%). Kept only as the base of `9bff1ca`, then removed with its oracles in the final pass |
+| `bbbc012` | Metal: tune Qwen hyper-connection dispatches for M1 Max | drop | its HC-down tile is M1 Max prefill only. The M5 analogue of its 16-SIMD-group pair default, measured in `40`: MTP decode on code -1.7% (11 pairs), prose +0.3% |
 | `a37fd7f` | Metal: reuse IQ2 headers when staging MoE prefill tiles | adopt -> `70-q2-kernels-m5` | device-independent |
 | `13c53d9` | Metal: specialize Qwen IQ2 decode and reuse shared Q8 gate/up inputs | adopt -> `70-q2-kernels-m5` | gate to M5 after an A/B |
 | `9a8462a` | Metal: streamline Qwen Q2 down loads and shared expert row reuse | adopt -> `70-q2-kernels-m5` | gate to M5 after an A/B |
 | `f47db4f` | Merge antirez/main at 8db1d1d into qwen-kernel-opt | merge | - |
 | `0024ca0` | fix(qwen): unify prefill chunk resolution and test generation parity | drop | chunk-invariant prefill changes logits |
 | `2d6a207` | fix(qwen): preserve reference prefill arithmetic with explicit projections | drop | chunk-invariant prefill changes logits |
-| `04c0867` | fix(metal): preserve Q8 dot arithmetic to eliminate late decode drift | adopt -> `40-dense-decode-kernels` | keeps `a50fecc` bitwise |
+| `04c0867` | fix(metal): preserve Q8 dot arithmetic to eliminate late decode drift | drop | repairs `a50fecc`; dropped with it |
 | `89986c3` | fix(qwen): retain prefill attention arithmetic across Metal partitions | drop | chunk-invariant prefill changes logits |
-| `9bff1ca` | perf(metal): reuse Qwen decode activations across four Q8 output rows | adopt -> `40-dense-decode-kernels` | 4-row Q8; extend the M1 gate to M5 after an A/B |
+| `9bff1ca` | perf(metal): reuse Qwen decode activations across four Q8 output rows | drop | measured in `40` with the gate widened to M5: bit-identical and selected for 2560->10240/6144 and 6144->2560, but plain decode +0.3% (14 pairs, CI -0.5..+1.9%). The Q8 projections do not limit M5 decode |
 | `11811b9` | perf(metal): reuse half operands for large Qwen SSD MoE prefill | idea -> `70-q2-kernels-m5` | M1 Max SSD-only upstream; check against the M5 tensor path |
 | `fd0c24a` | test(qwen): repair compact MoE checks after half-kernel extraction | idea -> `80-qwen-ssd-streaming` | test for the `2ba92ab` compact dispatch and the `11811b9` extraction; taken only with them |
 | `a6ad636` | test(qwen): add sparse and long-context MTP replay diagnostics | drop | as written it needs SSD streaming; in `30-mtp-cycle` the bitwise draft gate of the harness covers the cache-only priming it was meant to check |
 | `47ca2eb` | Metal: enable Qwen SSD prefill overlap on all devices | adopt -> `80-qwen-ssd-streaming` | phase B |
-| `028b43f` | Metal: stabilize Qwen HC arithmetic and extend M5 tuning to M6 | idea -> `40-dense-decode-kernels` | pins the F16 HC op order so the reuse kernels stay byte-identical; the M6 gate does not matter on M5 |
+| `028b43f` | Metal: stabilize Qwen HC arithmetic and extend M5 tuning to M6 | drop | the child's `_pf` kernel already spells the F16 op order, and `cdfc0d5`'s reuse kernel is byte-exact against it without this commit (checked in `40`); the M6 gate does not matter on M5 |
 | `b1af94b` | Merge antirez/main into qwen-kernel-opt | merge | - |
 
 ### #1115 (head `c544020`)

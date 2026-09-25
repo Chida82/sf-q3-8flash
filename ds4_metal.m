@@ -39015,6 +39015,7 @@ enum {
     QWEN4_K_HC_NORM_REUSE_Q8,
     QWEN4_K_HC_GATE_MIX_F16,
     QWEN4_K_HC_GATE_MIX_F16_PF,
+    QWEN4_K_HC_GATE_MIX_F16_REUSE,
     QWEN4_K_HC_GATE_MIX_F32,
     QWEN4_K_HC_GATE_MIX_Q8,
     QWEN4_K_HC_GATE_MIX_PAIR_F16,
@@ -39120,6 +39121,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_hc_norm_reuse_q8",
     "kernel_qwen4_hc_gate_mix_f16",
     "kernel_qwen4_hc_gate_mix_f16_pf",
+    "kernel_qwen4_hc_gate_mix_f16_reuse",
     "kernel_qwen4_hc_gate_mix_f32",
     "kernel_qwen4_hc_gate_mix_q8",
     "kernel_qwen4_hc_gate_mix_pair_f16",
@@ -39513,9 +39515,16 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
     const int prefetch_override = ds4_gpu_env_bool("DS4_QWEN4_HC_MIX_PREFETCH");
     const bool prefetch = weight_type == 1u &&
         (prefetch_override >= 0 ? prefetch_override > 0 : ds4_gpu_device_is_m5_apple_silicon());
+    /* One decode token on M5 activates the low-rank inputs once per
+     * threadgroup and reuses them across its four streams and output rows
+     * (same rounding as the plain and prefetched kernels). The override
+     * still forces either of those. */
+    const bool reuse = n_tokens == 1u && weight_type == 1u && n_rank == 320u &&
+        prefetch_override < 0 && ds4_gpu_device_is_m5_apple_silicon();
     const int kernel = pair ? (prefetch ? QWEN4_K_HC_GATE_MIX_PAIR_F16_PF
                                         : qwen4_hc_kernel(weight_type, QWEN4_K_HC_GATE_MIX_PAIR_F16,
                                               QWEN4_K_HC_GATE_MIX_PAIR_F32, QWEN4_K_HC_GATE_MIX_PAIR_Q8))
+                            : reuse ? QWEN4_K_HC_GATE_MIX_F16_REUSE
                             : prefetch ? QWEN4_K_HC_GATE_MIX_F16_PF
                             : qwen4_hc_kernel(weight_type, QWEN4_K_HC_GATE_MIX_F16, QWEN4_K_HC_GATE_MIX_F32,
                                        QWEN4_K_HC_GATE_MIX_Q8);
@@ -39527,7 +39536,7 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
         (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_HC_PAIR_NSG", default_nsg, 1u, 16u) : 4u;
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 4,
                           MTLSizeMake((n_embd + nsg - 1u) / nsg, pair ? 1u : n_tokens, 1), MTLSizeMake(nsg * 32u, 1, 1),
-                          pair ? (NSUInteger)n_rank * 2u * sizeof(float) : 0u);
+                          (pair || reuse) ? (NSUInteger)n_rank * 2u * sizeof(float) : 0u);
 }
 
 int ds4_gpu_qwen4_hc_combine_tensor(

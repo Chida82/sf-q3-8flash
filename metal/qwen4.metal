@@ -319,6 +319,68 @@ kernel void kernel_qwen4_hc_gate_mix_f16_pf(
     if (tiisg == 0) mixed[(uint64_t)tok * E + d] = g / (float)hc;
 }
 
+/* Reuse the low-rank sigmoid across streams and output rows. Keep x and
+ * sigmoid(x) separate: storing silu(x) would change the single-row
+ * accumulation's (x * weight) * sigmoid(x) rounding. */
+kernel void kernel_qwen4_hc_gate_mix_f16_reuse(
+        constant ds4_metal_args_qwen4_hc_gate_mix & args,
+        device const float *xn,
+        device const float *lo,
+        device const char  *w_up,
+        device float       *mixed,
+        threadgroup float2 *low_sig [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint hc = args.n_hc, E = args.n_embd, rank = args.n_rank;
+    const uint d = tgpig.x * (ntg.x / 32) + sgitg;
+    const uint tok = tgpig.y;
+    if (tok >= args.n_tokens) return;
+    device const float *l = lo + (uint64_t)tok * rank;
+    const float inv_hc = 1.0f / (float)hc;
+    for (uint r = tid; r < rank; r += ntg.x) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+        const float x = l[r] * inv_hc;
+        low_sig[r] = float2(x, qwen4_sigmoid(x));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (d >= E) return;
+    const uint s = tiisg / 8, lane = tiisg % 8;
+    device const half *wr = (device const half *)w_up + (uint64_t)(s * E + d) * rank;
+    float acc = 0.0f;
+    uint r = lane;
+    for (; r + 56u < rank; r += 64u) {
+        float wv[8];
+        float2 av[8];
+        for (uint i = 0; i < 8; i++) { wv[i] = (float)wr[r + 8u * i]; av[i] = low_sig[r + 8u * i]; }
+        for (uint i = 0; i < 8; i++) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+            const float t = av[i].x * wv[i];
+            const float u = t * av[i].y;
+            acc = acc + u;
+        }
+    }
+    for (; r < rank; r += 8u) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+        const float2 a = low_sig[r];
+        const float t = a.x * (float)wr[r];
+        const float u = t * a.y;
+        acc = acc + u;
+    }
+    acc += simd_shuffle_xor(acc, 1);
+    acc += simd_shuffle_xor(acc, 2);
+    acc += simd_shuffle_xor(acc, 4);
+    float g = qwen4_sigmoid(acc) * xn[(uint64_t)tok * E * hc + s * E + d];
+    g += simd_shuffle_xor(g, 8);
+    g += simd_shuffle_xor(g, 16);
+    if (tiisg == 0) mixed[(uint64_t)tok * E + d] = g / (float)hc;
+}
+
 /* Two-token MTP verification: reuse each up-projection weight for both
  * rows, and activate the low-rank inputs once per threadgroup. */
 template <typename W>
