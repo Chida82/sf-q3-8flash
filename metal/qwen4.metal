@@ -4651,13 +4651,16 @@ kernel void kernel_qwen4_gdn_front(
 
 /* The predictor needs a token ID, not a CPU copy of the entire vocabulary.
  * First reduce independent 4096-value chunks; then merge their winners.
- * The -1e30 initial score and index-zero fallback match sample_argmax. */
-struct qwen4_argmax_args { uint n, finish; };
+ * The -1e30 initial score and index-zero fallback match sample_argmax.
+ * A gathered head scores a row list: mapped translates the winning row to
+ * its token id. */
+struct qwen4_argmax_args { uint n, finish, mapped; };
 kernel void kernel_qwen4_argmax(
         constant qwen4_argmax_args &args,
         device const float *logits,
         device uint2 *partials,
         device int *out_idx,
+        device const int *map,
         uint group [[threadgroup_position_in_grid]],
         ushort tid [[thread_index_in_threadgroup]],
         ushort lane [[thread_index_in_simdgroup]],
@@ -4684,7 +4687,7 @@ kernel void kernel_qwen4_argmax(
         top = simd_max(best);
         winner = simd_min(best == top ? index : 0xffffffffu);
         if (!lane) {
-            if (args.finish) out_idx[0] = (int)winner;
+            if (args.finish) out_idx[0] = args.mapped ? map[winner] : (int)winner;
             else partials[group] = uint2(as_type<uint>(top), winner);
         }
     }

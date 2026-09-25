@@ -1888,7 +1888,7 @@ static void test_qwen4_argmax(void) {
             require_ok(ds4_gpu_tensor_write(x, 0, v, n * sizeof(float)) &&
                 ds4_gpu_tensor_fill_f32(tmp, 17.25f, chunks * 2u + guard) &&
                 ds4_gpu_tensor_fill_f32(out, 17.25f, 1u + guard) &&
-                ds4_gpu_begin_commands() && ds4_gpu_qwen4_argmax_tensor(out, tmp, x, n) &&
+                ds4_gpu_begin_commands() && ds4_gpu_qwen4_argmax_tensor(out, tmp, x, n, NULL) &&
                 ds4_gpu_end_commands(), "Qwen argmax dispatch");
             uint32_t got;
             require_ok(ds4_gpu_tensor_read(out, 0, &got, sizeof(got)) && got == expected, "Qwen argmax index");
@@ -1898,8 +1898,8 @@ static void test_qwen4_argmax(void) {
             require_ok(ds4_gpu_tensor_read(tmp, chunks * 8u, tail, sizeof(tail)), "argmax scratch guard read");
             for (uint32_t j = 0; j < guard; j++) require_ok(tail[j] == 17.25f, "argmax scratch guard");
         }
-        require_ok(!ds4_gpu_qwen4_argmax_tensor(out, tmp, x, 0u) &&
-                   !ds4_gpu_qwen4_argmax_tensor(out, tmp, x, n + 1u), "argmax rejects invalid sizes");
+        require_ok(!ds4_gpu_qwen4_argmax_tensor(out, tmp, x, 0u, NULL) &&
+                   !ds4_gpu_qwen4_argmax_tensor(out, tmp, x, n + 1u, NULL), "argmax rejects invalid sizes");
         ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(tmp); ds4_gpu_tensor_free(x); free(v);
     }
     printf("Qwen predictor argmax: CPU indices, ties, special values and guards passed\n");

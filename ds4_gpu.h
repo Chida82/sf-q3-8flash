@@ -2129,8 +2129,10 @@ void ds4_gpu_decode_graphs_invalidate(void);
  * gathered MTP draft head); same kernel and geometry as the model-range path. */
 int ds4_gpu_qwen4_matmul_q8_0_weights_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *w,
                                              uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x);
+/* out_idx = argmax of n_vocab logits, or map[argmax] when the logits score
+ * the rows a map lists */
 int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tensor *scratch,
-                               const ds4_gpu_tensor *logits, uint32_t n_vocab);
+                               const ds4_gpu_tensor *logits, uint32_t n_vocab, const ds4_gpu_tensor *map);
 /* M3 Ultra decode defaults; DS4_QWEN4_DECODE_FUSIONS=0 restores old paths. */
 int ds4_gpu_qwen4_decode_fusions_enabled(void);
 /* Single-token F16 injection: old_R/old_inj and next_R/inj_part must be distinct. */
