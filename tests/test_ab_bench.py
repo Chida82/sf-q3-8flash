@@ -8,6 +8,10 @@ spec = importlib.util.spec_from_file_location(
     "ab_bench", Path(__file__).resolve().parents[1] / "speed-bench/ab_bench.py")
 ab = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ab)
+pool_spec = importlib.util.spec_from_file_location(
+    "ab_pool", Path(__file__).resolve().parents[1] / "speed-bench/ab_pool.py")
+ab_pool = importlib.util.module_from_spec(pool_spec)
+pool_spec.loader.exec_module(ab_pool)
 
 HEADER = "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes\n"
 PLAIN_CSV = HEADER + ("8192,8192,1400.00,4,50.00,20.0,3,60.00,0\n"
@@ -107,6 +111,76 @@ class VerdictTest(unittest.TestCase):
         cells = [ab.record_row("perf/x", "d", "c", "m", 2, "PASS", t).count("|") for t in (full, plain)]
         self.assertEqual(cells[0], cells[1])
         self.assertEqual(cells[0], ab.record_header().splitlines()[0].count("|"))
+
+
+def chunk_line(pos, tokens, mid, ok=1):
+    return (f"ds4: Qwen3.8 prefill stage GPU ms/chunk (pos={pos} T={tokens} ok={ok}): ple 1.0 hc_attn 10.0 "
+            f"gdn 30.0 attn 20.0 hc_ffn 10.0 moe 10.0 moe_mid {mid} moe_down 30.0 head 0.0\n")
+
+
+PLAIN_SECTIONS = (chunk_line(0, 8192, 50.0) + chunk_line(8192, 512, 5.0) + chunk_line(8704, 2048, 20.0)
+                  + "ds4: Qwen3.8 T=1 GPU us/pass over 50 passes: ple 1.0 moe_mid 2.0 sum 3.0\n"
+                  + chunk_line(10752, 16, 1.0))
+
+
+def section_run(build, n, clock=1.0, target=1.0, warmup=False):
+    groups = {g: 10.0 * clock * (target if g in ("moe_mid", "moe_down") else 1.0) for g in ab.GROUPS}
+    return {"build": build, "kind": "plain", "n": n, "warmup": warmup, "note": "",
+            "sections": {name: dict(groups) for name, _, _ in ab.shapes("plain")}}
+
+
+def section_quads(*b_runs):
+    """Warm-up, then one A B B A quad per (b1, b2) of (clock, target) scales."""
+    runs = [section_run("A", 0, warmup=True), section_run("B", 0, warmup=True)]
+    for q, (b1, b2) in enumerate(b_runs):
+        runs += [section_run("A", 4 * q + 1), section_run("B", 4 * q + 2, *b1),
+                 section_run("B", 4 * q + 3, *b2), section_run("A", 4 * q + 4)]
+    return runs
+
+
+class SectionsTest(unittest.TestCase):
+    def test_chunk_lines_by_shape(self):
+        s = ab.parse_sections(PLAIN_SECTIONS, "plain")
+        self.assertEqual(list(s), ["prefill 8192", "prefill +512", "prefill +2048"])
+        self.assertEqual([s[k]["moe_mid"] for k in s], [50.0, 5.0, 20.0])
+        self.assertEqual(s["prefill +512"]["gdn"], 30.0)
+
+    def test_missing_chunk_is_a_run_failure(self):
+        for err, named in ((PLAIN_SECTIONS.replace("pos=8192 T=512", "pos=8192 T=511"), "prefill +512"),
+                           (PLAIN_SECTIONS.replace("T=2048 ok=1", "T=2048 ok=0"), "ok=0")):
+            with self.assertRaises(ab.Stop) as cm:
+                ab.parse_sections(err, "plain")
+            self.assertEqual(cm.exception.code, 1)
+            self.assertIn(named, str(cm.exception))
+
+    def test_unknown_group_refused_and_plain_default(self):
+        with self.assertRaises(ab.Stop) as cm:
+            ab.parse_args(["--a", ".", "--b", ".", "--sections", "moe_mid,nope"])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("nope", str(cm.exception))
+        args = ab.parse_args(["--a", ".", "--b", ".", "--sections", "moe_mid,moe_down"])
+        self.assertEqual((args.kinds, args.sections), (["plain"], ["moe_mid", "moe_down"]))
+
+    def test_normalized_ratio_cancels_the_clock(self):
+        slow_clock = ab.section_table(section_quads(((1.03, 1.0), (1.03, 1.0))), ["plain"], ["moe_mid", "moe_down"])
+        for t in slow_clock:
+            self.assertAlmostEqual(t["ratio"], 1.0)
+            self.assertAlmostEqual(t["whole"], 1.03)
+        faster = ab.section_table(section_quads(((1.0, 0.97), (1.0, 0.97))), ["plain"], ["moe_mid", "moe_down"])
+        self.assertAlmostEqual(faster[0]["ratio"], 0.97)
+        self.assertEqual(faster[0]["n"], 2)
+
+    def test_flagged_pair_left_out_of_verdict_and_pool(self):
+        runs = section_quads(((1.0, 0.97), (1.0, 0.97)), ((1.0, 0.5), (1.0, 0.97)))
+        runs[6]["flag"] = runs[7]["flag"] = "pair dropped: run 7 at 900 MHz"  # A1, B1 of the second quad
+        t = ab.section_table(runs, ["plain"], ["moe_mid", "moe_down"])[0]
+        self.assertEqual(t["n"], 3)
+        self.assertAlmostEqual(t["ratio"], 0.97)
+        with tempfile.TemporaryDirectory() as out:
+            ab.write_sections(Path(out) / "sections.csv", runs)
+            ratios = ab_pool.pooled("plain", [out], shape="prefill +512", targets=["moe_mid", "moe_down"])
+        self.assertEqual(len(ratios), 3)
+        self.assertTrue(all(abs(r - 0.97) < 1e-9 for r in ratios))
 
 
 class ScheduleTest(unittest.TestCase):

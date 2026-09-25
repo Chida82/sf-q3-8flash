@@ -4,7 +4,9 @@
 Runs the benchmark of build A (baseline) and build B (candidate) on one GGUF,
 one process at a time, in A B B A quads, and reports the median B/A ratio per
 metric. The verdict is gated on identical tokens and, with --bitwise, on
-identical logit bits. See "A/B harness" in speed-bench/README.md.
+identical logit bits. With --sections it runs the same schedule under the GPU
+section profiler and judges GPU time per prefill chunk instead of throughput.
+See "A/B harness" in speed-bench/README.md.
 """
 
 import argparse
@@ -15,6 +17,7 @@ import importlib.util
 import io
 import json
 import os
+import random
 import re
 import statistics
 import subprocess
@@ -48,6 +51,9 @@ MACTOP = {'time': ('timestamp',), 'freq': ('soc_metrics', 'gpu_freq_mhz'),
 IDS = re.compile(r'^ds4-bench: gen\[ctx=(\d+)\] token ids:(.*)$', re.M)
 MTP = re.compile(r'^ds4-bench: mtp\[ctx=(\d+)\] cycles=(\d+) tokens=(\d+)'
                  + ''.join(rf' k{k}=(\d+)/([0-9.]+)ms' for k in (1, 2, 3)) + '$', re.M)
+# DS4_QWEN4_TIMING=2 stage groups (ds4.c qwen4_prof_names) and their per-chunk prefill line
+GROUPS = ('ple', 'hc_attn', 'gdn', 'attn', 'hc_ffn', 'moe', 'moe_mid', 'moe_down', 'head')
+CHUNK = re.compile(r'^ds4: Qwen3\.8 prefill stage GPU ms/chunk \(pos=(\d+) T=(\d+) ok=(\d)\):(.*)$', re.M)
 
 
 class Stop(Exception):
@@ -202,13 +208,21 @@ def bench_cmd(tree, kind, model, csv_path, logits_dir=None):
     return cmd
 
 
+def shapes(kind):
+    """(metric name, chunk position, chunk tokens) of each prefill a kind times: every frontier
+    is prefilled on top of the previous one."""
+    out, previous = [], 0
+    for f in KINDS[kind]['frontiers']:
+        out.append((f'prefill {f}' if previous == 0 else f'prefill +{f - previous}', previous, f - previous))
+        previous = f
+    return out
+
+
 def metrics(rows, mtp, kind):
     frontiers = KINDS[kind]['frontiers']
     m = {}
-    previous = 0
-    for f in frontiers:
-        m[f'prefill {f}' if previous == 0 else f'prefill +{f - previous}'] = float(rows[f]['prefill_tps'])
-        previous = f
+    for (name, _, _), f in zip(shapes(kind), frontiers):
+        m[name] = float(rows[f]['prefill_tps'])
     steady = [(int(rows[f]['gen_steady_tokens']), float(rows[f]['gen_steady_tps'])) for f in frontiers]
     seconds = sum(n / tps for n, tps in steady if tps > 0)
     m['decode'] = sum(n for n, _ in steady) / seconds if seconds else None
@@ -238,7 +252,26 @@ def parse_run(csv_text, err_text, kind):
     return {'rows': rows, 'tokens': tokens, 'mtp': mtp, 'metrics': metrics(rows, mtp, kind)}
 
 
-def run_bench(n, build, tree, kind, model, env, out, phase, bitwise):
+def parse_sections(err_text, kind):
+    """GPU ms per stage group of each prefill chunk the kind times, from the profiler's lines."""
+    chunks = {}
+    for m in CHUNK.finditer(err_text):
+        if m[3] != '1':
+            raise Stop(1, f'{kind}: profiled chunk pos={m[1]} T={m[2]} reported ok=0')
+        words = m[4].split()
+        times = dict(zip(words[::2], words[1::2]))
+        if any(g not in times for g in GROUPS):
+            raise Stop(1, f'{kind}: section-time line for pos={m[1]} T={m[2]} lacks a stage group')
+        chunks.setdefault((int(m[1]), int(m[2])), {g: float(times[g]) for g in GROUPS})
+    out = {}
+    for name, pos, tokens in shapes(kind):
+        if (pos, tokens) not in chunks:
+            raise Stop(1, f'{kind}: no section-time line for {name} (pos={pos} T={tokens})')
+        out[name] = chunks[pos, tokens]
+    return out
+
+
+def run_bench(n, build, tree, kind, model, env, out, phase, bitwise, sections=False):
     stem = out / 'logs' / f'{n:02d}-{build}-{kind}'
     logits_dir = out / 'logits' / f'{build}-{kind}' if phase == 'warm-up' and bitwise else None
     if logits_dir:
@@ -250,7 +283,10 @@ def run_bench(n, build, tree, kind, model, env, out, phase, bitwise):
     end = time.time()
     if rc != 0:
         raise Stop(1, f'{build} {kind} run failed (exit {rc}); see {stem}.err')
-    run = parse_run(Path(f'{stem}.csv').read_text(), Path(f'{stem}.err').read_text(errors='replace'), kind)
+    err_text = Path(f'{stem}.err').read_text(errors='replace')
+    run = parse_run(Path(f'{stem}.csv').read_text(), err_text, kind)
+    if sections:
+        run['sections'] = parse_sections(err_text, kind)
     run.update(n=n, build=build, kind=kind, phase=phase, warmup=phase != 'timed', start=start, end=end,
                duration=end - start, logits=logits_dir, note='')
     return run
@@ -397,6 +433,47 @@ def verdict(runs, kinds):
     return table
 
 
+def bootstrap_ci(values, resamples=10000, seed=1):
+    """95% CI of the median by bootstrap (fixed seed); (None, None) below two values."""
+    if len(values) < 2:
+        return None, None
+    rng = random.Random(seed)
+    bs = sorted(statistics.median(rng.choices(values, k=len(values))) for _ in range(resamples))
+    return bs[resamples // 40], bs[resamples - resamples // 40]
+
+
+def section_split(groups, targets):
+    """(target ms, untouched ms) of one chunk."""
+    target = sum(groups[g] for g in targets)
+    return target, sum(groups.values()) - target
+
+
+def med(values):
+    return statistics.median(values) if values else None
+
+
+def section_table(runs, kinds, targets):
+    """Per kind and shape: B's (target / untouched) over A's per valid pair, with its CI, and
+    the whole-chunk ratio. The untouched groups share the run's clock, so the ratio cancels
+    the clock drift between runs."""
+    timed = [r for r in runs if not r['warmup']]
+    table = []
+    for kind in kinds:
+        valid = [(a, b) for a, b in pairs(timed, kind) if not a.get('flag')]
+        for name, _, _ in shapes(kind):
+            split = [(section_split(a['sections'][name], targets), section_split(b['sections'][name], targets))
+                     for a, b in valid]
+            split = [(x, y) for x, y in split if x[0] > 0 and x[1] > 0 and y[1] > 0]
+            ratios = [(bt / bu) / (at / au) for (at, au), (bt, bu) in split]
+            lo, hi = bootstrap_ci(ratios)
+            table.append({'kind': kind, 'shape': name, 'n': len(ratios),
+                          'a_target': med([x[0] for x, _ in split]), 'b_target': med([y[0] for _, y in split]),
+                          'a_rest': med([x[1] for x, _ in split]), 'b_rest': med([y[1] for _, y in split]),
+                          'ratio': med(ratios), 'lo': lo, 'hi': hi,
+                          'whole': med([sum(y) / sum(x) for x, y in split])})
+    return table
+
+
 def pct(ratio):
     return f'{(ratio - 1) * 100:+.1f}%'
 
@@ -419,7 +496,21 @@ def record_row(step, date, commit, model, valid_pairs, correctness, table):
     return '| ' + ' | '.join(row) + ' |'
 
 
-def summary(ctx, runs, table, status, correctness):
+def section_lines(ctx, sections):
+    lines = [f'sections  target {"+".join(ctx["sections"])}; B/A of (target / untouched) GPU ms per '
+             'prefill chunk, per valid pair',
+             f'{"kind":<10} {"shape":<14} {"A target":>9} {"B target":>9} {"A other":>9} {"B other":>9} '
+             f'{"B/A":>7}  {"95% CI":<17} {"whole":>7} n']
+    for t in sections:
+        ci = f'{pct(t["lo"])} .. {pct(t["hi"])}' if t['lo'] is not None else ''
+        lines.append(f'{t["kind"]:<10} {t["shape"]:<14} {num(t["a_target"]):>9} {num(t["b_target"]):>9} '
+                     f'{num(t["a_rest"]):>9} {num(t["b_rest"]):>9} '
+                     f'{pct(t["ratio"]) if t["ratio"] is not None else "-":>7}  {ci:<17} '
+                     f'{pct(t["whole"]) if t["whole"] is not None else "-":>7} {t["n"]}')
+    return lines
+
+
+def summary(ctx, runs, table, status, correctness, sections=None):
     timed = [r for r in runs if not r['warmup']]
     kinds = ctx['kinds']
     all_pairs = [p for kind in kinds for p in pairs(timed, kind)]
@@ -439,21 +530,29 @@ def summary(ctx, runs, table, status, correctness):
                      f'thermal {"/".join(thermal) or "?"}')
     lines.append(f'correctness  {correctness}')
     lines.append('')
-    lines.append(f'{"kind":<10} {"metric":<14} {"A":>9} {"B":>9} {"B/A":>7}  {"range":<17} n')
-    for t in table:
-        span = f'{pct(t["lo"])} .. {pct(t["hi"])}' if t['n'] else ''
-        mark = '' if t['headline'] else '  (detail)'
-        lines.append(f'{t["kind"]:<10} {t["metric"]:<14} {num(t["a"]):>9} {num(t["b"]):>9} '
-                     f'{pct(t["ratio"]) if t["ratio"] is not None else "-":>7}  {span:<17} {t["n"]}{mark}')
+    if sections is not None:
+        # profiled runs include the profiler's waits: no throughput table or record row
+        lines += section_lines(ctx, sections)
+    else:
+        lines.append(f'{"kind":<10} {"metric":<14} {"A":>9} {"B":>9} {"B/A":>7}  {"range":<17} n')
+        for t in table:
+            span = f'{pct(t["lo"])} .. {pct(t["hi"])}' if t['n'] else ''
+            mark = '' if t['headline'] else '  (detail)'
+            lines.append(f'{t["kind"]:<10} {t["metric"]:<14} {num(t["a"]):>9} {num(t["b"]):>9} '
+                         f'{pct(t["ratio"]) if t["ratio"] is not None else "-":>7}  {span:<17} {t["n"]}{mark}')
     notes = [f'run {r["n"]} {r["build"]} {r["kind"]}: {r.get("flag") or r["note"]}'
              for r in timed if r.get('flag') or r['note']]
     if notes:
         lines += [''] + notes
-    thin = [f'{t["kind"]} {t["metric"]}' for t in table if t['headline'] and t['n'] < 2]
+    if sections is not None:
+        thin = [f'{t["kind"]} {t["shape"]}' for t in sections if t['n'] < 2]
+    else:
+        thin = [f'{t["kind"]} {t["metric"]}' for t in table if t['headline'] and t['n'] < 2]
     if thin and status == 'PASS':
         lines += ['', f'INCONCLUSIVE: fewer than two valid pairs for {", ".join(thin)}']
-    lines += ['', 'record row:', record_row(ctx['B']['branch'], ctx['date'][:10], ctx['B']['commit'], ctx['model_name'],
-                                             valid, status, table)]
+    if sections is None:
+        lines += ['', 'record row:', record_row(ctx['B']['branch'], ctx['date'][:10], ctx['B']['commit'],
+                                                 ctx['model_name'], valid, status, table)]
     return '\n'.join(lines), bool(thin)
 
 
@@ -479,6 +578,18 @@ def write_samples(path, runs):
                             'note': r.get('flag') or r['note'], 'tokens_sha256': hashlib.sha256(ids).hexdigest()})
 
 
+def write_sections(path, runs):
+    with open(path, 'w', newline='') as f:
+        w = csv.DictWriter(f, ['run', 'build', 'kind', 'shape', *GROUPS, 'note'])
+        w.writeheader()
+        for r in runs:
+            if r['warmup']:
+                continue
+            for shape, groups in r['sections'].items():
+                w.writerow({'run': r['n'], 'build': r['build'], 'kind': r['kind'], 'shape': shape, **groups,
+                            'note': r.get('flag') or r['note']})
+
+
 # --- main --------------------------------------------------------------------
 
 def parse_args(argv):
@@ -486,7 +597,7 @@ def parse_args(argv):
     p.add_argument('--a', required=True, help='baseline build tree')
     p.add_argument('--b', required=True, help='candidate build tree (may equal --a for an A/A run)')
     p.add_argument('-m', '--model', default=str(ROOT / 'qwen3.8-flash-next.gguf'))
-    p.add_argument('--kinds', default=','.join(KINDS), help=f'comma list of {", ".join(KINDS)}')
+    p.add_argument('--kinds', help=f'comma list of {", ".join(KINDS)} (default all; plain with --sections)')
     p.add_argument('--budget', type=int, default=480, help=f'wall-clock seconds, at most {MAX_BUDGET}')
     p.add_argument('--bitwise', action='store_true', help='also require bit-identical logits')
     p.add_argument('--env', action='append', default=[], metavar='KEY=VALUE', help='set for both builds')
@@ -497,9 +608,19 @@ def parse_args(argv):
     p.add_argument('--preheat', type=float, default=210.0,
                    help='seconds of load before the timed rounds (at most half the budget); '
                         'the M5 Max reaches its thermal plateau about 215-240 s into a run')
+    p.add_argument('--sections', metavar='GROUPS',
+                   help='judge GPU time per prefill chunk: comma list of the DS4_QWEN4_TIMING=2 groups the '
+                        f'step targets ({", ".join(GROUPS)}), normalized by the other groups')
     p.add_argument('--out', help='output directory (default $TMPDIR/sf-q3-8flash-ab/<UTC time>)')
     args = p.parse_args(argv)
-    args.kinds = [k for k in args.kinds.split(',') if k]
+    args.sections = [g for g in (args.sections or '').split(',') if g]
+    for g in args.sections:
+        if g not in GROUPS:
+            raise Stop(2, f'--sections {g}: not a profiler group; choose from {", ".join(GROUPS)}')
+    if args.sections and set(args.sections) == set(GROUPS):
+        raise Stop(2, '--sections: leave at least one group untouched to normalize by')
+    kinds = args.kinds or ('plain' if args.sections else ','.join(KINDS))
+    args.kinds = [k for k in kinds.split(',') if k]
     if not args.kinds or any(k not in KINDS for k in args.kinds):
         raise Stop(2, f'--kinds {",".join(args.kinds)}: choose from {", ".join(KINDS)}')
     if not 0 < args.budget <= MAX_BUDGET:
@@ -511,6 +632,7 @@ def main(argv=None):
     begin = time.time()
     try:
         args = parse_args(argv)
+        args.env += ['DS4_QWEN4_TIMING=2'] if args.sections else []
         env = child_env(args.env)
         model = Path(os.path.abspath(args.model))
         if not model.is_file():
@@ -529,13 +651,14 @@ def main(argv=None):
     ctx = {'date': now.strftime('%Y-%m-%d %H:%M UTC'), 'device': sample.get('system_info', {}).get('name', '?'),
            'mactop': version, 'A': trees['A'], 'B': trees['B'], 'model': str(model),
            'model_name': model_label(model), 'env': args.env,
-           'budget': args.budget, 'kinds': args.kinds}
+           'budget': args.budget, 'kinds': args.kinds, 'sections': args.sections}
     counter = iter(range(1, 10_000))
     refs = {}
     runs = []
 
     def runner(build, kind, phase):
-        run = run_bench(next(counter), build, trees[build]['path'], kind, model, env, out, phase, args.bitwise)
+        run = run_bench(next(counter), build, trees[build]['path'], kind, model, env, out, phase, args.bitwise,
+                        bool(args.sections))
         monitor.check()
         refs.setdefault(kind, run)  # the first run of a kind is A's warm-up
         print(f'  run {run["n"]:2d} {build} {kind:<9} {phase:<7} {run["duration"]:.1f} s',
@@ -570,8 +693,11 @@ def main(argv=None):
     judge(timed, monitor.readings(version))
     drop_disturbed(timed, args.kinds, args.min_freq_of_median)
     table = verdict(runs, args.kinds)
-    text, thin = summary(ctx, runs, table, status, correctness)
+    sections = section_table(runs, args.kinds, args.sections) if args.sections else None
+    text, thin = summary(ctx, runs, table, status, correctness, sections)
     write_samples(out / 'samples.csv', runs)
+    if args.sections:
+        write_sections(out / 'sections.csv', runs)
     (out / 'summary.txt').write_text(text + '\n')
     print(text)
     print(f'\noutput: {out}', file=sys.stderr)

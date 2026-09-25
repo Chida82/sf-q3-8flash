@@ -69,7 +69,33 @@ Noise floor, A/A on the M5 Max plateau (2026-09-24): pooled plain decode and
 MTP decode ±1-2% per pair; tokens per cycle exactly equal; prefill +512 and
 +2048 about ±2-4%; prefill 8192, the first prefill of each process, up to about
 ±7%. A claim smaller than its metric's noise needs `--kinds <kind> --budget
-600` for more pairs, and is read against this range.
+600` for more pairs, and is read against this range. The first prefill can also
+lean: in `60-q4-expert-prefill` a step that changed no kernel read prefill 8192
++3% with a pooled CI wholly above zero.
+
+**Section-time mode.** `--sections moe_mid,moe_down` runs the same schedule
+and correctness gate with `DS4_QWEN4_TIMING=2` set for both builds, and judges
+GPU time instead of throughput. Kinds default to `plain`. For every prefill
+chunk a kind times, a run's ratio is the GPU time of the named stage groups
+over the time of the other groups of the same chunk. The other groups run at
+the same clock, so the ratio cancels the drift between runs. The summary gives,
+per chunk shape, B's ratio over A's as a median over the valid pairs with a
+bootstrap 95% CI, the target and untouched medians, and the whole-chunk ratio.
+There is no record row, since profiled runs include the profiler's waits.
+`sections.csv` holds every run's group times per chunk. The groups are the
+profiler's: `ple`, `hc_attn`, `gdn`, `attn`, `hc_ffn`, `moe`, `moe_mid`,
+`moe_down` and `head` (see `docs/METAL.md`). `openspec/config.yaml` decides
+small prefill kernel steps this way, and keeps the throughput run as the guard.
+Noise floor, A/A on the M5 Max (2026-09-25, 6 pairs): the normalized ratio's CI
+within about ±1% at 8192 and ±0.6% on the resumed chunks, while the
+whole-chunk ratio drifted up to +1.8%. As a check of known size, `60`'s kernel
+steps read -10.0%, -9.3% and -11.9% with CIs about 1 point wide.
+
+**Pooling.** `ab_pool.py <kind> [--prefill <frontier> | --sections <shape>
+<groups>] <out dir>...` pools the pair ratios of several invocations. It covers
+decode by default, the prefill tokens/s of one frontier, or a section-time
+shape as the summary names it (`"prefill +2048"`). It prints the pooled n, the
+median and the bootstrap 95% CI, and leaves out the pairs the harness dropped.
 
 Two references, two tools:
 
@@ -77,7 +103,8 @@ Two references, two tools:
 |---|---|---|
 | Quality against the parent project | upstream at the child's merge-base | StarForge `tools/parity-check.sh sf-q3-8flash` |
 | Bitwise identity of a step | this child's `main` or the previous step | `ab_bench.py --bitwise` |
-| Speed of a step | this child's `main` or the previous step | `ab_bench.py` |
+| Speed of a step | this child's `main` or the previous step | `ab_bench.py`, pooled with `ab_pool.py` |
+| GPU time of a small prefill kernel step | the previous step | `ab_bench.py --sections <groups>` |
 
 The summary ends with a row for [perf-record.md](perf-record.md), which keeps
 where the performance work started and where it has got to.
