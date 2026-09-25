@@ -2703,43 +2703,48 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
     ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
 }
 
-/* MTP input staging: cat rows [rms(e)*g_e | 0] and [0 | rms(R_s)*g_h_s]
- * (full-row or per-stream RMS), then R_out = proj[0] + proj[1+s]. */
-static void test_mtp(arena_t *a, uint32_t E, uint32_t hc) {
+/* MTP input staging over T rows: cat rows [rms(e)*g_e | 0] and
+ * [0 | rms(R)*g_h_s] (one RMS over all streams), then R_out = proj[0] + proj[1+s]. */
+static void test_mtp(arena_t *a, uint32_t E, uint32_t hc, uint32_t T) {
     double *g_e, *g_h;
     const uint64_t g_e_off = arena_f32(a, E, &g_e, 0.5f, 1.5f);
     const uint64_t g_h_off = arena_f32(a, (uint64_t)hc * E, &g_h, 0.5f, 1.5f);
-    float *e = rand_vec(E, 1.0f);
-    float *R = rand_vec((uint64_t)hc * E, 1.0f);
-    float *proj = rand_vec((uint64_t)(hc + 1u) * E, 1.0f);
-    double *cat = calloc((uint64_t)(hc + 1u) * 2u * E, sizeof(double));
-    double *R_ref = malloc((uint64_t)hc * E * sizeof(double));
+    const uint64_t cat_n = (uint64_t)(hc + 1u) * 2u * E, proj_n = (uint64_t)(hc + 1u) * E, r_n = (uint64_t)hc * E;
+    float *e = rand_vec((uint64_t)T * E, 1.0f);
+    float *R = rand_vec(T * r_n, 1.0f);
+    float *proj = rand_vec(T * proj_n, 1.0f);
+    double *cat = calloc(T * cat_n, sizeof(double));
+    double *R_ref = malloc(T * r_n * sizeof(double));
     const double eps = 1e-6;
-    double ss = 0.0;
-    for (uint32_t i = 0; i < E; i++) ss += (double)e[i] * e[i];
-    double inv = 1.0 / sqrt(ss / E + eps);
-    for (uint32_t i = 0; i < E; i++) cat[i] = e[i] * inv * g_e[i];
-    double full = 0.0;
-    for (uint32_t i = 0; i < hc * E; i++) full += (double)R[i] * R[i];
-    inv = 1.0 / sqrt(full / ((double)hc * E) + eps);
-    for (uint32_t s = 0; s < hc; s++) {
-        for (uint32_t i = 0; i < E; i++) {
-            cat[(uint64_t)(s + 1u) * 2u * E + E + i] = R[s * E + i] * inv * g_h[s * E + i];
-            R_ref[s * E + i] = (double)proj[i] + proj[(s + 1u) * E + i];
+    for (uint32_t t = 0; t < T; t++) {
+        const float *et = e + (uint64_t)t * E, *Rt = R + t * r_n, *pt = proj + t * proj_n;
+        double *ct = cat + t * cat_n, *rt = R_ref + t * r_n;
+        double ss = 0.0;
+        for (uint32_t i = 0; i < E; i++) ss += (double)et[i] * et[i];
+        double inv = 1.0 / sqrt(ss / E + eps);
+        for (uint32_t i = 0; i < E; i++) ct[i] = et[i] * inv * g_e[i];
+        double full = 0.0;
+        for (uint32_t i = 0; i < hc * E; i++) full += (double)Rt[i] * Rt[i];
+        inv = 1.0 / sqrt(full / ((double)hc * E) + eps);
+        for (uint32_t s = 0; s < hc; s++) {
+            for (uint32_t i = 0; i < E; i++) {
+                ct[(uint64_t)(s + 1u) * 2u * E + E + i] = Rt[s * E + i] * inv * g_h[s * E + i];
+                rt[s * E + i] = (double)pt[i] + pt[(s + 1u) * E + i];
+            }
         }
     }
-    ds4_gpu_tensor *ge = upload(e, E);
-    ds4_gpu_tensor *gR = upload(R, (uint64_t)hc * E);
-    ds4_gpu_tensor *gcat = upload(NULL, (uint64_t)(hc + 1u) * 2u * E);
-    ds4_gpu_tensor *gproj = upload(proj, (uint64_t)(hc + 1u) * E);
-    ds4_gpu_tensor *gout = upload(NULL, (uint64_t)hc * E);
-    require_ok(ds4_gpu_qwen4_mtp_stage_tensor(gcat, ge, gR, a->base, a->size, g_e_off, g_h_off, E, hc, (float)eps), "mtp stage");
-    require_ok(ds4_gpu_qwen4_mtp_combine_tensor(gout, gproj, E, hc), "mtp combine");
+    ds4_gpu_tensor *ge = upload(e, (uint64_t)T * E);
+    ds4_gpu_tensor *gR = upload(R, T * r_n);
+    ds4_gpu_tensor *gcat = upload(NULL, T * cat_n);
+    ds4_gpu_tensor *gproj = upload(proj, T * proj_n);
+    ds4_gpu_tensor *gout = upload(NULL, T * r_n);
+    require_ok(ds4_gpu_qwen4_mtp_stage_tensor(gcat, ge, gR, a->base, a->size, g_e_off, g_h_off, T, E, hc, (float)eps), "mtp stage");
+    require_ok(ds4_gpu_qwen4_mtp_combine_tensor(gout, gproj, T, E, hc), "mtp combine");
     char name[96];
-    snprintf(name, sizeof(name), "mtp stage E=%u hc=%u", E, hc);
-    check_tensor(name, gcat, cat, (uint64_t)(hc + 1u) * 2u * E, 1e-5);
-    snprintf(name, sizeof(name), "mtp combine E=%u hc=%u", E, hc);
-    check_tensor(name, gout, R_ref, (uint64_t)hc * E, 1e-6);
+    snprintf(name, sizeof(name), "mtp stage E=%u hc=%u T=%u", E, hc, T);
+    check_tensor(name, gcat, cat, T * cat_n, 1e-5);
+    snprintf(name, sizeof(name), "mtp combine E=%u hc=%u T=%u", E, hc, T);
+    check_tensor(name, gout, R_ref, T * r_n, 1e-6);
     ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gproj); ds4_gpu_tensor_free(gcat); ds4_gpu_tensor_free(gR); ds4_gpu_tensor_free(ge);
     free(R_ref); free(cat); free(proj); free(R); free(e); free(g_e); free(g_h);
 }
@@ -3471,8 +3476,9 @@ int main(void) {
     test_multi_gemv(&arena, 2560, 2);
     test_multi_gemv(&arena, 64, 3);
     printf("mtp\n");
-    test_mtp(&arena, 2560, 4);
-    test_mtp(&arena, 64, 4);
+    test_mtp(&arena, 2560, 4, 1u);
+    test_mtp(&arena, 2560, 4, 7u);
+    test_mtp(&arena, 64, 4, 3u);
     test_hc_norm_reuse(&arena);
     test_gdn_prefill_dispatch();
     printf("all qwen4 kernel tests passed\n");

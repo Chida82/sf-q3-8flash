@@ -41012,32 +41012,33 @@ int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tensor *scratch
 int ds4_gpu_qwen4_mtp_stage_tensor(
         ds4_gpu_tensor *cat, const ds4_gpu_tensor *e, const ds4_gpu_tensor *R,
         const void *model_map, uint64_t model_size, uint64_t g_e_offset, uint64_t g_h_offset,
-        uint32_t n_embd, uint32_t n_hc, float eps) {
-    struct { uint32_t n_embd, n_hc, pad0; float eps; } args = { n_embd, n_hc, 0u, eps };
+        uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, float eps) {
+    struct { uint32_t n_embd, n_hc, n_tokens; float eps; } args = { n_embd, n_hc, n_tokens, eps };
     qwen4_bind b[5];
-    if (n_embd == 0 || n_hc == 0 ||
-        !qwen4_bind_tensor(&b[0], e, (uint64_t)n_embd * sizeof(float), "mtp embedding") ||
-        !qwen4_bind_tensor(&b[1], R, (uint64_t)n_embd * n_hc * sizeof(float), "mtp streams") ||
-        !qwen4_bind_weight(&b[2], model_map, model_size, g_e_offset, (uint64_t)n_embd * sizeof(float), "mtp enorm") ||
-        !qwen4_bind_weight(&b[3], model_map, model_size, g_h_offset, (uint64_t)n_embd * n_hc * sizeof(float),
-                           "mtp hnorm") ||
-        !qwen4_bind_tensor(&b[4], cat, (uint64_t)(n_hc + 1u) * 2u * n_embd * sizeof(float), "mtp concat")) {
+    const uint64_t emb_bytes = (uint64_t)n_embd * sizeof(float);
+    if (n_embd == 0 || n_hc == 0 || n_tokens == 0 ||
+        !qwen4_bind_tensor(&b[0], e, n_tokens * emb_bytes, "mtp embedding") ||
+        !qwen4_bind_tensor(&b[1], R, n_tokens * n_hc * emb_bytes, "mtp streams") ||
+        !qwen4_bind_weight(&b[2], model_map, model_size, g_e_offset, emb_bytes, "mtp enorm") ||
+        !qwen4_bind_weight(&b[3], model_map, model_size, g_h_offset, n_hc * emb_bytes, "mtp hnorm") ||
+        !qwen4_bind_tensor(&b[4], cat, n_tokens * (n_hc + 1u) * 2u * emb_bytes, "mtp concat")) {
         return 0;
     }
     return qwen4_dispatch(QWEN4_K_MTP_STAGE, &args, sizeof(args), b, 5,
-                          MTLSizeMake(n_hc + 1u, 1, 1), MTLSizeMake(256, 1, 1), 0);
+                          MTLSizeMake(n_hc + 1u, n_tokens, 1), MTLSizeMake(256, 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_mtp_combine_tensor(
-        ds4_gpu_tensor *R_out, const ds4_gpu_tensor *proj, uint32_t n_embd, uint32_t n_hc) {
-    struct { uint32_t n_embd, n_hc; } args = { n_embd, n_hc };
+        ds4_gpu_tensor *R_out, const ds4_gpu_tensor *proj, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc) {
+    struct { uint32_t n_embd, n_hc, n_tokens; } args = { n_embd, n_hc, n_tokens };
     qwen4_bind b[2];
-    if (n_embd == 0 || n_hc == 0 ||
-        !qwen4_bind_tensor(&b[0], proj, (uint64_t)(n_hc + 1u) * n_embd * sizeof(float), "mtp projection") ||
-        !qwen4_bind_tensor(&b[1], R_out, (uint64_t)n_embd * n_hc * sizeof(float), "mtp residual")) {
+    const uint64_t emb_bytes = (uint64_t)n_embd * sizeof(float);
+    if (n_embd == 0 || n_hc == 0 || n_tokens == 0 ||
+        !qwen4_bind_tensor(&b[0], proj, n_tokens * (n_hc + 1u) * emb_bytes, "mtp projection") ||
+        !qwen4_bind_tensor(&b[1], R_out, n_tokens * n_hc * emb_bytes, "mtp residual")) {
         return 0;
     }
-    const uint32_t n = n_embd * n_hc;
+    const uint64_t n = (uint64_t)n_tokens * n_embd * n_hc;
     return qwen4_dispatch(QWEN4_K_MTP_COMBINE, &args, sizeof(args), b, 2,
                           MTLSizeMake((n + 255u) / 256u, 1, 1), MTLSizeMake(256, 1, 1), 0);
 }

@@ -2322,9 +2322,9 @@ int ds4_gpu_qwen4_hc_mix_rows_tensor(ds4_gpu_tensor *mixed, const ds4_gpu_tensor
 int ds4_gpu_qwen4_mtp_stage_tensor(
         ds4_gpu_tensor *cat, const ds4_gpu_tensor *e, const ds4_gpu_tensor *R,
         const void *model_map, uint64_t model_size, uint64_t g_e_offset, uint64_t g_h_offset,
-        uint32_t n_embd, uint32_t n_hc, float eps);
+        uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, float eps);
 int ds4_gpu_qwen4_mtp_combine_tensor(
-        ds4_gpu_tensor *R_out, const ds4_gpu_tensor *proj, uint32_t n_embd, uint32_t n_hc);
+        ds4_gpu_tensor *R_out, const ds4_gpu_tensor *proj, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc);
 
 /* sf-ablate(build): C++ linkage guard removed; this child has no C++ translation unit. */
 

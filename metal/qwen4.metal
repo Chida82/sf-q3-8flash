@@ -4455,28 +4455,31 @@ kernel void kernel_qwen4_hc_mix_rows(
 struct ds4_metal_args_qwen4_mtp_stage {
     uint32_t n_embd;
     uint32_t n_hc;
-    uint32_t pad0;
+    uint32_t n_tokens;
     float    eps;
 };
 
 /* Rows of the concat input for the fused [W_e | W_h] projection: row 0 is
  * [e/rms(e) * g_e | 0], row 1+s is [0 | R_s/rms(R) * g_h[s]] with one RMS
- * over all hc streams.  One threadgroup per row. */
+ * over all hc streams.  One threadgroup per row and token. */
 kernel void kernel_qwen4_mtp_stage(
         constant ds4_metal_args_qwen4_mtp_stage & args,
-        device const float *e,          /* [E] next-token embedding */
-        device const float *R,          /* [hc*E] pre-mixer streams */
+        device const float *e,          /* [T][E] next-token embeddings */
+        device const float *R,          /* [T][hc*E] pre-mixer streams */
         device const float *g_e,        /* [E] */
         device const float *g_h,        /* [hc*E] */
-        device float       *cat,        /* [1+hc][2E] */
+        device float       *cat,        /* [T][1+hc][2E] */
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tid [[thread_index_in_threadgroup]],
         ushort3 ntg [[threads_per_threadgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]]) {
-    const uint row = tgpig.x;
-    if (row > args.n_hc) return;
+    const uint row = tgpig.x, t = tgpig.y;
+    if (row > args.n_hc || t >= args.n_tokens) return;
     const uint E = args.n_embd;
+    e += (uint64_t)t * E;
+    R += (uint64_t)t * args.n_hc * E;
+    cat += (uint64_t)t * (args.n_hc + 1u) * 2u * E;
     const uint nth = ntg.x;
     const uint nsg = nth / 32;
     threadgroup float red[32];
@@ -4505,19 +4508,23 @@ kernel void kernel_qwen4_mtp_stage(
 struct ds4_metal_args_qwen4_mtp_combine {
     uint32_t n_embd;
     uint32_t n_hc;
+    uint32_t n_tokens;
 };
 
-/* R_out[s][d] = proj[0][d] + proj[1+s][d] */
+/* R_out[t][s][d] = proj[t][0][d] + proj[t][1+s][d] */
 kernel void kernel_qwen4_mtp_combine(
         constant ds4_metal_args_qwen4_mtp_combine & args,
-        device const float *proj,       /* [1+hc][E] */
-        device float       *R_out,      /* [hc*E] */
+        device const float *proj,       /* [T][1+hc][E] */
+        device float       *R_out,      /* [T][hc*E] */
         uint gid [[thread_position_in_grid]]) {
-    const uint E = args.n_embd;
-    if (gid >= E * args.n_hc) return;
-    const uint s = gid / E;
-    const uint d = gid - s * E;
-    R_out[gid] = proj[d] + proj[(uint64_t)(s + 1u) * E + d];
+    const uint E = args.n_embd, per = E * args.n_hc;
+    const uint t = gid / per;
+    if (t >= args.n_tokens) return;
+    const uint r = gid - t * per;
+    const uint s = r / E;
+    const uint d = r - s * E;
+    device const float *p = proj + (uint64_t)t * (args.n_hc + 1u) * E;
+    R_out[gid] = p[d] + p[(uint64_t)(s + 1u) * E + d];
 }
 
 /* --- decode-path fusions ------------------------------------------------ */
