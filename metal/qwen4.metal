@@ -3533,9 +3533,10 @@ static inline void qwen4_mm_stage16(device const char *row, uint b, uint q0, uin
  * 16 nibble bytes of the quarter pair; Q2_K keeps d|dmin, the group's scale
  * nibble and the 16 bit-plane bytes of its group pair; IQ2XXS keeps d, the
  * 32-bit grid indices and the sign/scale word of the block; MXFP4 keeps the
- * 17 block bytes. */
-struct qwen4_raw16 { uint4 h; uint4 q; uchar m[17]; };
-static inline qwen4_raw16 qwen4_load_raw16(device const char *row, uint b, uint q0, uint type) {
+ * scale byte in h.x and the 16 quant bytes in q.  nb is the row's block
+ * count. */
+struct qwen4_raw16 { uint4 h; uint4 q; };
+static inline qwen4_raw16 qwen4_load_raw16(device const char *row, uint b, uint q0, uint type, uint nb) {
     qwen4_raw16 r;
     if (type == 12) {
         const uint sb = b / 8, group = b % 8;
@@ -3560,10 +3561,37 @@ static inline qwen4_raw16 qwen4_load_raw16(device const char *row, uint b, uint 
         r.h.z = auxs >> 16;
     } else {
         device const uchar *blk = (device const uchar *)(row + (uint64_t)b * 17);
+        if (b > 0 && b + 1 < nb) {
+            /* the 5 aligned words around the 17 bytes, which stay inside the
+             * row for every block but its first and last */
+            const uint o = (uint)(reinterpret_cast<ulong>(blk) & 3ul), sh = 8u * (o + 1u);
+            device const uint *w = (device const uint *)(blk - o);
+            const uint w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3], w4 = w[4];
+            r.h.x = (w0 >> (8u * o)) & 0xFFu;
+            r.q = uint4((uint)((((ulong)w1 << 32) | w0) >> sh), (uint)((((ulong)w2 << 32) | w1) >> sh),
+                        (uint)((((ulong)w3 << 32) | w2) >> sh), (uint)((((ulong)w4 << 32) | w3) >> sh));
+        } else {
+            r.h.x = blk[0];
 #pragma unroll
-        for (uint i = 0; i < 17; i++) r.m[i] = blk[i];
+            for (uint i = 0; i < 4; i++)
+                r.q[i] = (uint)blk[1 + 4 * i] | ((uint)blk[2 + 4 * i] << 8) | ((uint)blk[3 + 4 * i] << 16) | ((uint)blk[4 + 4 * i] << 24);
+        }
     }
     return r;
+}
+/* The register prefetch of K step b into r, which holds step b - 1: a Q4_K
+ * thread's header serves the 8 groups of its super-block and its quant bytes
+ * both groups of a pair (low and high nibbles), so only the words that change
+ * are loaded. */
+static inline void qwen4_load_raw16_next(thread qwen4_raw16 &r, device const char *row, uint b, uint q0, uint type, uint nb) {
+    if (type == 12) {
+        const uint group = b % 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 144);
+        if (group == 0) r.h = *(device const uint4 *)blk;
+        if ((group & 1u) == 0) r.q = *(device const uint4 *)(blk + 16 + (group >> 1) * 32 + q0 * 8);
+        return;
+    }
+    r = qwen4_load_raw16(row, b, q0, type, nb);
 }
 static inline void qwen4_dequant_raw16(qwen4_raw16 r, uint b, uint q0, uint type, threadgroup half *dst) {
     if (type == 12) {
@@ -3606,10 +3634,10 @@ static inline void qwen4_dequant_raw16(qwen4_raw16 r, uint b, uint q0, uint type
         }
         return;
     }
-    const float d = ds4_metal_e8m0_to_f32(r.m[0]);
+    const float d = ds4_metal_e8m0_to_f32((uchar)r.h.x);
     const bool hi = q0 >= 2;
     for (uint i = 0; i < 16; i++) {
-        const uint byte = r.m[1 + i];
+        const uint byte = (r.q[i >> 2] >> (8u * (i & 3u))) & 0xFFu;
         dst[i] = (half)(d * ds4_metal_mxfp4_values[hi ? (byte >> 4) : (byte & 0xfu)]);
     }
 }
@@ -3879,8 +3907,10 @@ kernel void kernel_qwen4_rows_f32_to_f16(
  * matmul's accumulation order differs, so outputs are close to, not
  * identical with, kernel_qwen4_moe_mm_mid/down (test_moe_mm_tiles_exact
  * bounds the difference).  With tail_base 64 (function constant 905) the
- * 64-token kernel keeps the full tiles and the 32-token kernel takes a
- * remainder of at most 32 tokens.  The activation operand comes pre-rounded to half
+ * 64-token kernel keeps the full tiles and each expert's remainder goes to
+ * the narrowest kernel that holds it: 64 or 32 tokens, and for the half
+ * operands 16 or 8; the tile width does not change the bits a token gets
+ * (test_moe_mm_tiles_exact, nax=1 against nax=2).  The activation operand comes pre-rounded to half
  * (kernel_qwen4_rows_f32_to_f16, one pass per call), so each K step gathers
  * 16 bytes per item; the mid epilogue also writes the half copy of `mid`
  * that the down tiles read.  The mid epilogue applies SiLU(gate)*up on the
@@ -3930,7 +3960,7 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     constexpr int NR0 = 64, NK = 32;
-    constexpr int NB = NR1 * 4 / 128;   /* B staging items per thread (token, 8-wide k slice) */
+    constexpr int NB = (NR1 * 4 + 127) / 128;   /* B staging items per thread (token, 8-wide k slice) */
     using BT = typename qwen4_nax_btype<COMP, XT>::type;
     uint rb, tile0;
     if (args.expert_major) { const uint n_rb = (args.out_rows + NR0 - 1u) / NR0; rb = tgpig.x % n_rb; tile0 = tgpig.x / n_rb; }
@@ -3942,8 +3972,9 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
      * 32-token kernel takes a remainder of at most 32 tokens */
     uint work_count = count, work_start = 0;
     if (qwen4_moe_tail_base) {
+        constexpr bool narrow = !COMP && is_same<XT, half>::value;   /* half tiles also have 16- and 8-token tails */
         const uint remainder = count % qwen4_moe_tail_base;
-        const uint tail_tt = remainder <= 32u ? 32u : 64u;
+        const uint tail_tt = remainder > 32u ? 64u : !narrow || remainder > 16u ? 32u : remainder > 8u ? 16u : 8u;
         if ((uint)NR1 < qwen4_moe_tail_base) {
             if (!remainder || tail_tt != (uint)NR1) return;
             work_start = count - remainder;
@@ -3994,7 +4025,7 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
         const bool a_row = row0 + ar < args.out_rows;
         device const char *grow = gbase + (uint64_t)(row0 + min(ar, args.out_rows - 1u)) * args.row_bytes;
         device const char *urow = ubase + (uint64_t)(row0 + min(ar, args.out_rows - 1u)) * args.row_bytes;
-        qwen4_raw16 rg = qwen4_load_raw16(grow, 0, aq * 2, type), ru = qwen4_load_raw16(urow, 0, aq * 2, type);
+        qwen4_raw16 rg = qwen4_load_raw16(grow, 0, aq * 2, type, nk), ru = qwen4_load_raw16(urow, 0, aq * 2, type, nk);
         for (uint kb = 0; kb < nk; kb++) {
             {
                 threadgroup half *dg = Ag + ar * NK + aq * 16;
@@ -4005,10 +4036,11 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
                 } else {
                     for (uint i = 0; i < 16; i++) { dg[i] = 0.0h; du[i] = 0.0h; }
                 }
-                if (kb + 1 < nk) { rg = qwen4_load_raw16(grow, kb + 1, aq * 2, type); ru = qwen4_load_raw16(urow, kb + 1, aq * 2, type); }
+                if (kb + 1 < nk) { qwen4_load_raw16_next(rg, grow, kb + 1, aq * 2, type, nk); qwen4_load_raw16_next(ru, urow, kb + 1, aq * 2, type, nk); }
             }
 #pragma unroll
             for (int b = 0; b < NB; b++) {
+                if (NR1 < 32 && tid >= NR1 * 4) break;   /* the 16- and 8-token tiles stage fewer items than threads */
                 if constexpr (COMP) {
                     /* stage xh and the residual xr: x = xh + xr to ~2^-22 relative */
                     if (xr[b]) {
@@ -4089,7 +4121,7 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     constexpr int NR0 = 64, NK = 32;
-    constexpr int NB = NR1 * 4 / 128;
+    constexpr int NB = (NR1 * 4 + 127) / 128;
     uint rb, tile0;
     if (args.expert_major) { const uint n_rb = (args.out_rows + NR0 - 1u) / NR0; rb = tgpig.x % n_rb; tile0 = tgpig.x / n_rb; }
     else { rb = tgpig.x; tile0 = tgpig.z; }
@@ -4100,8 +4132,9 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
      * 32-token kernel takes a remainder of at most 32 tokens */
     uint work_count = count, work_start = 0;
     if (qwen4_moe_tail_base) {
+        constexpr bool narrow = !COMP && is_same<XT, half>::value;   /* half tiles also have 16- and 8-token tails */
         const uint remainder = count % qwen4_moe_tail_base;
-        const uint tail_tt = remainder <= 32u ? 32u : 64u;
+        const uint tail_tt = remainder > 32u ? 64u : !narrow || remainder > 16u ? 32u : remainder > 8u ? 16u : 8u;
         if ((uint)NR1 < qwen4_moe_tail_base) {
             if (!remainder || tail_tt != (uint)NR1) return;
             work_start = count - remainder;
@@ -4149,16 +4182,17 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const bool a_row = row0 + ar < args.out_rows;
         device const char *drow = dbase + (uint64_t)(row0 + min(ar, args.out_rows - 1u)) * args.row_bytes;
-        qwen4_raw16 rd = qwen4_load_raw16(drow, 0, aq * 2, type);
+        qwen4_raw16 rd = qwen4_load_raw16(drow, 0, aq * 2, type, nk);
         for (uint kb = 0; kb < nk; kb++) {
             {
                 threadgroup half *dd = As + ar * NK + aq * 16;
                 if (a_row) qwen4_dequant_raw16(rd, kb, aq * 2, type, dd);
                 else for (uint i = 0; i < 16; i++) dd[i] = 0.0h;
-                if (kb + 1 < nk) rd = qwen4_load_raw16(drow, kb + 1, aq * 2, type);
+                if (kb + 1 < nk) qwen4_load_raw16_next(rd, drow, kb + 1, aq * 2, type, nk);
             }
 #pragma unroll
             for (int b = 0; b < NB; b++) {
+                if (NR1 < 32 && tid >= NR1 * 4) break;   /* the 16- and 8-token tiles stage fewer items than threads */
                 if constexpr (COMP) {
                     /* stage the half operand and its residual separately */
                     *(threadgroup uint4 *)bdst[b] = mr[b] ? *(device const uint4 *)(mr[b] + kb * NK) : uint4(0u);
@@ -4202,6 +4236,10 @@ template [[host_name("kernel_qwen4_moe_mm_mid_nax")]] kernel void kernel_qwen4_m
 template [[host_name("kernel_qwen4_moe_mm_mid_nax64")]] kernel void kernel_qwen4_moe_mm_mid_nax_t<64, half, false>(QWEN4_NAX_MID_SIG_HALF);
 template [[host_name("kernel_qwen4_moe_mm_down_nax")]] kernel void kernel_qwen4_moe_mm_down_nax_t<32, half, false>(QWEN4_NAX_DOWN_SIG_HALF);
 template [[host_name("kernel_qwen4_moe_mm_down_nax64")]] kernel void kernel_qwen4_moe_mm_down_nax_t<64, half, false>(QWEN4_NAX_DOWN_SIG_HALF);
+template [[host_name("kernel_qwen4_moe_mm_mid_nax16")]] kernel void kernel_qwen4_moe_mm_mid_nax_t<16, half, false>(QWEN4_NAX_MID_SIG_HALF);
+template [[host_name("kernel_qwen4_moe_mm_down_nax16")]] kernel void kernel_qwen4_moe_mm_down_nax_t<16, half, false>(QWEN4_NAX_DOWN_SIG_HALF);
+template [[host_name("kernel_qwen4_moe_mm_mid_nax8")]] kernel void kernel_qwen4_moe_mm_mid_nax_t<8, half, false>(QWEN4_NAX_MID_SIG_HALF);
+template [[host_name("kernel_qwen4_moe_mm_down_nax8")]] kernel void kernel_qwen4_moe_mm_down_nax_t<8, half, false>(QWEN4_NAX_DOWN_SIG_HALF);
 template [[host_name("kernel_qwen4_moe_mm_mid_naxf")]] kernel void kernel_qwen4_moe_mm_mid_nax_t<32, float, false>(QWEN4_NAX_MID_SIG_FLOAT);
 template [[host_name("kernel_qwen4_moe_mm_mid_naxf64")]] kernel void kernel_qwen4_moe_mm_mid_nax_t<64, float, false>(QWEN4_NAX_MID_SIG_FLOAT);
 template [[host_name("kernel_qwen4_moe_mm_down_naxf")]] kernel void kernel_qwen4_moe_mm_down_nax_t<32, float, false>(QWEN4_NAX_DOWN_SIG_FLOAT);

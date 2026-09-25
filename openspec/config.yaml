@@ -32,7 +32,22 @@ context: |
   adds; no step is kept as neutral because a later step builds on it. A step
   that adds a tool and claims no speed needs bitwise output and no metric
   below zero. An inconclusive run is repeated once with a longer budget on
-  the kinds that decide it. Work never happens on main:
+  the kinds that decide it.
+  A prefill step that changes kernels and whose predicted end-to-end effect
+  is below the harness's resolution (a few percent) is decided on GPU time
+  instead: ABBA pairs of DS4_QWEN4_TIMING=2 runs on the harness's prompts and
+  frontiers, taking per chunk the time of the sections the step targets
+  divided by the time of the sections it does not touch, which cancels the
+  clock drift between runs, pooled with a bootstrap 95% CI. It is kept when
+  that ratio's CI lies below one at a shape the step targets and above one at
+  none; the harness then runs once as the guard (bitwise output, no
+  throughput metric wholly below zero). A step that changes scheduling or
+  overlap between kernels stays on the harness, since the section cuts hide
+  overlap. Until speed-bench/ab_bench.py has such a sections mode, which also
+  pools its own runs, the first change that needs it adds the mode as its
+  first, tool step. Why: in 60-q4-expert-prefill a no-op step read prefill
+  8192 +3% with a CI wholly above zero, while the section times resolved
+  every step. Work never happens on main:
   main is only read, through a worktree.
   Code a change ports (from an upstream PR or elsewhere) or writes is not
   final as it first lands. Every change that adds code plans two reviews
@@ -42,7 +57,8 @@ context: |
   idiom, deletes what the change made dead, and recovers missed speed. It
   applies what pays in correctness, speed or reading cost, keeping output
   identical (bitwise where the change claims it). The refinements are
-  measured like a step and committed as their own commit.
+  measured like a step. A change lands on main as one signed commit that
+  includes its refinements.
 
 # Per-artifact rules (optional)
 # Add custom rules for specific artifacts.

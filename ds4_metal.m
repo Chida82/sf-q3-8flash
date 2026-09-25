@@ -39083,6 +39083,10 @@ enum {
     QWEN4_K_MOE_MM_DOWN_NAX,
     QWEN4_K_MOE_MM_MID_NAX64,
     QWEN4_K_MOE_MM_DOWN_NAX64,
+    QWEN4_K_MOE_MM_MID_NAX16,
+    QWEN4_K_MOE_MM_DOWN_NAX16,
+    QWEN4_K_MOE_MM_MID_NAX8,
+    QWEN4_K_MOE_MM_DOWN_NAX8,
     QWEN4_K_MOE_MM_MID_NAXF,
     QWEN4_K_MOE_MM_DOWN_NAXF,
     QWEN4_K_MOE_MM_MID_NAXF64,
@@ -39189,6 +39193,10 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_mm_down_nax",
     "kernel_qwen4_moe_mm_mid_nax64",
     "kernel_qwen4_moe_mm_down_nax64",
+    "kernel_qwen4_moe_mm_mid_nax16",
+    "kernel_qwen4_moe_mm_down_nax16",
+    "kernel_qwen4_moe_mm_mid_nax8",
+    "kernel_qwen4_moe_mm_down_nax8",
     "kernel_qwen4_moe_mm_mid_naxf",
     "kernel_qwen4_moe_mm_down_naxf",
     "kernel_qwen4_moe_mm_mid_naxf64",
@@ -40871,9 +40879,15 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
                             MTLSizeMake(128, 1, 1), nax == 64u ? 16384u : nax_fx || nax_comp ? 12288u : 10240u)) return 0;
         if (!nax_tails) return 1;
         args.tiles_per_launch = 1;
-        return qwen4_dispatch(nax_mid_tail, &args, sizeof(args), b, nax_comp ? 8 : 7,
-                              qwen4_moe_mm_grid((ff_dim + 63u) / 64u, n_expert, 1, args.expert_major),
-                              MTLSizeMake(128, 1, 1), nax_fx || nax_comp ? 12288u : 10240u);
+        const MTLSize tail_grid = qwen4_moe_mm_grid((ff_dim + 63u) / 64u, n_expert, 1, args.expert_major);
+        const uint32_t tail_shmem = nax_fx || nax_comp ? 12288u : 10240u;
+        if (!qwen4_dispatch(nax_mid_tail, &args, sizeof(args), b, nax_comp ? 8 : 7, tail_grid,
+                            MTLSizeMake(128, 1, 1), tail_shmem)) return 0;
+        /* the half tiles take remainders of at most 16 and 8 tokens in
+         * narrower tiles */
+        return nax_fx || nax_comp ||
+               (qwen4_dispatch(QWEN4_K_MOE_MM_MID_NAX16, &args, sizeof(args), b, 7, tail_grid, MTLSizeMake(128, 1, 1), tail_shmem) &&
+                qwen4_dispatch(QWEN4_K_MOE_MM_MID_NAX8, &args, sizeof(args), b, 7, tail_grid, MTLSizeMake(128, 1, 1), tail_shmem));
     }
     if (!qwen4_dispatch(kernel, &args, sizeof(args), b, 6,
                           qwen4_moe_mm_grid((ff_dim + 31u) / 32u, n_expert, tiles, args.expert_major),
@@ -40955,9 +40969,12 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
                             MTLSizeMake(128, 1, 1), nax == 64u ? 16384u : 8192u)) return 0;
         if (!nax_tails) return 1;
         args.tiles_per_launch = 1;
-        return qwen4_dispatch(nax_down_tail, &args, sizeof(args), b, nax_comp ? 6 : 5,
-                              qwen4_moe_mm_grid((out_dim + 63u) / 64u, n_expert, 1, args.expert_major),
-                              MTLSizeMake(128, 1, 1), 8192u);
+        const MTLSize tail_grid = qwen4_moe_mm_grid((out_dim + 63u) / 64u, n_expert, 1, args.expert_major);
+        if (!qwen4_dispatch(nax_down_tail, &args, sizeof(args), b, nax_comp ? 6 : 5, tail_grid,
+                            MTLSizeMake(128, 1, 1), 8192u)) return 0;
+        return nax_fx || nax_comp ||
+               (qwen4_dispatch(QWEN4_K_MOE_MM_DOWN_NAX16, &args, sizeof(args), b, 5, tail_grid, MTLSizeMake(128, 1, 1), 8192u) &&
+                qwen4_dispatch(QWEN4_K_MOE_MM_DOWN_NAX8, &args, sizeof(args), b, 5, tail_grid, MTLSizeMake(128, 1, 1), 8192u));
     }
     if (!qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
                           qwen4_moe_mm_grid((out_dim + 31u) / 32u, n_expert, tiles, args.expert_major),

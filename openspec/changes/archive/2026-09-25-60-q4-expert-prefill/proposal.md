@@ -4,7 +4,8 @@
 
 Prefill is compute-bound, and no upstream PR speeds it up for the Q4 model on
 M5. On M5 the expert matmuls always use the Metal-4 tensor tiles `_nax64`
-(64 rows × 64 tokens, K step 32) with half activations (default level 2,
+(64 rows × 64 tokens, K step 32, and a 32-token kernel for remainders of
+at most 32) with half activations (default level 2,
 `qwen4_moe_mm_nax_level`). Three costs remain:
 
 - **Redundant loads.**
@@ -12,9 +13,10 @@ M5. On M5 the expert matmuls always use the Metal-4 tensor tiles `_nax64`
     only 8 B of the quants are live nibbles. Both threads of a row reload the
     same header on all 8 K steps of a super-block.
   - MXFP4 staging issues 17 single-byte loads, duplicated across both threads.
-- **Serial staging.** The threadgroup A/B tiles are single-buffered, so each
-  K step runs dequant -> store -> barrier -> matmul in sequence. ALU dequant
-  never overlaps the tensor units.
+- **Serial staging.** The raw words of K step k+1 are already prefetched
+  into registers, so load latency overlaps. But the threadgroup A/B tiles are
+  single-buffered: each K step runs dequant -> store -> barrier -> matmul ->
+  barrier in sequence, and ALU dequant never overlaps the tensor units.
 - **Padding.** The tile width follows total T, not tokens per expert. With the
   disk KV cache, a typical turn prefills only a new suffix. At 512-2048 new
   tokens an expert receives about 10-40 tokens, so 64- or 32-token tiles can be
@@ -28,10 +30,14 @@ tiles. An item that cannot is dropped, not tuned toward a tolerance.
 
 In this order:
 
-1. **O5, header held in registers.** Keep the Q4_K header in registers and
-   reload it every 8 K steps, and stage MXFP4 with packed word loads. Staging
-   bytes drop from about 32 to about 18 per 16 values. Same values reach the
-   same tensor op, so bitwise identical.
+0. **S0, tool.** Cut `moe_mid` and `moe_down` in the tile path too, so
+   `DS4_QWEN4_TIMING=2` splits prefill MoE time; pin the tile kernels'
+   output bits at a small-count shape.
+1. **O5, fewer staging loads.** O5a keeps the Q4_K header in registers
+   (reloaded every 8 K steps) and the quant words for both groups of a pair
+   (reloaded every 2): about 32 to about 10 bytes per 16 values. O5b stages
+   MXFP4 with aligned word loads instead of 17 byte loads. Same values reach
+   the same tensor op, so bitwise identical.
 2. **O6, double-buffered staging.** Two A/B tile buffers per threadgroup: the
    dequant of K step k+1 overlaps the tensor op on step k. The `matmul2d` shape
    (64×64, K 32) and the K order stay as they are, so each tensor op receives
@@ -73,8 +79,10 @@ None.
 
 - `kernel_qwen4_moe_mm_mid_nax_t` and `kernel_qwen4_moe_mm_down_nax_t`,
   `qwen4_load_raw16` and `qwen4_dequant_raw16` in `metal/qwen4.metal`.
-- Tile selection in `ds4_metal.m`; path selection in `ds4.c` (about lines
-  32500-32590).
-- `20-perf-bench-harness` must report prefill at 512, 2048 and 8192 new tokens,
-  and its bit-exact frontier-logits check is the acceptance gate for each item.
+- Tile selection in `ds4_metal.m`; path selection in `ds4.c` (`mm_min`, about line
+  32554).
+- `speed-bench/ab_bench.py` already reports prefill at 8192, +512 and +2048
+  (plain) and 2048 (MTP kinds); its bit-exact frontier-logits check is the
+  acceptance gate for each item, with the kernel-test hashes pinned in S0.
+- `tests/test_qwen4_kernels.c`: one more shape for the tile test (S0).
 - No format or API change.

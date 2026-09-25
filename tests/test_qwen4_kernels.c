@@ -2466,8 +2466,8 @@ static void test_moe_mm_tiles_iq2(arena_t *a) {
     ds4_gpu_tensor_free(gmid); ds4_gpu_tensor_free(gpart);
 }
 
-static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
-    const uint32_t T = 641, E = 256, F = 256, NE = 4, slots = 2, n_out = 3, list_cap = T + 7, guard = 16;
+static void test_moe_mm_tiles_exact(arena_t *a, uint32_t T, uint32_t down_type) {
+    const uint32_t E = 256, F = 256, NE = 4, slots = 2, n_out = 3, list_cap = T + 7, guard = 16;
     const uint64_t mid_n = (uint64_t)T * n_out * F, part_n = (uint64_t)T * n_out * E;
     const char *env_names[] = {"DS4_QWEN4_MOE_MID_TILES", "DS4_QWEN4_MOE_DOWN_TILES", "DS4_QWEN4_MOE_MM_NAX"};
     char *saved_env[3];
@@ -2596,11 +2596,14 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
         unsetenv("DS4_QWEN4_MOE_MID_NT");
         unsetenv("DS4_QWEN4_MOE_TAILS");
     }
+    float *w32_mid[2] = {NULL, NULL}, *w32_part[2] = {NULL, NULL};   /* levels 1 and 3: 32-token tiles only */
     if (down_type == 39u) for (uint32_t nax = 1; nax <= 5; nax++) {
         /* tensor-op tiles of 32/64 tokens, half (1/2), float (3/4) or
          * compensated (5) activation operands: cooperative accumulation;
          * bound the drift against the simdgroup tiles and print the
-         * exact-reference error */
+         * exact-reference error.  The tile width must not change the bits
+         * a token gets: level 2 (64-token tiles with, on M5, 32/16/8-token
+         * tails) must equal level 1, and level 4 level 3, byte for byte. */
         char nax_str[4]; snprintf(nax_str, sizeof(nax_str), "%u", nax);
         for (uint32_t i = 0; i < 2; i++) setenv(env_names[i], "8", 1);
         setenv("DS4_QWEN4_MOE_MM_NAX", nax_str, 1);
@@ -2621,7 +2624,7 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
             {
                 uint64_t h = 1469598103934665603ull;
                 for (uint64_t i = 0; i < mid_n; i++) { uint32_t u; memcpy(&u, &got_mid[i], 4); h = (h ^ u) * 1099511628211ull; }
-                printf("  MoE nax=%u mid: max|d|=%.3e (scale %.3e) hash=%016llx\n", nax, worst, scale, (unsigned long long)h);
+                printf("  MoE nax=%u T=%u mid: max|d|=%.3e (scale %.3e) hash=%016llx\n", nax, T, worst, scale, (unsigned long long)h);
             }
             {
                 double eworst = 0.0, esum = 0.0;
@@ -2648,7 +2651,7 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
             {
                 uint64_t h = 1469598103934665603ull;
                 for (uint64_t i = 0; i < part_n; i++) { uint32_t u; memcpy(&u, &got_part[i], 4); h = (h ^ u) * 1099511628211ull; }
-                printf("  MoE nax=%u down: max|d|=%.3e (scale %.3e) hash=%016llx\n", nax, worst, scale, (unsigned long long)h);
+                printf("  MoE nax=%u T=%u down: max|d|=%.3e (scale %.3e) hash=%016llx\n", nax, T, worst, scale, (unsigned long long)h);
             }
             {
                 double eworst = 0.0, esum = 0.0;
@@ -2660,12 +2663,25 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
                 }
                 printf("  MoE nax=%u down vs exact: max=%.3e mean=%.3e\n", nax, eworst, esum / (double)part_n);
             }
-            free(got_mid); free(got_part);
+            if (nax == 1 || nax == 3) {
+                w32_mid[nax / 3] = got_mid; w32_part[nax / 3] = got_part;
+            } else {
+                if ((nax == 2 || nax == 4) && w32_mid[nax / 4]) {
+                    char name[96];
+                    snprintf(name, sizeof(name), "MoE nax=%u T=%u mid vs 32-token tiles", nax, T);
+                    check_exact_f32(name, got_mid, w32_mid[nax / 4], mid_n);
+                    snprintf(name, sizeof(name), "MoE nax=%u T=%u down vs 32-token tiles", nax, T);
+                    check_exact_f32(name, got_part, w32_part[nax / 4], part_n);
+                    printf("  MoE nax=%u T=%u: byte-exact mid/down vs nax=%u (32-token tiles)\n", nax, T, nax - 1);
+                }
+                free(got_mid); free(got_part);
+            }
         } else {
             printf("  MoE nax: tensor API unavailable, skipped\n");
         }
         unsetenv("DS4_QWEN4_MOE_MM_NAX");
     }
+    for (uint32_t i = 0; i < 2; i++) { free(w32_mid[i]); free(w32_part[i]); }
     if (down_type == 39u) {
         /* error decomposition on a dyadic Q4_K fixture: the dequantized
          * weights are exactly representable in half, so the simdgroup path's
@@ -3491,8 +3507,14 @@ int main(void) {
     test_q4k_ordered_exact(&arena, 2, 640, false);
     test_q4k_ordered_exact(&arena, 1, 641, false);
     test_q4k_ordered_exact(&arena, 2, 641, true);
-    test_moe_mm_tiles_exact(&arena, 8u);
-    test_moe_mm_tiles_exact(&arena, 39u);
+    test_moe_mm_tiles_exact(&arena, 641, 8u);
+    test_moe_mm_tiles_exact(&arena, 641, 39u);
+    /* expert remainders at the default level on M5: T 641 gives 1 (the
+     * 8-token tail), T 75 gives 11 (16-token tail) and 38/37 (partial
+     * 64-token tiles), T 161 gives 33/17/16 (the band edges of the 64-,
+     * 32- and 16-token tiles) */
+    test_moe_mm_tiles_exact(&arena, 75, 39u);
+    test_moe_mm_tiles_exact(&arena, 161, 39u);
     test_moe_mm_tiles_iq2(&arena);
     printf("dense mm\n");
     test_dense_mm(&arena, 2560, 512, 37, 0u);

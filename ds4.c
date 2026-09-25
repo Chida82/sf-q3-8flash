@@ -32505,7 +32505,9 @@ static bool qwen4_graph_attention_cache(ds4_qwen4_gpu_graph *g, const ds4_model 
 }
 
 /* DS4_QWEN4_TIMING=2 stage groups in forward order; moe_mid and moe_down are
- * carved out of moe on the per-token expert path. */
+ * carved out of moe on the tiled path (routed experts) and on the per-token
+ * path (with the shared expert's slot for T <= 8); the grouped path is not
+ * split. */
 enum { QWEN4_PROF_PLE, QWEN4_PROF_HC_ATTN, QWEN4_PROF_GDN, QWEN4_PROF_ATTN, QWEN4_PROF_HC_FFN,
        QWEN4_PROF_MOE, QWEN4_PROF_MOE_MID, QWEN4_PROF_MOE_DOWN, QWEN4_PROF_HEAD, QWEN4_PROF_N };
 static const char *const qwen4_prof_names[QWEN4_PROF_N] = {
@@ -32567,10 +32569,12 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
             ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, DS4_N_EXPERT_USED,
                                                       DS4_N_EXPERT, g->cap_tokens) &&
                  qwen4_moe_profile_boundary(profile, &last, &elapsed[1]) &&
+                 qwen4_prof_cut(g, QWEN4_PROF_MOE) &&
                  ds4_gpu_qwen4_moe_mm_mid_tensor(g->mid, g->mixed, g->moe_lists, g->moe_counts, m->map, m->size,
                                                  l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
                                                  l->ffn_gate_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED,
                                                  DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP, g->cap_tokens) &&
+                 qwen4_prof_cut(g, QWEN4_PROF_MOE_MID) &&
                  qwen4_moe_profile_boundary(profile, &last, &elapsed[2]) &&
                  qwen4_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
                  qwen4_gemv(g->sh_up, m, l->ffn_up_shexp, g->mixed, T) &&
@@ -32578,10 +32582,12 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                  qwen4_moe_profile_boundary(profile, &last, &elapsed[3]);
         }
         if (ok) {
-            ok = ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->moe_lists, g->moe_counts, m->map, m->size,
+            ok = qwen4_prof_cut(g, QWEN4_PROF_MOE) &&
+                 ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->moe_lists, g->moe_counts, m->map, m->size,
                                                   l->ffn_down_exps->abs_offset, l->ffn_down_exps->type, DS4_N_EXPERT, T,
                                                   DS4_N_EXPERT_USED, DS4_N_EXPERT_USED, DS4_N_FF_EXP, DS4_N_EMBD,
                                                   g->cap_tokens) &&
+                 qwen4_prof_cut(g, QWEN4_PROF_MOE_DOWN) &&
                  qwen4_moe_profile_boundary(profile, &last, &elapsed[4]) &&
                  qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->sh_mid, T) &&
                  qwen4_moe_profile_boundary(profile, &last, &elapsed[5]);
