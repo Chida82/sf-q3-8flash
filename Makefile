@@ -98,10 +98,12 @@ linenoise.o: linenoise.c linenoise.h
 # change to ds4.h left objects built against the old struct layout; the server
 # unit tests then read TP fields at the wrong offset until `make clean`. Each
 # object lists the headers it includes directly plus those pulled in by ds4.h.
+# The tests that #include ds4.c take its headers as well.
 DS4_CORE_HDRS := ds4.h ds4_tool_text.h ds4_distributed.h ds4_image.h ds4_tp.h \
                  ds4_layer_pack.h ds4_gpu_mgpu.h ds4_gpu.h ds4_gpu_tp.h ds4_qwen4_vision.h \
                  ds4_qwen4_unicode.inc
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: $(DS4_CORE_HDRS)
+tests/test_session_state.o tests/test_qwen4_ngrams.o tests/test_qwen4_ngram_state.o: $(DS4_CORE_HDRS)
 ds4_metal.o: $(DS4_CORE_HDRS)
 ds4_cli.o ds4_cli_cpu.o: ds4.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_prompt_prefix.h linenoise.h
 ds4_server.o ds4_server_cpu.o: ds4.h ds4_tool_text.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds4_tp.h rax.h
@@ -140,7 +142,7 @@ tests/test_image_decode.o: tests/test_image_decode.c ds4_image.h
 tests/test_image_decode: tests/test_image_decode.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
-tests/test_session_state.o: tests/test_session_state.c
+tests/test_session_state.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
 
 tests/test_session_state: tests/test_session_state.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
@@ -164,7 +166,7 @@ test-session-state: tests/test_session_state tests/test_tp_commands tests/test_t
 	./tests/test_tp_rdma
 	./tests/test_tp_tcp
 
-tests/test_qwen4_ngrams.o: tests/test_qwen4_ngrams.c
+tests/test_qwen4_ngrams.o: tests/test_qwen4_ngrams.c ds4.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
 tests/test_qwen4_ngrams: tests/test_qwen4_ngrams.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
@@ -173,7 +175,7 @@ tests/test_qwen4_ngrams: tests/test_qwen4_ngrams.o $(filter-out ds4_cpu.o,$(CPU_
 test-qwen4-ngrams: tests/test_qwen4_ngrams
 	./tests/test_qwen4_ngrams
 
-tests/test_qwen4_ngram_state.o: tests/test_qwen4_ngram_state.c
+tests/test_qwen4_ngram_state.o: tests/test_qwen4_ngram_state.c ds4.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
 tests/test_qwen4_ngram_state: tests/test_qwen4_ngram_state.o $(filter-out ds4.o,$(CORE_OBJS))

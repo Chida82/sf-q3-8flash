@@ -33039,6 +33039,16 @@ static bool qwen4_graph_state_swap2(ds4_qwen4_gpu_graph *g) {
     return true;
 }
 
+/* The nextn layer over T rows of g->R, whose cache entries go at idx. */
+static bool qwen4_graph_nextn_layer(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                    uint32_t il, uint32_t idx, uint32_t T) {
+    return qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T) &&
+           qwen4_graph_attention(g, m, l, il, idx, T) &&
+           ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0 &&
+           qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T) &&
+           qwen4_graph_moe(g, m, l, T);
+}
+
 /* The steering bank contains trunk layers only. The predictor remains
  * unsteered; its drafts are verified by the steered target trunk.
  * One to three causal predictor steps at idx, using consecutive rows of the
@@ -33082,19 +33092,13 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
         g->verify_rows_exact = true;
         ds4_gpu_qwen4_set_verify_rows_exact(true);
     }
-    if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T);
-    if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, T);
-    if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, E, hc) != 0;
-    if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
-    if (ok) ok = qwen4_graph_moe(g, m, l, T);
+    if (ok) ok = qwen4_graph_nextn_layer(g, m, l, il, idx, T);
     if (three) {
         g->verify_rows_exact = false;
         ds4_gpu_qwen4_set_verify_rows_exact(false);
     }
     ds4_gpu_tensor *last = NULL, *last2 = NULL;
-    const char *argmax_env = getenv("DS4_QWEN4_MTP_GPU_ARGMAX");
-    const bool gpu_argmax = want_logits && draft_out && !logits_out &&
-        (!argmax_env || strcmp(argmax_env, "0") != 0);
+    const bool gpu_argmax = want_logits && draft_out && !logits_out;
     /* draft-only rows: host logits consumers always see the full head */
     const bool gathered = gpu_argmax && qwen4_mtp_draft_head_load(g, m, w->output);
     const uint32_t head_rows = gathered ? g->draft_rows : gpu_argmax ? qwen4_mtp_draft_rows() : DS4_N_VOCAB;
@@ -33120,11 +33124,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
              qwen4_gemv(g->mtp_proj, m, l->nextn_eh_proj, g->mtp_cat, hc + 1u) &&
              ds4_gpu_qwen4_mtp_combine_tensor(g->mtp_R, g->mtp_proj, 1u, E, hc);
         g->R = g->mtp_R;
-        if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, 1);
-        if (ok) ok = qwen4_graph_attention(g, m, l, il, idx + T, 1);
-        if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, 1, E, hc) != 0;
-        if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, 1);
-        if (ok) ok = qwen4_graph_moe(g, m, l, 1);
+        if (ok) ok = qwen4_graph_nextn_layer(g, m, l, il, idx + T, 1);
         last2 = ds4_gpu_tensor_view(g->mtp_R, 0, hc * emb_bytes);
         g->R = last2;
         if (ok) ok = last2 &&
@@ -33186,6 +33186,7 @@ static bool qwen4_graph_mtp_prime(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     uint64_t cap = ds4_gpu_tensor_bytes(g->part) / ((hc + 1u) * 2u * emb_bytes);
     const uint64_t proj_cap = ds4_gpu_tensor_bytes(g->mid) / ((hc + 1u) * emb_bytes);
     if (proj_cap < cap) cap = proj_cap;
+    if (g->cap_tokens < cap) cap = g->cap_tokens;   /* the layer's own transients hold cap_tokens rows */
     ds4_gpu_tensor *R_save = g->R;
     bool ok = true;
     for (uint32_t t0 = 0; ok && cap > 0 && t0 + 1u < T; ) {
@@ -38917,6 +38918,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 
 /* sf-ablate(cuda): ds4_engine_create_with_gpu_config wrapper removed; Metal opens through ds4_engine_open. */
 
+/* Token embedding types the predictor's GPU gather reads (kernel_qwen4_mtp_stage). */
+static bool qwen4_mtp_gather_type_ok(uint32_t type) {
+    return type == DS4_TENSOR_F32 || type == DS4_TENSOR_F16 || type == DS4_TENSOR_BF16 ||
+           type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_Q4_0;
+}
+
 static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_engine_options *opt,
                                      const ds4_gpu_config *gpu_cfg) {
@@ -39185,6 +39192,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
         fprintf(stderr,
                 "ds4: --mtp requires a model with embedded MTP weights; "
                 "use --mtp-model FILE for external support\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+    if (opt->glm_mtp && e->backend == DS4_BACKEND_METAL && e->weights.token_embd &&
+        !qwen4_mtp_gather_type_ok(e->weights.token_embd->type)) {
+        fprintf(stderr, "ds4: --mtp gathers token embeddings on the GPU, which reads f32, f16, bf16, q8_0 "
+                        "and q4_0 tables; this model's is %s\n", tensor_type_name(e->weights.token_embd->type));
         ds4_engine_close(e);
         *out = NULL;
         return 1;

@@ -1900,9 +1900,22 @@ static void test_qwen4_argmax(void) {
         }
         require_ok(!ds4_gpu_qwen4_argmax_tensor(out, tmp, x, 0u, NULL) &&
                    !ds4_gpu_qwen4_argmax_tensor(out, tmp, x, n + 1u, NULL), "argmax rejects invalid sizes");
+        /* a gathered head scores a row list: the winner's row maps to its id */
+        int32_t *map = malloc(n * sizeof(int32_t));
+        for (uint32_t j = 0; j < n; j++) map[j] = (int32_t)((j * 7919u + 13u) % 248320u);
+        for (uint32_t j = 0; j < n; j++) v[j] = (float)((j * 37u) % 101u);
+        v[(n * 3u) / 4u] = 200.0f;
+        ds4_gpu_tensor *gmap = upload(NULL, n);
+        int32_t got_id = -1;
+        require_ok(gmap && ds4_gpu_tensor_write(gmap, 0, map, n * sizeof(int32_t)) &&
+                   ds4_gpu_tensor_write(x, 0, v, n * sizeof(float)) &&
+                   ds4_gpu_begin_commands() && ds4_gpu_qwen4_argmax_tensor(out, tmp, x, n, gmap) &&
+                   ds4_gpu_end_commands() && ds4_gpu_tensor_read(out, 0, &got_id, sizeof(got_id)) &&
+                   got_id == map[(n * 3u) / 4u], "Qwen argmax maps the winning row");
+        ds4_gpu_tensor_free(gmap); free(map);
         ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(tmp); ds4_gpu_tensor_free(x); free(v);
     }
-    printf("Qwen predictor argmax: CPU indices, ties, special values and guards passed\n");
+    printf("Qwen predictor argmax: CPU indices, ties, special values, row maps and guards passed\n");
 }
 
 /* The paired mixer must preserve both token rows and its partial-group guard. */
@@ -2704,14 +2717,22 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
 }
 
 /* MTP input staging over T rows: cat rows [rms(e)*g_e | 0] with e the
- * embedding row the token id names (an f32 table here), and
- * [0 | rms(R)*g_h_s] (one RMS over all streams); then R_out = proj[0] + proj[1+s]. */
-static void test_mtp(arena_t *a, uint32_t E, uint32_t hc, uint32_t T) {
+ * embedding row the token id names, gathered from a table of `type` (f32 0,
+ * f16 1, q4_0 2, q8_0 8, bf16 30), and [0 | rms(R)*g_h_s] (one RMS over all
+ * streams); then R_out = proj[0] + proj[1+s]. */
+static void test_mtp(arena_t *a, uint32_t E, uint32_t hc, uint32_t T, uint32_t type) {
     double *g_e, *g_h, *table;
     const uint64_t g_e_off = arena_f32(a, E, &g_e, 0.5f, 1.5f);
     const uint64_t g_h_off = arena_f32(a, (uint64_t)hc * E, &g_h, 0.5f, 1.5f);
     const uint32_t n_vocab = 2u * T + 1u;
-    const uint64_t table_off = arena_f32(a, (uint64_t)n_vocab * E, &table, -1.0f, 1.0f);
+    const uint64_t n = (uint64_t)n_vocab * E;
+    const uint64_t table_off = type == 1u ? arena_f16(a, n, &table, 1.0f) :
+                               type == 30u ? arena_bf16(a, n, &table, 1.0f) :
+                               type == 8u ? arena_q8_0(a, n_vocab, E, &table, 1.0f) :
+                               type == 2u ? arena_q4_0(a, n_vocab, E, &table, 1.0f) :
+                               arena_f32(a, n, &table, -1.0f, 1.0f);
+    const uint32_t row_bytes = type == 1u || type == 30u ? E * 2u : type == 8u ? E / 32u * 34u :
+                               type == 2u ? E / 32u * 18u : E * 4u;
     const uint64_t cat_n = (uint64_t)(hc + 1u) * 2u * E, proj_n = (uint64_t)(hc + 1u) * E, r_n = (uint64_t)hc * E;
     int32_t *ids = malloc(T * sizeof(int32_t));
     float *R = rand_vec(T * r_n, 1.0f);
@@ -2744,11 +2765,11 @@ static void test_mtp(arena_t *a, uint32_t E, uint32_t hc, uint32_t T) {
     ds4_gpu_tensor *gcat = upload(NULL, T * cat_n);
     ds4_gpu_tensor *gproj = upload(proj, T * proj_n);
     ds4_gpu_tensor *gout = upload(NULL, T * r_n);
-    require_ok(ds4_gpu_qwen4_mtp_stage_tensor(gcat, gids, gR, a->base, a->size, table_off, 0u, E * sizeof(float),
+    require_ok(ds4_gpu_qwen4_mtp_stage_tensor(gcat, gids, gR, a->base, a->size, table_off, type, row_bytes,
                                               n_vocab, g_e_off, g_h_off, T, E, hc, (float)eps), "mtp stage");
     require_ok(ds4_gpu_qwen4_mtp_combine_tensor(gout, gproj, T, E, hc), "mtp combine");
     char name[96];
-    snprintf(name, sizeof(name), "mtp stage E=%u hc=%u T=%u", E, hc, T);
+    snprintf(name, sizeof(name), "mtp stage E=%u hc=%u T=%u table type %u", E, hc, T, type);
     check_tensor(name, gcat, cat, T * cat_n, 1e-5);
     snprintf(name, sizeof(name), "mtp combine E=%u hc=%u T=%u", E, hc, T);
     check_tensor(name, gout, R_ref, T * r_n, 1e-6);
@@ -3483,9 +3504,10 @@ int main(void) {
     test_multi_gemv(&arena, 2560, 2);
     test_multi_gemv(&arena, 64, 3);
     printf("mtp\n");
-    test_mtp(&arena, 2560, 4, 1u);
-    test_mtp(&arena, 2560, 4, 7u);
-    test_mtp(&arena, 64, 4, 3u);
+    test_mtp(&arena, 2560, 4, 1u, 0u);
+    test_mtp(&arena, 64, 4, 3u, 0u);
+    const uint32_t mtp_types[] = {0u, 1u, 2u, 8u, 30u};
+    for (uint32_t i = 0; i < sizeof(mtp_types) / sizeof(mtp_types[0]); i++) test_mtp(&arena, 2560, 4, 7u, mtp_types[i]);
     test_hc_norm_reuse(&arena);
     test_gdn_prefill_dispatch();
     printf("all qwen4 kernel tests passed\n");
