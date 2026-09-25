@@ -33029,11 +33029,24 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
               ds4_gpu_qwen4_mtp_combine_tensor(g->mtp_R, g->mtp_proj, T, E, hc);
     ds4_gpu_tensor_free(R_rows);
     g->R = g->mtp_R;
+    /* Three rows take the row-exact decode geometry the verify uses for its
+     * own three rows (split attention, decode matvecs): the single-pass
+     * attention a three-token prefill tail keeps would cost them 1.3 ms
+     * instead of 0.1. */
+    const bool three = T == 3u && !g->verify_rows_exact;
+    if (three) {
+        g->verify_rows_exact = true;
+        ds4_gpu_qwen4_set_verify_rows_exact(true);
+    }
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T);
     if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, T);
     if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, E, hc) != 0;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
     if (ok) ok = qwen4_graph_moe(g, m, l, T);
+    if (three) {
+        g->verify_rows_exact = false;
+        ds4_gpu_qwen4_set_verify_rows_exact(false);
+    }
     ds4_gpu_tensor *last = NULL;
     const char *argmax_env = getenv("DS4_QWEN4_MTP_GPU_ARGMAX");
     const bool gpu_argmax = want_logits && draft_out && !logits_out &&
