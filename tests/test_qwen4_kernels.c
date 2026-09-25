@@ -2703,24 +2703,29 @@ static void test_moe_mm_tiles_exact(arena_t *a, uint32_t down_type) {
     ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
 }
 
-/* MTP input staging over T rows: cat rows [rms(e)*g_e | 0] and
- * [0 | rms(R)*g_h_s] (one RMS over all streams), then R_out = proj[0] + proj[1+s]. */
+/* MTP input staging over T rows: cat rows [rms(e)*g_e | 0] with e the
+ * embedding row the token id names (an f32 table here), and
+ * [0 | rms(R)*g_h_s] (one RMS over all streams); then R_out = proj[0] + proj[1+s]. */
 static void test_mtp(arena_t *a, uint32_t E, uint32_t hc, uint32_t T) {
-    double *g_e, *g_h;
+    double *g_e, *g_h, *table;
     const uint64_t g_e_off = arena_f32(a, E, &g_e, 0.5f, 1.5f);
     const uint64_t g_h_off = arena_f32(a, (uint64_t)hc * E, &g_h, 0.5f, 1.5f);
+    const uint32_t n_vocab = 2u * T + 1u;
+    const uint64_t table_off = arena_f32(a, (uint64_t)n_vocab * E, &table, -1.0f, 1.0f);
     const uint64_t cat_n = (uint64_t)(hc + 1u) * 2u * E, proj_n = (uint64_t)(hc + 1u) * E, r_n = (uint64_t)hc * E;
-    float *e = rand_vec((uint64_t)T * E, 1.0f);
+    int32_t *ids = malloc(T * sizeof(int32_t));
     float *R = rand_vec(T * r_n, 1.0f);
     float *proj = rand_vec(T * proj_n, 1.0f);
     double *cat = calloc(T * cat_n, sizeof(double));
     double *R_ref = malloc(T * r_n * sizeof(double));
     const double eps = 1e-6;
     for (uint32_t t = 0; t < T; t++) {
-        const float *et = e + (uint64_t)t * E, *Rt = R + t * r_n, *pt = proj + t * proj_n;
+        ids[t] = (int32_t)((t * 7u + 3u) % n_vocab);
+        const double *et = table + (uint64_t)ids[t] * E;
+        const float *Rt = R + t * r_n, *pt = proj + t * proj_n;
         double *ct = cat + t * cat_n, *rt = R_ref + t * r_n;
         double ss = 0.0;
-        for (uint32_t i = 0; i < E; i++) ss += (double)et[i] * et[i];
+        for (uint32_t i = 0; i < E; i++) ss += et[i] * et[i];
         double inv = 1.0 / sqrt(ss / E + eps);
         for (uint32_t i = 0; i < E; i++) ct[i] = et[i] * inv * g_e[i];
         double full = 0.0;
@@ -2733,20 +2738,22 @@ static void test_mtp(arena_t *a, uint32_t E, uint32_t hc, uint32_t T) {
             }
         }
     }
-    ds4_gpu_tensor *ge = upload(e, (uint64_t)T * E);
+    ds4_gpu_tensor *gids = upload(NULL, T);
+    require_ok(ds4_gpu_tensor_write(gids, 0, ids, T * sizeof(int32_t)), "mtp ids");
     ds4_gpu_tensor *gR = upload(R, T * r_n);
     ds4_gpu_tensor *gcat = upload(NULL, T * cat_n);
     ds4_gpu_tensor *gproj = upload(proj, T * proj_n);
     ds4_gpu_tensor *gout = upload(NULL, T * r_n);
-    require_ok(ds4_gpu_qwen4_mtp_stage_tensor(gcat, ge, gR, a->base, a->size, g_e_off, g_h_off, T, E, hc, (float)eps), "mtp stage");
+    require_ok(ds4_gpu_qwen4_mtp_stage_tensor(gcat, gids, gR, a->base, a->size, table_off, 0u, E * sizeof(float),
+                                              n_vocab, g_e_off, g_h_off, T, E, hc, (float)eps), "mtp stage");
     require_ok(ds4_gpu_qwen4_mtp_combine_tensor(gout, gproj, T, E, hc), "mtp combine");
     char name[96];
     snprintf(name, sizeof(name), "mtp stage E=%u hc=%u T=%u", E, hc, T);
     check_tensor(name, gcat, cat, T * cat_n, 1e-5);
     snprintf(name, sizeof(name), "mtp combine E=%u hc=%u T=%u", E, hc, T);
     check_tensor(name, gout, R_ref, T * r_n, 1e-6);
-    ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gproj); ds4_gpu_tensor_free(gcat); ds4_gpu_tensor_free(gR); ds4_gpu_tensor_free(ge);
-    free(R_ref); free(cat); free(proj); free(R); free(e); free(g_e); free(g_h);
+    ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gproj); ds4_gpu_tensor_free(gcat); ds4_gpu_tensor_free(gR); ds4_gpu_tensor_free(gids);
+    free(R_ref); free(cat); free(proj); free(R); free(ids); free(table); free(g_e); free(g_h);
 }
 
 /* A split immediately below the large-prefill boundary uses the original

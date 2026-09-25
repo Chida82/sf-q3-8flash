@@ -2319,9 +2319,14 @@ int ds4_gpu_qwen4_hc_lo_act_tensor(ds4_gpu_tensor *lo_act, const ds4_gpu_tensor 
                                    uint32_t n_tokens, uint32_t n_hc, uint32_t n_rank);
 int ds4_gpu_qwen4_hc_mix_rows_tensor(ds4_gpu_tensor *mixed, const ds4_gpu_tensor *u, const ds4_gpu_tensor *xn,
                                      uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc);
+/* The predictor's staged input for n_tokens rows: the embedding of the
+ * token id each row names, gathered from the table (f32, f16, bf16, q8_0 or
+ * q4_0 rows of row_bytes), and the row's hc streams. */
 int ds4_gpu_qwen4_mtp_stage_tensor(
-        ds4_gpu_tensor *cat, const ds4_gpu_tensor *e, const ds4_gpu_tensor *R,
-        const void *model_map, uint64_t model_size, uint64_t g_e_offset, uint64_t g_h_offset,
+        ds4_gpu_tensor *cat, const ds4_gpu_tensor *ids, const ds4_gpu_tensor *R,
+        const void *model_map, uint64_t model_size,
+        uint64_t table_offset, uint32_t table_type, uint32_t row_bytes, uint32_t n_vocab,
+        uint64_t g_e_offset, uint64_t g_h_offset,
         uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, float eps);
 int ds4_gpu_qwen4_mtp_combine_tensor(
         ds4_gpu_tensor *R_out, const ds4_gpu_tensor *proj, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc);

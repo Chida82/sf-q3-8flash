@@ -4457,14 +4457,38 @@ struct ds4_metal_args_qwen4_mtp_stage {
     uint32_t n_hc;
     uint32_t n_tokens;
     float    eps;
+    uint32_t table_type;   /* token embedding table: 0 f32, 1 f16, 2 q4_0, 8 q8_0, 30 bf16 */
+    uint32_t row_bytes;
 };
 
+/* One element of a token embedding row, as the host reference dequantizes
+ * it: every product is exact in float. */
+static inline float qwen4_embd_at(device const char *row, uint type, uint i) {
+    switch (type) {
+    case 0:  return ((device const float *)row)[i];
+    case 1:  return float(((device const half *)row)[i]);
+    case 30: return as_type<float>(uint(((device const ushort *)row)[i]) << 16);
+    case 8: {
+        device const char *blk = row + (i >> 5) * 34u;
+        return float(*(device const half *)blk) * float(blk[2u + (i & 31u)]);
+    }
+    case 2: {
+        device const char *blk = row + (i >> 5) * 18u;
+        const uint j = i & 31u, q = uint(((device const uchar *)blk)[2u + (j & 15u)]);
+        return float(*(device const half *)blk) * (float(j < 16u ? q & 15u : q >> 4) - 8.0f);
+    }
+    default: return 0.0f;
+    }
+}
+
 /* Rows of the concat input for the fused [W_e | W_h] projection: row 0 is
- * [e/rms(e) * g_e | 0], row 1+s is [0 | R_s/rms(R) * g_h[s]] with one RMS
- * over all hc streams.  One threadgroup per row and token. */
+ * [e/rms(e) * g_e | 0] with e the embedding of the token id the row names,
+ * gathered from the table here; row 1+s is [0 | R_s/rms(R) * g_h[s]] with
+ * one RMS over all hc streams.  One threadgroup per row and token. */
 kernel void kernel_qwen4_mtp_stage(
         constant ds4_metal_args_qwen4_mtp_stage & args,
-        device const float *e,          /* [T][E] next-token embeddings */
+        device const int   *ids,        /* [T] next-token ids */
+        device const char  *table,      /* token embeddings */
         device const float *R,          /* [T][hc*E] pre-mixer streams */
         device const float *g_e,        /* [E] */
         device const float *g_h,        /* [hc*E] */
@@ -4477,19 +4501,25 @@ kernel void kernel_qwen4_mtp_stage(
     const uint row = tgpig.x, t = tgpig.y;
     if (row > args.n_hc || t >= args.n_tokens) return;
     const uint E = args.n_embd;
-    e += (uint64_t)t * E;
     R += (uint64_t)t * args.n_hc * E;
     cat += (uint64_t)t * (args.n_hc + 1u) * 2u * E;
     const uint nth = ntg.x;
     const uint nsg = nth / 32;
     threadgroup float red[32];
     const bool emb = row == 0;
-    device const float *src = emb ? e : R + (uint64_t)(row - 1u) * E;
+    device const char *erow = table + (uint64_t)ids[t] * args.row_bytes;
+    device const float *src = R + (uint64_t)(emb ? 0u : row - 1u) * E;
     device const float *g = emb ? g_e : g_h + (uint64_t)(row - 1u) * E;
-    device const float *rs = emb ? src : R;
     const uint n_red = emb ? E : E * args.n_hc;
     float ss = 0.0f;
-    for (uint i = tid; i < n_red; i += nth) ss += rs[i] * rs[i];
+    if (emb) {
+        for (uint i = tid; i < E; i += nth) {
+            const float v = qwen4_embd_at(erow, args.table_type, i);
+            ss += v * v;
+        }
+    } else {
+        for (uint i = tid; i < n_red; i += nth) ss += R[i] * R[i];
+    }
     ss = simd_sum(ss);
     if (tiisg == 0) red[sgitg] = ss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -4500,7 +4530,7 @@ kernel void kernel_qwen4_mtp_stage(
     const uint lo = emb ? 0u : E;
     const uint hi = emb ? E : 0u;
     for (uint i = tid; i < E; i += nth) {
-        o[lo + i] = src[i] * inv * g[i];
+        o[lo + i] = (emb ? qwen4_embd_at(erow, args.table_type, i) : src[i]) * inv * g[i];
         o[hi + i] = 0.0f;
     }
 }

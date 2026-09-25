@@ -41010,21 +41010,27 @@ int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tensor *scratch
 }
 
 int ds4_gpu_qwen4_mtp_stage_tensor(
-        ds4_gpu_tensor *cat, const ds4_gpu_tensor *e, const ds4_gpu_tensor *R,
-        const void *model_map, uint64_t model_size, uint64_t g_e_offset, uint64_t g_h_offset,
+        ds4_gpu_tensor *cat, const ds4_gpu_tensor *ids, const ds4_gpu_tensor *R,
+        const void *model_map, uint64_t model_size,
+        uint64_t table_offset, uint32_t table_type, uint32_t row_bytes, uint32_t n_vocab,
+        uint64_t g_e_offset, uint64_t g_h_offset,
         uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, float eps) {
-    struct { uint32_t n_embd, n_hc, n_tokens; float eps; } args = { n_embd, n_hc, n_tokens, eps };
-    qwen4_bind b[5];
+    struct { uint32_t n_embd, n_hc, n_tokens; float eps; uint32_t table_type, row_bytes; } args =
+        { n_embd, n_hc, n_tokens, eps, table_type, row_bytes };
+    qwen4_bind b[6];
     const uint64_t emb_bytes = (uint64_t)n_embd * sizeof(float);
-    if (n_embd == 0 || n_hc == 0 || n_tokens == 0 ||
-        !qwen4_bind_tensor(&b[0], e, n_tokens * emb_bytes, "mtp embedding") ||
-        !qwen4_bind_tensor(&b[1], R, n_tokens * n_hc * emb_bytes, "mtp streams") ||
-        !qwen4_bind_weight(&b[2], model_map, model_size, g_e_offset, emb_bytes, "mtp enorm") ||
-        !qwen4_bind_weight(&b[3], model_map, model_size, g_h_offset, n_hc * emb_bytes, "mtp hnorm") ||
-        !qwen4_bind_tensor(&b[4], cat, n_tokens * (n_hc + 1u) * 2u * emb_bytes, "mtp concat")) {
+    if (n_embd == 0 || n_hc == 0 || n_tokens == 0 || row_bytes == 0 || n_vocab == 0 ||
+        (table_type != 0u && table_type != 1u && table_type != 2u && table_type != 8u && table_type != 30u) ||
+        !qwen4_bind_tensor(&b[0], ids, (uint64_t)n_tokens * sizeof(int32_t), "mtp token ids") ||
+        !qwen4_bind_weight(&b[1], model_map, model_size, table_offset, (uint64_t)n_vocab * row_bytes,
+                           "mtp token embeddings") ||
+        !qwen4_bind_tensor(&b[2], R, n_tokens * n_hc * emb_bytes, "mtp streams") ||
+        !qwen4_bind_weight(&b[3], model_map, model_size, g_e_offset, emb_bytes, "mtp enorm") ||
+        !qwen4_bind_weight(&b[4], model_map, model_size, g_h_offset, n_hc * emb_bytes, "mtp hnorm") ||
+        !qwen4_bind_tensor(&b[5], cat, n_tokens * (n_hc + 1u) * 2u * emb_bytes, "mtp concat")) {
         return 0;
     }
-    return qwen4_dispatch(QWEN4_K_MTP_STAGE, &args, sizeof(args), b, 5,
+    return qwen4_dispatch(QWEN4_K_MTP_STAGE, &args, sizeof(args), b, 6,
                           MTLSizeMake(n_hc + 1u, n_tokens, 1), MTLSizeMake(256, 1, 1), 0);
 }
 
