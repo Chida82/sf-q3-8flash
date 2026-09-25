@@ -23,7 +23,16 @@ context: |
   speed-bench/perf-record.md, and appends the printed row there. If the
   current segment has no start row yet, the change first writes it with an
   A/A run on a worktree of the start commit. Steps inside a change are judged
-  with the same harness against the previous step. Work never happens on main:
+  with the same harness against the previous step. A step is kept when the
+  pooled bootstrap 95% CI of its target metric (plain decode for decode work,
+  the prefill metrics for prefill work), over all its A/B runs against the
+  previous step, lies above zero, however small the gain, and no other
+  throughput metric's pooled CI lies wholly below zero. A neutral step (CI
+  across zero, nothing below) is kept only if it deletes more lines than it
+  adds; no step is kept as neutral because a later step builds on it. A step
+  that adds a tool and claims no speed needs bitwise output and no metric
+  below zero. An inconclusive run is repeated once with a longer budget on
+  the kinds that decide it. Work never happens on main:
   main is only read, through a worktree.
   Code a change ports (from an upstream PR or elsewhere) or writes is not
   final as it first lands. Every change that adds code plans two reviews

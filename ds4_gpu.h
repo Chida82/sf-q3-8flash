@@ -167,6 +167,8 @@ int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label
  * GLM branches went from ds4.c (verified with nm against every object and source). */
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+/* GPU busy seconds of the command buffers waited since the previous call. */
+double ds4_gpu_take_gpu_seconds(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);

@@ -1331,7 +1331,9 @@ static void ds4_gpu_close_batch_encoder(void) {
     g_batch_enc = nil;
 }
 
-static double g_gpu_busy_accum;
+/* GPU busy time of every waited command buffer; DS4_METAL_GPU_BUSY_PROFILE
+ * prints the running total, ds4_gpu_take_gpu_seconds() hands out slices. */
+static double g_gpu_busy_accum, g_gpu_busy_taken;
 static uint64_t g_gpu_busy_cbs;
 
 /* A failed command buffer can leave a cross-threadgroup arrival counter at an
@@ -1362,9 +1364,9 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
         }
         prev_gpu_end = cb.GPUEndTime;
     }
+    const double busy = cb.GPUEndTime - cb.GPUStartTime;
+    if (busy > 0) g_gpu_busy_accum += busy;
     if (getenv("DS4_METAL_GPU_BUSY_PROFILE")) {
-        const double busy = cb.GPUEndTime - cb.GPUStartTime;
-        if (busy > 0) g_gpu_busy_accum += busy;
         if ((++g_gpu_busy_cbs % 64u) == 0u) {
             fprintf(stderr, "ds4: gpu busy accum %.1f ms over %llu cbs\n",
                     g_gpu_busy_accum * 1000.0,
@@ -11375,6 +11377,12 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
         }
         return ds4_gpu_begin_commands();
     }
+}
+
+double ds4_gpu_take_gpu_seconds(void) {
+    const double t = g_gpu_busy_accum - g_gpu_busy_taken;
+    g_gpu_busy_taken = g_gpu_busy_accum;
+    return t;
 }
 
 int ds4_gpu_end_commands(void) {
@@ -39258,8 +39266,10 @@ static bool qwen4_moe_mv_specialize(uint32_t type) {
         (type == 39u && ds4_gpu_device_is_m5_apple_silicon());
 }
 
-static uint32_t qwen4_moe_mv_rows(void) {
-    return (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_MOE_MV_NR", 1u, 1u, 4u);
+static uint32_t qwen4_moe_mv_rows(uint32_t type) {
+    /* MXFP4 down walks its rows in pairs on M5 (two chains per SIMD group). */
+    const uint32_t default_nr = type == 39u && ds4_gpu_device_is_m5_apple_silicon() ? 2u : 1u;
+    return (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_MOE_MV_NR", default_nr, 1u, 4u);
 }
 
 static uint32_t qwen4_moe_mv_groups(uint32_t type) {
@@ -39284,7 +39294,7 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
         if (kernel == QWEN4_K_MOE_MID || kernel == QWEN4_K_MOE_DOWN || kernel == QWEN4_K_MOE_DOWN_MXFP4_PF) {
             const qwen4_moe_args *a = args;
             const bool specialize = qwen4_moe_mv_specialize(a->weight_type);
-            const uint32_t values[] = {a->weight_type, a->shared_type, specialize ? a->in_dim : 0u, specialize ? qwen4_moe_mv_rows() : 0u};
+            const uint32_t values[] = {a->weight_type, a->shared_type, specialize ? a->in_dim : 0u, specialize ? qwen4_moe_mv_rows(a->weight_type) : 0u};
             NSString *key = [NSString stringWithFormat:@"%s_type=%u_shared=%u_dim=%u_rows=%u",
                              qwen4_kernel_names[kernel], values[0], values[1], values[2], values[3]];
             pipeline = [g_pipeline_cache objectForKey:key];
@@ -40495,7 +40505,7 @@ int ds4_gpu_qwen4_moe_mid_tensor(
     const bool specialize = !q4k && qwen4_moe_mv_specialize(weight_type);
     const uint64_t nr_env = q4k ?
         ds4_gpu_env_u64("DS4_QWEN4_Q4K_MID_NR", default_nr, 1u, UINT64_MAX) :
-        (specialize ? qwen4_moe_mv_rows() : 2u);
+        (specialize ? qwen4_moe_mv_rows(weight_type) : 2u);
     const uint32_t nr = nr_env >= 1u && nr_env <= (q4k ? 2u : 4u) ? (uint32_t)nr_env : default_nr;
     /* NR2 without an NSG override restores the former ordered dispatch. */
     const uint32_t default_nsg = nr != 1u ? 2u : m3_ultra ? 8u : m5_single ? 4u : 2u;
@@ -40540,7 +40550,7 @@ int ds4_gpu_qwen4_moe_down_tensor(
         b[4] = b[0];
     }
     const uint32_t nsg = qwen4_moe_mv_specialize(weight_type) ? qwen4_moe_mv_groups(weight_type) : 4u;
-    const uint32_t rows_per_tg = nsg * (qwen4_moe_mv_specialize(weight_type) ? qwen4_moe_mv_rows() : 2u);
+    const uint32_t rows_per_tg = nsg * (qwen4_moe_mv_specialize(weight_type) ? qwen4_moe_mv_rows(weight_type) : 2u);
     /* MXFP4 rows with four blocks per lane requested ahead (same lane map and
      * chain order, byte-identical); M5 default, DS4_QWEN4_MOE_DOWN_PREFETCH=0/1
      * overrides on any device. */

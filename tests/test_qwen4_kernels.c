@@ -3391,6 +3391,7 @@ int main(void) {
         test_moe_types(&arena, 8, 6, 256, 672, 3, 16u, 10u);
         test_moe_types(&arena, 8, 6, 2560, 640, 1, 12u, 39u);
         test_moe_types(&arena, 8, 6, 2560, 640, 2, 12u, 39u);
+        test_moe_types(&arena, 8, 6, 2560, 640, 3, 12u, 39u);
         test_moe_types(&arena, 8, 6, 256, 256, 9, 12u, 39u);
         test_moe_types(&arena, 8, 6, 256, 672, 3, 12u, 39u);
         printf("all Qwen MoE decode specialization tests passed\n");

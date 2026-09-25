@@ -31609,6 +31609,7 @@ typedef struct ds4_qwen4_gpu_graph {
     float steer_attn_scale;
     float steer_ffn_scale;
     bool prompt_rows;        /* prefill rows: dumps read them, the predictor primes on them */
+    double *prof;            /* DS4_QWEN4_TIMING=2: GPU seconds per stage group, NULL when off */
 } ds4_qwen4_gpu_graph;
 
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
@@ -32503,6 +32504,22 @@ static bool qwen4_graph_attention_cache(ds4_qwen4_gpu_graph *g, const ds4_model 
            qwen4_graph_attention_append(g, m, l, il, pos0, T);
 }
 
+/* DS4_QWEN4_TIMING=2 stage groups in forward order; moe_mid and moe_down are
+ * carved out of moe on the per-token expert path. */
+enum { QWEN4_PROF_PLE, QWEN4_PROF_HC_ATTN, QWEN4_PROF_GDN, QWEN4_PROF_ATTN, QWEN4_PROF_HC_FFN,
+       QWEN4_PROF_MOE, QWEN4_PROF_MOE_MID, QWEN4_PROF_MOE_DOWN, QWEN4_PROF_HEAD, QWEN4_PROF_N };
+static const char *const qwen4_prof_names[QWEN4_PROF_N] = {
+    "ple", "hc_attn", "gdn", "attn", "hc_ffn", "moe", "moe_mid", "moe_down", "head"};
+
+/* Submit the work encoded since the previous cut and charge its GPU time to
+ * the group it closes (diagnostics only: each cut is a wait). */
+static bool qwen4_prof_cut(ds4_qwen4_gpu_graph *g, int group) {
+    if (!g->prof) return true;
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) return false;
+    g->prof[group] += ds4_gpu_take_gpu_seconds();
+    return qwen4_graph_begin_commands_if_needed();
+}
+
 /* router GEMV, top-k (+ shared gate logit), experts with the shared expert as
  * an extra slot, weighted reduce with the hc combine folded in */
 static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elapsed) {
@@ -32620,16 +32637,19 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     } else
 #endif
     if (ok) {
-        ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
+        ok = qwen4_prof_cut(g, QWEN4_PROF_MOE) &&
+             ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
                                           l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
                                           DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
                                           shared_dense ? 0u : l->ffn_gate_shexp->abs_offset,
                                           shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
                                           shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type) != 0 &&
+             qwen4_prof_cut(g, QWEN4_PROF_MOE_MID) &&
              ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
                                            l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
                                            DS4_N_EMBD, shared_dense ? 0u : l->ffn_down_shexp->abs_offset,
-                                           shared_dense ? UINT32_MAX : l->ffn_down_shexp->type) != 0;
+                                           shared_dense ? UINT32_MAX : l->ffn_down_shexp->type) != 0 &&
+             qwen4_prof_cut(g, QWEN4_PROF_MOE_DOWN);
     }
     if (ok) {
         ok = ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit,
@@ -32753,20 +32773,12 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     const double t1 = timing ? now_sec() : 0.0;
     if (!qwen4_graph_begin_commands_if_needed()) return false;
     bool ok = true;
-    /* DS4_QWEN4_TIMING=2 on prefill batches: sync after each stage group and
-     * report GPU ms per group (adds sync overhead; diagnostics only) */
-    double prof[6] = {0};
-    const bool prof_on = timing == 2 && T > 1u;
-    double prof_last = prof_on ? now_sec() : 0.0;
-#define QWEN4_PROF(idx_) do { \
-        if (prof_on) { \
-            ds4_gpu_end_commands(); \
-            const double now_ = now_sec(); \
-            prof[idx_] += now_ - prof_last; \
-            prof_last = now_; \
-            qwen4_graph_begin_commands_if_needed(); \
-        } \
-    } while (0)
+    /* DS4_QWEN4_TIMING=2: submit after each stage group and charge its GPU
+     * time to the group (adds a wait per cut; diagnostics only) */
+    double prof[QWEN4_PROF_N] = {0};
+    const bool prof_on = timing == 2;
+    if (prof_on) ds4_gpu_take_gpu_seconds();   /* drop earlier buffers */
+    g->prof = prof_on ? prof : NULL;
     for (uint32_t il = 0; il < n_trunk && ok; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (ds4_qwen4_layer_is_ple(il)) {
@@ -32781,9 +32793,9 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
                                                DS4_N_PLE_NGRAM, g->snap_after_first ? g->snap_ple_hist : NULL, 0u,
                                                g->snap_after_second ? g->snap2_ple_hist : NULL, 1u);
         }
-        QWEN4_PROF(0);
+        if (ok) ok = qwen4_prof_cut(g, QWEN4_PROF_PLE);
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T);
-        QWEN4_PROF(1);
+        if (ok) ok = qwen4_prof_cut(g, QWEN4_PROF_HC_ATTN);
         if (ok) {
             ok = ds4_qwen4_layer_is_linear(il) ? qwen4_graph_linear(g, m, l, il, T)
                                                : qwen4_graph_attention(g, m, l, il, pos0, T);
@@ -32794,7 +32806,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             if (g->prompt_rows) qwen4_graph_dump_last_attn(g, il, T);
             ok = qwen4_graph_apply_steering_attn(g, il, T);
         }
-        QWEN4_PROF(ds4_qwen4_layer_is_linear(il) ? 2 : 3);
+        if (ok) ok = qwen4_prof_cut(g, ds4_qwen4_layer_is_linear(il) ? QWEN4_PROF_GDN : QWEN4_PROF_ATTN);
         if (T == 1u && !g->mtp_R && DS4_N_HC == 4u && ds4_gpu_qwen4_decode_fusions_enabled() &&
             l->hc_ffn_inject->type == DS4_TENSOR_F16) {
             if (ok) ok = ds4_gpu_qwen4_hc_combine_norm_tensor(g->hc_u, g->blk, g->inj,
@@ -32813,26 +32825,19 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0;
             if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
         }
-        QWEN4_PROF(4);
+        if (ok) ok = qwen4_prof_cut(g, QWEN4_PROF_HC_FFN);
         if (ok) ok = qwen4_graph_moe(g, m, l, T);   /* the reduce folds the combine in */
         if (ok && g->prompt_rows)
             metal_graph_debug_dump_tensor("qwen_router", g->router,
                                            (uint64_t)T * DS4_N_EXPERT, il, pos0);
         if (ok && g->prompt_rows) qwen4_graph_dump_last_ffn(g, il, T);
         if (ok) ok = qwen4_graph_apply_steering_ffn(g, il, T);
-        QWEN4_PROF(5);
+        if (ok) ok = qwen4_prof_cut(g, QWEN4_PROF_MOE);
         /* Submit this prefix while the host encodes the remaining layers.
          * Flush keeps the same ordered queue and retains pending buffers;
          * end_commands below waits for both batches before inputs are reused. */
         if (ok && il + 1u == flush_layer) ok = ds4_gpu_flush_commands() != 0;
     }
-    if (prof_on) {
-        fprintf(stderr, "ds4: Qwen3.8 prefill stage ms/chunk (pos=%u T=%u ok=%d): "
-                "ple %.1f hc_attn %.1f gdn %.1f attn %.1f hc_ffn %.1f moe %.1f\n",
-                pos0, T, ok ? 1 : 0, 1000.0 * prof[0], 1000.0 * prof[1],
-                1000.0 * prof[2], 1000.0 * prof[3], 1000.0 * prof[4], 1000.0 * prof[5]);
-    }
-#undef QWEN4_PROF
     if (ok && logits_out && all_rows) {
         ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down, w->output_hc_up, NULL, T) &&
              qwen4_gemv(g->logits, m, w->output, g->mixed, T);
@@ -32849,6 +32854,29 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             ds4_gpu_tensor_free(last);
         }
         if (ok) ok = qwen4_gemv(g->logits, m, w->output, g->mixed, 1);
+    }
+    if (ok) ok = qwen4_prof_cut(g, QWEN4_PROF_HEAD);
+    g->prof = NULL;
+    if (prof_on && T > 8u) {
+        fprintf(stderr, "ds4: Qwen3.8 prefill stage GPU ms/chunk (pos=%u T=%u ok=%d):", pos0, T, ok ? 1 : 0);
+        for (int i = 0; i < QWEN4_PROF_N; i++) fprintf(stderr, " %s %.1f", qwen4_prof_names[i], 1e3 * prof[i]);
+        fputc('\n', stderr);
+    } else if (prof_on) {
+        /* decode and verify passes: mean per pass of each T, every 50 */
+        static double prof_sum[9][QWEN4_PROF_N];
+        static uint32_t prof_n[9];
+        double total = 0.0;
+        for (int i = 0; i < QWEN4_PROF_N; i++) prof_sum[T][i] += prof[i];
+        if (++prof_n[T] == 50u) {
+            fprintf(stderr, "ds4: Qwen3.8 T=%u GPU us/pass over 50 passes:", T);
+            for (int i = 0; i < QWEN4_PROF_N; i++) {
+                fprintf(stderr, " %s %.1f", qwen4_prof_names[i], 1e6 * prof_sum[T][i] / 50);
+                total += prof_sum[T][i];
+            }
+            fprintf(stderr, " sum %.1f\n", 1e6 * total / 50);
+            memset(prof_sum[T], 0, sizeof(prof_sum[T]));
+            prof_n[T] = 0;
+        }
     }
     if (ok && qwen4_graph_mtp_priming(g)) ok = qwen4_graph_mtp_prime(g, m, w, pos0, T);
     const double t2 = timing ? now_sec() : 0.0;

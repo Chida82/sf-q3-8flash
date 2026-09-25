@@ -17,7 +17,14 @@ Set diagnostics inline, never globally:
 
 ```sh
 DS4_METAL_CB_TIMES=1 ./sf-q3-8flash -p "Hello"
+DS4_QWEN4_TIMING=2 ./sf-q3-8flash -p "Hello"
 ```
+
+`DS4_QWEN4_TIMING=2` submits the work after each stage group (ple, hc_attn,
+gdn, attn, hc_ffn, moe, moe_mid, moe_down, head) and reports the GPU time of
+each: per chunk for prefill, and as the mean per pass over every 50 decode or
+verify passes of the same size. The waits slow the run, but its output is
+unchanged.
 
 Use `make test-qwen4-kernels` after Metal or kernel changes and run model-backed
 parity before landing performance work.
