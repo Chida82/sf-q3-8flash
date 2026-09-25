@@ -32395,14 +32395,14 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
     return ok;
 }
 
-/* The per-session part of an attention layer for T rows at pos0: cache
- * appends, pooled block keys and the attention core; the projections before
- * it and the output projection after it are row-agnostic. */
-static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
-                                       uint32_t il, uint32_t pos0, uint32_t T) {
+/* An attention layer's cache appends for T rows at pos0: K, V and the raw
+ * indexer keys through the prep kernel (which also writes q, gate and the
+ * indexer query), then the pooled keys of the blocks whose last token falls
+ * in this chunk. */
+static bool qwen4_graph_attention_append(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                         uint32_t il, uint32_t pos0, uint32_t T) {
     const uint32_t ratio = 4u;
     const uint32_t last = pos0 + T - 1u;
-    const uint32_t q_dim = DS4_N_HEAD * DS4_N_HEAD_DIM;
     if (!(ds4_gpu_qwen4_attn_prep_tensor(g->q, g->gate, g->layer_k_cache[il], g->layer_v_cache[il], g->iqn,
                                          g->layer_ik_cache[il], g->qg, g->kp, g->vp, g->iq, g->ik, g->pos3,
                                          m->map, m->size, l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
@@ -32411,16 +32411,24 @@ static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *
                                          pos0, g->ctx_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS))) {
         return false;
     }
-    /* blocks whose last token falls in this chunk get their pooled keys */
     const uint32_t first_block = pos0 / ratio;
     const uint32_t n_blocks_after = (last + 1u) / ratio;
-    if (n_blocks_after > first_block &&
-        !ds4_gpu_qwen4_idx_block_key_tensor(g->layer_block_key[il], g->layer_ik_cache[il], g->pos3, m->map, m->size,
-                                            l->indexer_k_norm->abs_offset, first_block,
-                                            n_blocks_after - first_block, ratio, DS4_N_INDEXER_HEAD_DIM,
-                                            DS4_N_ROT, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS)) {
-        return false;
-    }
+    return n_blocks_after <= first_block ||
+           ds4_gpu_qwen4_idx_block_key_tensor(g->layer_block_key[il], g->layer_ik_cache[il], g->pos3, m->map, m->size,
+                                              l->indexer_k_norm->abs_offset, first_block,
+                                              n_blocks_after - first_block, ratio, DS4_N_INDEXER_HEAD_DIM,
+                                              DS4_N_ROT, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
+}
+
+/* The per-session part of an attention layer for T rows at pos0: cache
+ * appends, pooled block keys and the attention core; the projections before
+ * it and the output projection after it are row-agnostic. */
+static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                       uint32_t il, uint32_t pos0, uint32_t T) {
+    const uint32_t ratio = 4u;
+    const uint32_t q_dim = DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint32_t n_blocks_after = (pos0 + T) / ratio;
+    if (!qwen4_graph_attention_append(g, m, l, il, pos0, T)) return false;
     if (T == 3u && g->verify_rows_exact) {
         /* 3-row speculative verify: run the attention core as 2/1-row
          * sub-batches so every dispatch keeps the exact T <= 2 kernel paths
@@ -32478,6 +32486,21 @@ static bool qwen4_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     }
     return qwen4_graph_attention_tail(g, m, l, il, pos0, T) &&
            qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T);
+}
+
+/* Only the cache writes of an attention layer, for T rows whose output
+ * nothing reads (prompt rows priming the predictor): K, V and the indexer
+ * keys take the same projections and prep kernel as qwen4_graph_attention,
+ * so the caches get the same bytes, while Q, the indexer query, the core and
+ * the output projection are skipped (the prep kernel's q from stale Q rows
+ * goes unread).  Short fused batches run the whole layer. */
+static bool qwen4_graph_attention_cache(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                        uint32_t il, uint32_t pos0, uint32_t T) {
+    if (qwen4_graph_fused(g, T)) return qwen4_graph_attention(g, m, l, il, pos0, T);
+    return qwen4_gemv(g->kp, m, l->attn_k, g->mixed, T) &&
+           qwen4_gemv(g->vp, m, l->attn_v, g->mixed, T) &&
+           qwen4_gemv(g->ik, m, l->indexer_k_proj, g->mixed, T) &&
+           qwen4_graph_attention_append(g, m, l, il, pos0, T);
 }
 
 /* router GEMV, top-k (+ shared gate logit), experts with the shared expert as
@@ -32693,7 +32716,8 @@ static bool qwen4_graph_mtp_prime(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
  * everything is causal by construction because the recurrent kernels walk
  * tokens in order and attention reads the caches written for the same
  * chunk.  g->R keeps the pre-mixer streams of every row afterwards, except
- * that prompt priming leaves the predictor's residual in all but the last. */
+ * that prompt priming leaves the predictor's input residual in all but the
+ * last. */
 static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                        const int *tokens, uint32_t T, float *logits_out, bool all_rows) {
     if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
@@ -33147,9 +33171,11 @@ static bool qwen4_graph_mtp_step(ds4_qwen4_gpu_graph *g, const ds4_model *m, con
  * attention cache covers the prompt instead of starting empty at the first
  * draft.  Rows go in sub-chunks; their staged inputs live in the MoE
  * transients, idle between the trunk's last experts and the nextn layer's
- * own, and the predictor's residual overwrites the trunk streams in place.
- * The chunk's last row waits in mtp_tail for the token that follows it,
- * which the next forward brings (qwen4_graph_mtp_tail_flush). */
+ * own, and the predictor's input residual overwrites the trunk streams in
+ * place.  Only the layer's cache writes run: nothing reads a history row's
+ * output.  The chunk's last row waits in mtp_tail for the token that follows
+ * it, and runs the whole layer when the next forward brings that token
+ * (qwen4_graph_mtp_tail_flush). */
 static bool qwen4_graph_mtp_prime(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                   uint32_t pos0, uint32_t T) {
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC;
@@ -33171,10 +33197,7 @@ static bool qwen4_graph_mtp_prime(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
              ds4_gpu_qwen4_mtp_combine_tensor(R, g->mid, n, E, hc);
         g->R = R;
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, n);
-        if (ok) ok = qwen4_graph_attention(g, m, l, il, pos0 + t0, n);
-        if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, n, E, hc) != 0;
-        if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, n);
-        if (ok) ok = qwen4_graph_moe(g, m, l, n);
+        if (ok) ok = qwen4_graph_attention_cache(g, m, l, il, pos0 + t0, n);
         g->R = R_save;
         ds4_gpu_tensor_free(R);
         ds4_gpu_tensor_free(ids);
