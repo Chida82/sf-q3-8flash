@@ -76,8 +76,10 @@ lean: in `60-q4-expert-prefill` a step that changed no kernel read prefill 8192
 **Section-time mode.** `--sections moe_mid,moe_down` runs the same schedule
 and correctness gate with `DS4_QWEN4_TIMING=2` set for both builds, and judges
 GPU time instead of throughput. Kinds default to `plain`. For every prefill
-chunk a kind times, a run's ratio is the GPU time of the named stage groups
-over the time of the other groups of the same chunk. The other groups run at
+chunk a kind times, and for plain also a `decode` shape (the mean of the
+profiler's single-token lines, each the µs per pass over 50 passes), a run's
+ratio is the GPU time of the named stage groups over the time of the other
+groups of the same chunk or pass. The other groups run at
 the same clock, so the ratio cancels the drift between runs. The summary gives,
 per chunk shape, B's ratio over A's as a median over the valid pairs with a
 bootstrap 95% CI, the target and untouched medians, and the whole-chunk ratio.

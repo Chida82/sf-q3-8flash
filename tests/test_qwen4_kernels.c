@@ -1650,6 +1650,43 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
                                             sg_off, su_off, shared_type), "moe mid");
     require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off, dtype, NE, T, slots, F, E,
                                              sd_off, shared_type), "moe down");
+    if (wtype == 16u) {
+        /* The IQ2_XXS gate/up kernel (M5) must match the generic kernel byte
+         * for byte, shared Q8 slot included; elsewhere both runs take the
+         * generic kernel. */
+        const uint64_t nm = (uint64_t)T * n_out * F;
+        float *gm = malloc(nm * sizeof(float)), *im = malloc(nm * sizeof(float));
+        require_ok(gm && im, "IQ2 mid exact allocation");
+        setenv("DS4_QWEN4_NO_IQ2_MID", "1", 1);
+        require_ok(ds4_gpu_qwen4_moe_mid_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off, wtype, NE, T, slots,
+                                                E, F, sg_off, su_off, shared_type) &&
+                   ds4_gpu_tensor_read(gmid, 0, gm, nm * sizeof(float)), "generic IQ2 mid");
+        unsetenv("DS4_QWEN4_NO_IQ2_MID");
+        require_ok(ds4_gpu_qwen4_moe_mid_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off, wtype, NE, T, slots,
+                                                E, F, sg_off, su_off, shared_type) &&
+                   ds4_gpu_tensor_read(gmid, 0, im, nm * sizeof(float)), "IQ2 kernel mid");
+        check_exact_f32("IQ2_XXS gate/up kernel vs generic", im, gm, nm);
+        printf("  moe iq2_xxs E=%u F=%u T=%u: IQ2 gate/up kernel byte-exact vs generic (shared slot included)\n", E, F, T);
+        free(gm); free(im);
+    }
+    if (dtype == 10u && F == 640u) {
+        /* The Q2_K down kernel at width 640 (M5) must match the generic
+         * kernel byte for byte, shared Q8 slot included. */
+        const uint64_t np = (uint64_t)T * n_out * E;
+        float *gp = malloc(np * sizeof(float)), *kp = malloc(np * sizeof(float));
+        require_ok(gp && kp, "Q2_K down exact allocation");
+        setenv("DS4_QWEN4_NO_Q2K_DOWN", "1", 1);
+        require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off, dtype, NE, T, slots, F, E,
+                                                 sd_off, shared_type) &&
+                   ds4_gpu_tensor_read(gpart, 0, gp, np * sizeof(float)), "generic Q2_K down");
+        unsetenv("DS4_QWEN4_NO_Q2K_DOWN");
+        require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off, dtype, NE, T, slots, F, E,
+                                                 sd_off, shared_type) &&
+                   ds4_gpu_tensor_read(gpart, 0, kp, np * sizeof(float)), "Q2_K down kernel");
+        check_exact_f32("Q2_K down kernel vs generic", kp, gp, np);
+        printf("  moe q2_K E=%u F=%u T=%u: Q2_K down kernel byte-exact vs generic (shared slot included)\n", E, F, T);
+        free(gp); free(kp);
+    }
     if ((dtype == 10u || dtype == 39u) && getenv("DS4_TEST_QWEN4_MV_EXACT")) {
         /* Specialized decode row kernels must match the generic dispatch bit
          * for bit across every NR/NSG geometry; Q4_K gate/up keep their own
@@ -2343,8 +2380,13 @@ static void test_q4k_ordered_exact(arena_t *a, uint32_t T, uint32_t F, bool shar
 /* Q2-pack tiers (iq2_xxs gate/up + q2_K down) on the routed tiles: the
  * simdgroup tiles are the reference; the tensor-op levels are bounded
  * against them and against a double-precision exact reference. */
-static void test_moe_mm_tiles_iq2(arena_t *a) {
-    const uint32_t T = 641, E = 256, F = 256, NE = 4, slots = 2, n_out = 3, list_cap = T + 7, guard = 16;
+/* Q2 pack tiles: IQ2_XXS gate/up and Q2_K down, whose rows are padded to
+ * whole 256-blocks (W columns) when F is not a multiple of 256, as the pack's
+ * 640-of-768 down is.  The tensor tiles of level 2 (64-token tiles and, where
+ * the device enables them, 32/16/8-token tails) must equal level 1 (32-token
+ * tiles) byte for byte. */
+static void test_moe_mm_tiles_iq2(arena_t *a, uint32_t T, uint32_t F) {
+    const uint32_t E = 256, W = (F + 255u) / 256u * 256u, NE = 4, slots = 2, n_out = 3, list_cap = T + 7, guard = 16;
     const uint64_t mid_n = (uint64_t)T * n_out * F, part_n = (uint64_t)T * n_out * E;
     const char *env_names[] = {"DS4_QWEN4_MOE_MID_TILES", "DS4_QWEN4_MOE_DOWN_TILES"};
     char *saved_env[3];
@@ -2358,7 +2400,7 @@ static void test_moe_mm_tiles_iq2(arena_t *a) {
     double *gate_shadow, *up_shadow, *down_shadow;
     const uint64_t gate_off = arena_tier(a, 16u, (uint64_t)NE * F, E, &gate_shadow);
     const uint64_t up_off = arena_tier(a, 16u, (uint64_t)NE * F, E, &up_shadow);
-    const uint64_t down_off = arena_tier(a, 10u, (uint64_t)NE * E, F, &down_shadow);
+    const uint64_t down_off = arena_tier(a, 10u, (uint64_t)NE * E, W, &down_shadow);
     float *x = rand_vec((uint64_t)T * E, 2.0f);
     int32_t *sel = malloc((uint64_t)T * slots * sizeof(int32_t));
     require_ok(sel != NULL, "Q2 tile selection allocation");
@@ -2384,7 +2426,7 @@ static void test_moe_mm_tiles_iq2(arena_t *a) {
                 mid_exact[((uint64_t)t * n_out + s) * F + f] = (g / (1.0 + exp(-g))) * u;
             }
             for (uint32_t d = 0; d < E; d++) {
-                const double *dr = down_shadow + ((uint64_t)e * E + d) * F;
+                const double *dr = down_shadow + ((uint64_t)e * E + d) * W;
                 double p = 0.0;
                 for (uint32_t k = 0; k < F; k++) p += dr[k] * mid_exact[((uint64_t)t * n_out + s) * F + k];
                 part_exact[((uint64_t)t * n_out + s) * E + d] = p;
@@ -2394,7 +2436,7 @@ static void test_moe_mm_tiles_iq2(arena_t *a) {
     ds4_gpu_tensor *gmid = upload(NULL, mid_n + guard);
     ds4_gpu_tensor *gpart = upload(NULL, part_n + guard);
     const float sentinel = -1234.5f;
-    float *ref_mid = NULL, *ref_part = NULL;
+    float *ref_mid = NULL, *ref_part = NULL, *w32_mid = NULL, *w32_part = NULL;
     const uint32_t nax_levels[] = {0, 1, 2, 5};
     for (uint32_t li = 0; li < sizeof(nax_levels) / sizeof(nax_levels[0]); li++) {
         const uint32_t nax = nax_levels[li];
@@ -2426,12 +2468,22 @@ static void test_moe_mm_tiles_iq2(arena_t *a) {
             esum += d;
         }
         printf("  Q2 tiles nax=%u mid vs exact: max=%.3e mean=%.3e\n", nax, eworst, esum / (double)mid_n);
+        {
+            uint64_t h = 1469598103934665603ull;
+            for (uint64_t i = 0; i < mid_n; i++) { uint32_t u; memcpy(&u, &got_mid[i], 4); h = (h ^ u) * 1099511628211ull; }
+            printf("  Q2 tiles nax=%u T=%u F=%u mid hash=%016llx\n", nax, T, F, (unsigned long long)h);
+        }
+        if (nax == 2 && w32_mid) {
+            snprintf(name, sizeof(name), "Q2 tile mid T=%u F=%u nax=2 vs 32-token tiles", T, F);
+            check_exact_f32(name, got_mid, w32_mid, mid_n);
+        }
+        if (nax == 1) w32_mid = got_mid;
         if (ref_mid) {
             snprintf(name, sizeof(name), "Q2 tile mid nax=%u within 2e-3 of simdgroup", nax);
             require_ok(worst <= 2e-3 * scale, name);
             printf("  Q2 tiles nax=%u mid vs simdgroup: max|d|=%.3e (scale %.3e)\n", nax, worst, scale);
         } else { ref_mid = got_mid; got_mid = NULL; }
-        free(got_mid);
+        if (got_mid != w32_mid) free(got_mid);
         require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(gpart, gmid, glists, gcounts, a->base, a->size, down_off,
                                                     10u, NE, T, slots, n_out, F, E, list_cap), "Q2 tile down dispatch");
         float *got_part = download(gpart, part_n + guard);
@@ -2450,13 +2502,25 @@ static void test_moe_mm_tiles_iq2(arena_t *a) {
             esum += d;
         }
         printf("  Q2 tiles nax=%u down vs exact: max=%.3e mean=%.3e\n", nax, eworst, esum / (double)part_n);
+        {
+            uint64_t h = 1469598103934665603ull;
+            for (uint64_t i = 0; i < part_n; i++) { uint32_t u; memcpy(&u, &got_part[i], 4); h = (h ^ u) * 1099511628211ull; }
+            printf("  Q2 tiles nax=%u T=%u F=%u down hash=%016llx\n", nax, T, F, (unsigned long long)h);
+        }
+        if (nax == 2 && w32_part) {
+            snprintf(name, sizeof(name), "Q2 tile down T=%u F=%u nax=2 vs 32-token tiles", T, F);
+            check_exact_f32(name, got_part, w32_part, part_n);
+            printf("  Q2 tiles T=%u F=%u: byte-exact mid/down nax=2 vs nax=1 (32-token tiles)\n", T, F);
+        }
+        if (nax == 1) w32_part = got_part;
         if (ref_part) {
             snprintf(name, sizeof(name), "Q2 tile down nax=%u within 2e-3 of simdgroup", nax);
             require_ok(worst <= 2e-3 * scale, name);
             printf("  Q2 tiles nax=%u down vs simdgroup: max|d|=%.3e (scale %.3e)\n", nax, worst, scale);
         } else { ref_part = got_part; got_part = NULL; }
-        free(got_part);
+        if (got_part != w32_part) free(got_part);
     }
+    free(w32_mid); free(w32_part);
     for (uint32_t i = 0; i < 3; i++) {
         const char *names[] = {env_names[0], env_names[1], "DS4_QWEN4_MOE_MM_NAX"};
         if (saved_env[i]) { setenv(names[i], saved_env[i], 1); free(saved_env[i]); } else unsetenv(names[i]);
@@ -3403,6 +3467,7 @@ int main(void) {
     if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {
         test_moe_types(&arena, 8, 6, 2560, 640, 1, 16u, 10u);
         test_moe_types(&arena, 8, 6, 2560, 640, 2, 16u, 10u);
+        test_moe_types(&arena, 8, 6, 2560, 640, 3, 16u, 10u);
         test_moe_types(&arena, 8, 6, 256, 256, 9, 16u, 10u);
         test_moe_types(&arena, 8, 6, 256, 672, 3, 16u, 10u);
         test_moe_types(&arena, 8, 6, 2560, 640, 1, 12u, 39u);
@@ -3515,7 +3580,9 @@ int main(void) {
      * 32- and 16-token tiles) */
     test_moe_mm_tiles_exact(&arena, 75, 39u);
     test_moe_mm_tiles_exact(&arena, 161, 39u);
-    test_moe_mm_tiles_iq2(&arena);
+    test_moe_mm_tiles_iq2(&arena, 641, 256);
+    test_moe_mm_tiles_iq2(&arena, 161, 640);   /* padded Q2_K down; remainders 33/17/16 */
+    test_moe_mm_tiles_iq2(&arena, 641, 640);   /* padded; remainder 1 */
     printf("dense mm\n");
     test_dense_mm(&arena, 2560, 512, 37, 0u);
 #ifdef __APPLE__

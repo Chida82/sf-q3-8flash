@@ -118,15 +118,20 @@ def chunk_line(pos, tokens, mid, ok=1):
             f"gdn 30.0 attn 20.0 hc_ffn 10.0 moe 10.0 moe_mid {mid} moe_down 30.0 head 0.0\n")
 
 
-PLAIN_SECTIONS = (chunk_line(0, 8192, 50.0) + chunk_line(8192, 512, 5.0) + chunk_line(8704, 2048, 20.0)
-                  + "ds4: Qwen3.8 T=1 GPU us/pass over 50 passes: ple 1.0 moe_mid 2.0 sum 3.0\n"
+def decode_line(down, tokens=1):
+    return (f"ds4: Qwen3.8 T={tokens} GPU us/pass over 50 passes: ple 100.0 hc_attn 2000.0 gdn 5000.0 "
+            f"attn 1900.0 hc_ffn 2100.0 moe 1500.0 moe_mid 2500.0 moe_down {down} head 1150.0 sum 1.0\n")
+
+
+PLAIN_SECTIONS = (chunk_line(0, 8192, 50.0) + chunk_line(8192, 512, 5.0) + decode_line(1300.0)
+                  + chunk_line(8704, 2048, 20.0) + decode_line(1320.0) + decode_line(900.0, tokens=2)
                   + chunk_line(10752, 16, 1.0))
 
 
 def section_run(build, n, clock=1.0, target=1.0, warmup=False):
     groups = {g: 10.0 * clock * (target if g in ("moe_mid", "moe_down") else 1.0) for g in ab.GROUPS}
     return {"build": build, "kind": "plain", "n": n, "warmup": warmup, "note": "",
-            "sections": {name: dict(groups) for name, _, _ in ab.shapes("plain")}}
+            "sections": {name: dict(groups) for name in ab.section_shapes("plain")}}
 
 
 def section_quads(*b_runs):
@@ -141,9 +146,31 @@ def section_quads(*b_runs):
 class SectionsTest(unittest.TestCase):
     def test_chunk_lines_by_shape(self):
         s = ab.parse_sections(PLAIN_SECTIONS, "plain")
-        self.assertEqual(list(s), ["prefill 8192", "prefill +512", "prefill +2048"])
-        self.assertEqual([s[k]["moe_mid"] for k in s], [50.0, 5.0, 20.0])
+        self.assertEqual(list(s), ["prefill 8192", "prefill +512", "prefill +2048", "decode"])
+        self.assertEqual([s[k]["moe_mid"] for k in list(s)[:3]], [50.0, 5.0, 20.0])
         self.assertEqual(s["prefill +512"]["gdn"], 30.0)
+
+    def test_decode_is_the_mean_of_the_single_token_lines(self):
+        d = ab.parse_sections(PLAIN_SECTIONS, "plain")["decode"]
+        self.assertAlmostEqual(d["moe_down"], 1310.0)  # the T=2 verify line is not a decode pass
+        self.assertEqual(d["gdn"], 5000.0)
+        self.assertNotIn("decode", ab.section_shapes("mtp-code"))
+
+    def test_missing_decode_line_is_a_run_failure(self):
+        err = "".join(l + "\n" for l in PLAIN_SECTIONS.splitlines() if " T=1 " not in l)
+        with self.assertRaises(ab.Stop) as cm:
+            ab.parse_sections(err, "plain")
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("decode", str(cm.exception))
+
+    def test_decode_kernel_step(self):
+        runs = section_quads(((1.0, 1.0), (1.0, 1.0)))
+        for r in runs:
+            if r["build"] == "B":
+                r["sections"]["decode"]["moe_down"] *= 0.98
+        t = next(x for x in ab.section_table(runs, ["plain"], ["moe_down"]) if x["shape"] == "decode")
+        self.assertAlmostEqual(t["ratio"], 0.98)
+        self.assertEqual(t["n"], 2)
 
     def test_missing_chunk_is_a_run_failure(self):
         for err, named in ((PLAIN_SECTIONS.replace("pos=8192 T=512", "pos=8192 T=511"), "prefill +512"),

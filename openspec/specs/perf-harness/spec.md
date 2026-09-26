@@ -267,18 +267,24 @@ schedule, budget and correctness gate as a throughput run. Only GPU times
 SHALL be judged; throughput figures from profiled runs SHALL NOT be reported
 as a speed verdict.
 
-For every prefill chunk shape of the selected kinds (for the plain kind: 8192
-tokens from an empty context, then 512 and 2048 resumed), the mode SHALL
-compute, per run, the GPU time of the target groups divided by the GPU time of
-all other groups of the same chunk. It SHALL then compute, per valid A/B pair,
-B's ratio over A's. The summary SHALL report per shape:
+The mode SHALL judge these shapes of the selected kinds:
+- every prefill chunk shape (for the plain kind: 8192 tokens from an empty
+  context, then 512 and 2048 resumed);
+- for the plain kind, a `decode` shape, from the profiler's single-token decode
+  lines (each the mean GPU time per pass over 50 passes). A run's decode
+  figure per group SHALL be the mean over all its single-token lines.
+
+For each shape, the mode SHALL compute, per run, the GPU time of the target
+groups divided by the GPU time of all other groups of the same chunk or
+decode pass. It SHALL then compute, per valid A/B pair, B's ratio over A's.
+The summary SHALL report per shape:
 - A's and B's median target and untouched times;
 - the median pair ratio with a bootstrap 95% CI;
-- the median pair ratio of the whole chunk's GPU time.
+- the median pair ratio of the whole chunk's or pass's GPU time.
 
 Pairs dropped as disturbed SHALL be left out, as in the throughput verdict.
-The raw per-run, per-chunk section times SHALL be written to the output
-directory.
+The raw per-run section times, per chunk and for decode, SHALL be written to
+the output directory.
 
 #### Scenario: Faster target sections
 - **WHEN** B's `moe_mid` and `moe_down` take 3% less GPU time than A's while every other group is unchanged
@@ -295,6 +301,14 @@ directory.
 #### Scenario: Missing section lines
 - **WHEN** a profiled run's standard error lacks the chunk line of a shape the kind prefills
 - **THEN** the run is a run failure (exit status 1) naming the kind and the shape
+
+#### Scenario: Missing decode lines
+- **WHEN** a profiled plain run's standard error has no single-token decode line
+- **THEN** the run is a run failure (exit status 1) naming the kind and the `decode` shape
+
+#### Scenario: Decode kernel step
+- **WHEN** B's `moe_down` takes 2% less GPU time per decode pass than A's and nothing else changes
+- **THEN** the `decode` row shows a normalized ratio near 0.98 for the target `moe_down`, with its CI
 
 #### Scenario: Output still gated
 - **WHEN** B's greedy tokens differ from A's in section-time mode

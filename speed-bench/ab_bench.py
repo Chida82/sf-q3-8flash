@@ -5,7 +5,8 @@ Runs the benchmark of build A (baseline) and build B (candidate) on one GGUF,
 one process at a time, in A B B A quads, and reports the median B/A ratio per
 metric. The verdict is gated on identical tokens and, with --bitwise, on
 identical logit bits. With --sections it runs the same schedule under the GPU
-section profiler and judges GPU time per prefill chunk instead of throughput.
+section profiler and judges GPU time per prefill chunk and decode pass instead of
+throughput.
 See "A/B harness" in speed-bench/README.md.
 """
 
@@ -54,6 +55,8 @@ MTP = re.compile(r'^ds4-bench: mtp\[ctx=(\d+)\] cycles=(\d+) tokens=(\d+)'
 # DS4_QWEN4_TIMING=2 stage groups (ds4.c qwen4_prof_names) and their per-chunk prefill line
 GROUPS = ('ple', 'hc_attn', 'gdn', 'attn', 'hc_ffn', 'moe', 'moe_mid', 'moe_down', 'head')
 CHUNK = re.compile(r'^ds4: Qwen3\.8 prefill stage GPU ms/chunk \(pos=(\d+) T=(\d+) ok=(\d)\):(.*)$', re.M)
+# single-token decode: the mean GPU us per pass of each group, printed every 50 passes
+DECODE = re.compile(r'^ds4: Qwen3\.8 T=1 GPU us/pass over 50 passes:(.*)$', re.M)
 
 
 class Stop(Exception):
@@ -252,22 +255,38 @@ def parse_run(csv_text, err_text, kind):
     return {'rows': rows, 'tokens': tokens, 'mtp': mtp, 'metrics': metrics(rows, mtp, kind)}
 
 
+def section_shapes(kind):
+    """The shapes the section-time mode judges: the kind's prefill chunks, and for plain its
+    single-token decode passes."""
+    return [name for name, _, _ in shapes(kind)] + (['decode'] if kind == 'plain' else [])
+
+
+def group_times(text, where, kind):
+    words = text.split()
+    times = dict(zip(words[::2], words[1::2]))
+    if any(g not in times for g in GROUPS):
+        raise Stop(1, f'{kind}: section-time line for {where} lacks a stage group')
+    return {g: float(times[g]) for g in GROUPS}
+
+
 def parse_sections(err_text, kind):
-    """GPU ms per stage group of each prefill chunk the kind times, from the profiler's lines."""
+    """GPU time per stage group of each shape the kind is judged on, from the profiler's lines:
+    ms per prefill chunk, and for decode the mean us per pass over the run's lines."""
     chunks = {}
     for m in CHUNK.finditer(err_text):
         if m[3] != '1':
             raise Stop(1, f'{kind}: profiled chunk pos={m[1]} T={m[2]} reported ok=0')
-        words = m[4].split()
-        times = dict(zip(words[::2], words[1::2]))
-        if any(g not in times for g in GROUPS):
-            raise Stop(1, f'{kind}: section-time line for pos={m[1]} T={m[2]} lacks a stage group')
-        chunks.setdefault((int(m[1]), int(m[2])), {g: float(times[g]) for g in GROUPS})
+        chunks.setdefault((int(m[1]), int(m[2])), group_times(m[4], f'pos={m[1]} T={m[2]}', kind))
     out = {}
     for name, pos, tokens in shapes(kind):
         if (pos, tokens) not in chunks:
             raise Stop(1, f'{kind}: no section-time line for {name} (pos={pos} T={tokens})')
         out[name] = chunks[pos, tokens]
+    if 'decode' in section_shapes(kind):
+        passes = [group_times(m[1], 'decode', kind) for m in DECODE.finditer(err_text)]
+        if not passes:
+            raise Stop(1, f'{kind}: no section-time line for decode (T=1)')
+        out['decode'] = {g: statistics.fmean(p[g] for p in passes) for g in GROUPS}
     return out
 
 
@@ -460,7 +479,7 @@ def section_table(runs, kinds, targets):
     table = []
     for kind in kinds:
         valid = [(a, b) for a, b in pairs(timed, kind) if not a.get('flag')]
-        for name, _, _ in shapes(kind):
+        for name in section_shapes(kind):
             split = [(section_split(a['sections'][name], targets), section_split(b['sections'][name], targets))
                      for a, b in valid]
             split = [(x, y) for x, y in split if x[0] > 0 and x[1] > 0 and y[1] > 0]
@@ -497,8 +516,8 @@ def record_row(step, date, commit, model, valid_pairs, correctness, table):
 
 
 def section_lines(ctx, sections):
-    lines = [f'sections  target {"+".join(ctx["sections"])}; B/A of (target / untouched) GPU ms per '
-             'prefill chunk, per valid pair',
+    lines = [f'sections  target {"+".join(ctx["sections"])}; B/A of (target / untouched) GPU time per '
+             'prefill chunk (ms) or decode pass (us), per valid pair',
              f'{"kind":<10} {"shape":<14} {"A target":>9} {"B target":>9} {"A other":>9} {"B other":>9} '
              f'{"B/A":>7}  {"95% CI":<17} {"whole":>7} n']
     for t in sections:
@@ -609,8 +628,9 @@ def parse_args(argv):
                    help='seconds of load before the timed rounds (at most half the budget); '
                         'the M5 Max reaches its thermal plateau about 215-240 s into a run')
     p.add_argument('--sections', metavar='GROUPS',
-                   help='judge GPU time per prefill chunk: comma list of the DS4_QWEN4_TIMING=2 groups the '
-                        f'step targets ({", ".join(GROUPS)}), normalized by the other groups')
+                   help='judge GPU time per prefill chunk and decode pass: comma list of the '
+                        f'DS4_QWEN4_TIMING=2 groups the step targets ({", ".join(GROUPS)}), '
+                        'normalized by the other groups')
     p.add_argument('--out', help='output directory (default $TMPDIR/sf-q3-8flash-ab/<UTC time>)')
     args = p.parse_args(argv)
     args.sections = [g for g in (args.sections or '').split(',') if g]

@@ -39060,8 +39060,11 @@ enum {
     QWEN4_K_MOE_MID,
     QWEN4_K_MOE_MID_Q4K,
     QWEN4_K_MOE_MID_Q4K_NR1,
+    QWEN4_K_MOE_MID_IQ2,
+    QWEN4_K_MOE_MID_IQ2_NR1,
     QWEN4_K_MOE_DOWN,
     QWEN4_K_MOE_DOWN_MXFP4_PF,
+    QWEN4_K_MOE_DOWN_Q2K,
     QWEN4_K_MOE_MID_Q4K_GROUPED,
     QWEN4_K_MOE_DOWN_MXFP4_GROUPED,
     QWEN4_K_MOE_REDUCE,
@@ -39170,8 +39173,11 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_mid",
     "kernel_qwen4_moe_mid_q4k",
     "kernel_qwen4_moe_mid_q4k_nr1",
+    "kernel_qwen4_moe_mid_iq2",
+    "kernel_qwen4_moe_mid_iq2_nr1",
     "kernel_qwen4_moe_down",
     "kernel_qwen4_moe_down_mxfp4_pf",
+    "kernel_qwen4_moe_down_q2k",
     "kernel_qwen4_moe_mid_q4k_grouped",
     "kernel_qwen4_moe_down_mxfp4_grouped",
     "kernel_qwen4_moe_reduce",
@@ -39267,7 +39273,8 @@ typedef struct {
 static bool qwen4_moe_mv_specialize(uint32_t type) {
     /* Constant quantization and logical width remove the generic decode
      * branches. Keep the original per-lane reduction order and padded stride.
-     * M3 Ultra uses low-bit and MXFP4 down rows; M5 uses MXFP4 down rows. */
+     * M3 Ultra uses low-bit and MXFP4 down rows; M5 uses MXFP4 down rows (its
+     * IQ2_XXS and Q2_K rows run their own kernels). */
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_MV_SPECIALIZE");
     return override >= 0 ? override != 0 :
         ((type == 16u || type == 10u || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
@@ -40521,6 +40528,14 @@ int ds4_gpu_qwen4_moe_mid_tensor(
         (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_Q4K_MID_NSG", default_nsg, 1u, 8u) :
         (specialize ? qwen4_moe_mv_groups(weight_type) : 4u);
     const uint32_t rows_per_tg = nr * nsg;
+    /* IQ2_XXS on M5: activations loaded once per row pair and projection;
+     * one row per SIMD group for one or two tokens, two above */
+    if (weight_type == 16u && ds4_gpu_device_is_m5_apple_silicon() && getenv("DS4_QWEN4_NO_IQ2_MID") == NULL) {
+        const uint32_t iq2_nr = n_tokens <= 2u ? 1u : 2u, iq2_rows = iq2_nr * 4u;
+        return qwen4_dispatch(iq2_nr == 1u ? QWEN4_K_MOE_MID_IQ2_NR1 : QWEN4_K_MOE_MID_IQ2, &args, sizeof(args), b, 7,
+                              MTLSizeMake((ff_dim + iq2_rows - 1) / iq2_rows, n_out, n_tokens),
+                              MTLSizeMake(128, 1, 1), 0);
+    }
     const int kernel = !q4k ? QWEN4_K_MOE_MID : nr == 1u ? QWEN4_K_MOE_MID_Q4K_NR1 : QWEN4_K_MOE_MID_Q4K;
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 7,
                           MTLSizeMake((ff_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
@@ -40562,6 +40577,13 @@ int ds4_gpu_qwen4_moe_down_tensor(
     /* MXFP4 rows with four blocks per lane requested ahead (same lane map and
      * chain order, byte-identical); M5 default, DS4_QWEN4_MOE_DOWN_PREFETCH=0/1
      * overrides on any device. */
+    /* Q2_K at the pack's width 640 on M5: two rows per SIMD group sharing
+     * each activation load, the generic lane map and chain order */
+    if (weight_type == 10u && ff_dim == 640u && ds4_gpu_device_is_m5_apple_silicon() &&
+        getenv("DS4_QWEN4_NO_Q2K_DOWN") == NULL) {
+        return qwen4_dispatch(QWEN4_K_MOE_DOWN_Q2K, &args, sizeof(args), b, 5,
+                              MTLSizeMake((out_dim + 7u) / 8u, n_out, n_tokens), MTLSizeMake(128, 1, 1), 0);
+    }
     const int prefetch_override = ds4_gpu_env_bool("DS4_QWEN4_MOE_DOWN_PREFETCH");
     const bool prefetch = weight_type == 39u && (ff_dim % 32u) == 0 &&
         (prefetch_override >= 0 ? prefetch_override > 0 : ds4_gpu_device_is_m5_apple_silicon());

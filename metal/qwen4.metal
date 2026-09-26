@@ -2967,6 +2967,101 @@ static inline void qwen4_moe_shared_q8_mid(
     }
 }
 
+/* Per-token IQ2_XXS gate/up, NR rows per SIMD group: each lane loads its
+ * eight activations of a 32-block once for every row and both projections,
+ * and keeps the generic row dot's eight-value part and ordered dl * part
+ * additions per row and projection.  A Q8 shared slot loads x once for gate
+ * and up; other shared types keep the generic row dot. */
+template <uint NR>
+kernel void kernel_qwen4_moe_mid_iq2(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *gate_base,
+        device const char    *up_base,
+        device const int32_t *selected,
+        device const float   *x,
+        device float         *mid,
+        device const char    *sh_gate,
+        device const char    *sh_up,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint slot = tgpig.y, tok = tgpig.z;
+    const uint n_out = args.n_slots + args.has_shared;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * NR;
+    if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
+    device const float *xt = x + (uint64_t)tok * args.in_dim;
+    device float *out = mid + ((uint64_t)tok * n_out + slot) * args.out_rows;
+    if (slot == args.n_slots) {
+        if (args.shared_type == 8u) {
+            qwen4_moe_shared_q8_mid(sh_gate, sh_up, xt, out, row0, min(row0 + NR, args.out_rows), args.in_dim,
+                                    args.shared_row_bytes, tiisg);
+        } else {
+            for (uint r = row0; r < row0 + NR && r < args.out_rows; r++) {
+                const uint64_t off = (uint64_t)r * args.shared_row_bytes;
+                const float g = qwen4_row_dot(sh_gate + off, xt, args.shared_type, args.in_dim, tiisg);
+                const float u = qwen4_row_dot(sh_up + off, xt, args.shared_type, args.in_dim, tiisg);
+                if (tiisg == 0) out[r] = qwen4_silu(g) * u;
+            }
+        }
+        return;
+    }
+    const int32_t expert = selected[(uint64_t)tok * args.n_slots + slot];
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {
+        if (tiisg == 0) for (uint r = row0; r < row0 + NR && r < args.out_rows; r++) out[r] = 0.0f;
+        return;
+    }
+    device const char *gb = gate_base + (uint64_t)(uint)expert * args.expert_bytes;
+    device const char *ub = up_base + (uint64_t)(uint)expert * args.expert_bytes;
+    const uint nb = args.in_dim / 256;
+    const uint ib32 = tiisg / 4, j = tiisg % 4;
+    float sumg[NR] = {0.0f}, sumu[NR] = {0.0f};
+    for (uint ib = 0; ib < nb; ib++) {
+        device const float *yp = xt + ib * 256 + ib32 * 32 + j * 8;
+        float y[8];
+        for (uint i = 0; i < 8; i++) y[i] = yp[i];
+        for (uint r = 0; r < NR && row0 + r < args.out_rows; r++) {
+            const uint64_t off = (uint64_t)(row0 + r) * args.row_bytes + (uint64_t)ib * 66;
+            device const uchar *bg = (device const uchar *)(gb + off);
+            device const uchar *bu = (device const uchar *)(ub + off);
+            const float dg = (float)(*(device const half *)bg);
+            const float du = (float)(*(device const half *)bu);
+            /* IQ2_XXS blocks are only two-byte aligned */
+            device const ushort *qg = (device const ushort *)(bg + 2) + 4 * ib32;
+            device const ushort *qu = (device const ushort *)(bu + 2) + 4 * ib32;
+            const uint ag = (uint)qg[0] | ((uint)qg[1] << 16);
+            const uint sg = (uint)qg[2] | ((uint)qg[3] << 16);
+            const uint au = (uint)qu[0] | ((uint)qu[1] << 16);
+            const uint su = (uint)qu[2] | ((uint)qu[3] << 16);
+            const float dlg = dg * (0.5f + (float)(sg >> 28)) * 0.25f;
+            const float dlu = du * (0.5f + (float)(su >> 28)) * 0.25f;
+            constant const uchar *gridg = (constant const uchar *)(ds4_metal_iq2xxs_grid + ((ag >> (8 * j)) & 0xFFu));
+            constant const uchar *gridu = (constant const uchar *)(ds4_metal_iq2xxs_grid + ((au >> (8 * j)) & 0xFFu));
+            const uint signsg = ds4_metal_ksigns_iq2xs[(sg >> (7 * j)) & 127u];
+            const uint signsu = ds4_metal_ksigns_iq2xs[(su >> (7 * j)) & 127u];
+            float partg = 0.0f, partu = 0.0f;
+            for (uint i = 0; i < 8; i++) {
+                partg += (float)gridg[i] * ((signsg >> i) & 1u ? -y[i] : y[i]);
+                partu += (float)gridu[i] * ((signsu >> i) & 1u ? -y[i] : y[i]);
+            }
+            sumg[r] += dlg * partg;
+            sumu[r] += dlu * partu;
+        }
+    }
+    for (uint r = 0; r < NR && row0 + r < args.out_rows; r++) {
+        const float g = simd_sum(sumg[r]);
+        const float u = simd_sum(sumu[r]);
+        if (tiisg == 0) out[row0 + r] = qwen4_silu(g) * u;
+    }
+}
+
+#define QWEN4_MOE_MID_IQ2_SIG constant ds4_metal_args_qwen4_moe &, device const char *, device const char *, \
+    device const int32_t *, device const float *, device float *, device const char *, device const char *, \
+    uint3, ushort, ushort, ushort3
+template [[host_name("kernel_qwen4_moe_mid_iq2")]] kernel void kernel_qwen4_moe_mid_iq2<2>(QWEN4_MOE_MID_IQ2_SIG);
+template [[host_name("kernel_qwen4_moe_mid_iq2_nr1")]] kernel void kernel_qwen4_moe_mid_iq2<1>(QWEN4_MOE_MID_IQ2_SIG);
+#undef QWEN4_MOE_MID_IQ2_SIG
+
 /* Per-token Q4_K gate/up, NR output rows per SIMD group: a routed slot is
  * one pass over its (token, slot) pair; a Q8 shared slot loads x once for
  * gate and up, other shared types keep the generic row dot. */
@@ -3217,8 +3312,45 @@ static inline void qwen4_moe_down_mxfp4_pass(
     }
 }
 
+/* Shared Q8 down rows r0 .. r1 of one pair, two at a time: each lane loads its
+ * activations once per block for both rows, and each row keeps the generic
+ * row dot's lane mapping, block order, expression and sum. */
+static inline void qwen4_moe_shared_q8_rows(
+        device const char *sh, device const float *m, device float *out,
+        uint r0, uint r1, uint in_dim, uint row_bytes, ushort tiisg) {
+    const short ix = tiisg / 8, it = tiisg % 8;
+    const uint nb = in_dim / 32u;
+    for (uint r = r0; r < r1; r += 2u) {
+        const bool two = r + 1u < r1;
+        device const char *ra = sh + (uint64_t)r * row_bytes;
+        device const char *rb = two ? ra + row_bytes : ra;
+        float suma = 0.0f, sumb = 0.0f;
+        for (uint ib = (uint)ix; ib < nb; ib += 4) {
+            device const char *ba = ra + (uint64_t)ib * 34;
+            device const char *bb = rb + (uint64_t)ib * 34;
+            device const float *y = m + ib * 32 + (uint)it * 2;
+            const float da = (float)(*(device const half *)ba);
+            const float db = (float)(*(device const half *)bb);
+            device const char *qa = ba + 2 + it * 2;
+            device const char *qb = bb + 2 + it * 2;
+            const float y0 = y[0], y1 = y[1], y16 = y[16], y17 = y[17];
+            suma += da * (y0 * (float)qa[0] + y1 * (float)qa[1] +
+                          y16 * (float)qa[16] + y17 * (float)qa[17]);
+            sumb += db * (y0 * (float)qb[0] + y1 * (float)qb[1] +
+                          y16 * (float)qb[16] + y17 * (float)qb[17]);
+        }
+        const float va = simd_sum(suma);
+        const float vb = simd_sum(sumb);
+        if (tiisg == 0) {
+            out[r] = va;
+            if (two) out[r + 1u] = vb;
+        }
+    }
+}
+
 /* Per-token MXFP4 down: nr rows per SIMD group, walked in pairs through the
- * pass; the shared Q8 slot keeps the generic row dot. */
+ * pass; a Q8 shared slot walks its rows in pairs through
+ * qwen4_moe_shared_q8_rows, other shared types keep the generic row dot. */
 kernel void kernel_qwen4_moe_down_mxfp4_pf(
         constant ds4_metal_args_qwen4_moe & args,
         device const char    *down_base,
@@ -3241,6 +3373,11 @@ kernel void kernel_qwen4_moe_down_mxfp4_pf(
     const uint64_t pair = (uint64_t)tok * n_out + slot;
     device const float *m = mid + pair * args.in_dim;
     if (slot == args.n_slots) {
+        if (st == 8u) {
+            qwen4_moe_shared_q8_rows(sh_down, m, part + pair * args.out_rows, row0, min(row0 + nr, args.out_rows),
+                                     dim, args.shared_row_bytes, tiisg);
+            return;
+        }
         for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
             const float v = qwen4_row_dot(sh_down + (uint64_t)r * args.shared_row_bytes, m, st, dim, tiisg);
             if (tiisg == 0) part[pair * args.out_rows + r] = v;
@@ -3252,6 +3389,83 @@ kernel void kernel_qwen4_moe_down_mxfp4_pf(
     for (uint r = row0; r < row0 + nr && r < args.out_rows; r += 2u) {
         const bool two = r + 1u < row0 + nr && r + 1u < args.out_rows;
         qwen4_moe_down_mxfp4_pass<1>(args, down_base, mid, part, &p, ebase, r, two, dim / 32, tiisg / 8, tiisg % 8, tiisg);
+    }
+}
+
+/* One Q2_K down block of two rows for one lane: the lane's eight
+ * activations are loaded once and each row keeps the generic row dot's
+ * eight-element chain (ds * q - dm) * y. */
+static inline void qwen4_q2k_block_rows(device const char *db, uint row_bytes, uint row0, bool two, uint ib,
+                                        device const float *m, uint group, uint l, uint q_base, uint shift,
+                                        thread float &acca, thread float &accb) {
+    const uint column = ib * 256u + group * 16u + l;
+    const packed_float4 y0 = *(device const packed_float4 *)(m + column);
+    const packed_float4 y1 = *(device const packed_float4 *)(m + column + 4u);
+    const float y[8] = {y0.x, y0.y, y0.z, y0.w, y1.x, y1.y, y1.z, y1.w};
+    for (uint r = 0; r < (two ? 2u : 1u); r++) {
+        device const uchar *blk = (device const uchar *)(db + (uint64_t)(row0 + r) * row_bytes + (uint64_t)ib * 84u);
+        const float d = (float)(*(device const half *)(blk + 80));
+        const float dmin = (float)(*(device const half *)(blk + 82));
+        const uint sc = blk[group];
+        const float ds = d * (float)(sc & 0xFu), dm = dmin * (float)(sc >> 4);
+        device const uchar *qs = blk + 16u + q_base + l;
+        const packed_uchar4 q0 = *(device const packed_uchar4 *)qs;
+        const packed_uchar4 q1 = *(device const packed_uchar4 *)(qs + 4u);
+        const uchar q[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+        thread float &acc = r ? accb : acca;
+        for (uint i = 0; i < 8u; i++) acc += (ds * (float)((q[i] >> shift) & 3u) - dm) * y[i];
+    }
+}
+
+/* Per-token Q2_K down at width 640 (rows padded to 768), two rows per SIMD
+ * group sharing each activation load.  Blocks 0 and 1 are whole; of block 2
+ * only lanes 0-15 hold columns below 640, exactly the lanes the generic row
+ * dot keeps.  A Q8 shared slot walks its rows through
+ * qwen4_moe_shared_q8_rows; other shared types keep the generic row dot. */
+kernel void kernel_qwen4_moe_down_q2k(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *down_base,
+        device const int32_t *selected,
+        device const float   *mid,
+        device float         *part,
+        device const char    *sh_down,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint slot = tgpig.y, tok = tgpig.z;
+    const uint n_out = args.n_slots + args.has_shared;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * 2u;
+    if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
+    const uint64_t pair = (uint64_t)tok * n_out + slot;
+    device const float *m = mid + pair * args.in_dim;
+    device float *out = part + pair * args.out_rows;
+    const bool two = row0 + 1u < args.out_rows;
+    if (slot == args.n_slots) {
+        if (args.shared_type == 8u) {
+            qwen4_moe_shared_q8_rows(sh_down, m, out, row0, row0 + (two ? 2u : 1u), args.in_dim,
+                                     args.shared_row_bytes, tiisg);
+        } else {
+            for (uint r = row0; r < row0 + (two ? 2u : 1u); r++) {
+                const float v = qwen4_row_dot(sh_down + (uint64_t)r * args.shared_row_bytes, m, args.shared_type,
+                                              args.in_dim, tiisg);
+                if (tiisg == 0) out[r] = v;
+            }
+        }
+        return;
+    }
+    device const char *db = down_base + (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
+    const uint group = tiisg / 2u, l = (tiisg % 2u) * 8u;
+    const uint q_base = 32u * (group / 8u) + 16u * (group & 1u), shift = ((group / 2u) & 3u) * 2u;
+    float acca = 0.0f, accb = 0.0f;
+    qwen4_q2k_block_rows(db, args.row_bytes, row0, two, 0u, m, group, l, q_base, shift, acca, accb);
+    qwen4_q2k_block_rows(db, args.row_bytes, row0, two, 1u, m, group, l, q_base, shift, acca, accb);
+    if (tiisg < 16u) qwen4_q2k_block_rows(db, args.row_bytes, row0, two, 2u, m, group, l, q_base, shift, acca, accb);
+    const float va = simd_sum(acca);
+    const float vb = simd_sum(accb);
+    if (tiisg == 0) {
+        out[row0] = va;
+        if (two) out[row0 + 1u] = vb;
     }
 }
 
