@@ -66,8 +66,8 @@ with MTP. The resident rates on this machine are about 47-49 t/s plain decode,
 |---|---|---|---|---|---|---|
 | Q4 | 48 GB | 2.3 / 18.6 GiB | 17.4 | 903 / 241 / 449 | 23.8 / 26.3 | 339 / 447 |
 | Q4 | 40 GB | refused / 1.5 GiB | - | - | 18.2 / 19.7 | 379 / 505 |
-| Q2 | 48 GB | 3.4 / 9.1 GiB | 27.5 | 996 / 392 / 688 | 34.8 / 35.3 | 483 / 571 |
-| Q2 | 40 GB | - / 2.6 GiB | - | - | 28.1 / 29.2 | 556 / 727 |
+| Q2 | 48 GB | 3.5 / 12.5 GiB | 26.9 | 1090 / 409 / 686 | 34.7 / 35.7 | 596 / 649 |
+| Q2 | 40 GB | - / 2.6 GiB | - | - | 27.3 / 29.1 | 593 / 714 |
 
 The cache size also depends on what else the machine holds at open, since the
 emulated plan counts the memory that is really available after the lock.

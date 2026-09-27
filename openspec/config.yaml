@@ -33,6 +33,12 @@ context: |
   that adds a tool and claims no speed needs bitwise output and no metric
   below zero. An inconclusive run is repeated once with a longer budget on
   the kinds that decide it.
+  One trade-off is allowed. A kernel step with bitwise identical output that
+  gains a prefill metric by ten percent or more (pooled median, CI wholly
+  above zero) may be kept although a decode metric's pooled CI lies wholly
+  below zero, if no decode metric's pooled median is below -2%. The owner
+  approved this on 2026-09-27, first for the low-bit remainder tails of
+  81-q2-prefill-tails. The performance record keeps the loss visible.
   A prefill or decode step that changes kernels and whose predicted
   end-to-end effect is below the harness's resolution (a few percent on
   prefill, about one on decode) is decided on GPU time instead: ABBA pairs of

@@ -7,8 +7,11 @@ Q1) three times and dropped them each time. The tails are bit-identical and make
 Q2 prefill much faster: about +20% on a 512-token turn. But every campaign also
 read one decode metric slightly below zero, and the project rule drops a step
 when any throughput metric's pooled CI lies wholly below zero. The owner's
-question is whether a +20% prefill gain is worth up to 1% of decode. This change
-first finds out what that decode cost really is, then decides.
+question was whether a +20% prefill gain is worth up to 1% of decode. On
+2026-09-27 the owner decided it is: the Q2 pack already gained a lot of decode
+in `70`, so a decode loss of up to 2% is accepted when the same step gains
+prefill by ten percent or more. This change lands the tails under that
+trade-off.
 
 ## What is known
 
@@ -128,37 +131,31 @@ and Q1 does not touch its path.
 
 ## What Changes
 
-In this order, from `main` with `70-q2-kernels-m5` landed:
+From `main` with `80-qwen-ssd-streaming` landed:
 
-1. **S0, tool: a decode-length override in the A/B harness.**
-   `ab_bench.py --gen N` sets the tokens generated per frontier for every kind
-   in place of the defaults of 64 and 128. The metric names stay the same. The
-   summary header and the record row show the override. With `--gen 512`, a
-   fixed cost of 10 ms per phase reads about −0.1% instead of −0.8%, while a
-   cost per token keeps its size. Checked by unit tests and one A/A run.
-2. **D1, diagnosis: fixed or per token.** The Q1 gate is applied as a probe,
-   and the plain and MTP-code kinds run with the default length and with
-   `--gen 512`, one after another. A per-token timing probe
-   (`DS4_METAL_CB_TIMES=1`, or the bench's per-token times if present) shows
-   where in the phase the extra time falls. Two cheap attributions follow:
-   - the pipelines created ahead of time (a probe);
-   - mid tails only against down tails only (a probe knob).
+1. **The gate.** `qwen4_moe_mm_tails` turns the tails on for IQ2_XXS and Q2_K on
+   M5 (design D1). `DS4_QWEN4_MOE_TAILS=0` still turns them off.
+2. **The trade-off clause.** `openspec/config.yaml` gets the rule the owner
+   approved: a bitwise step that gains prefill by ten percent or more at one of
+   the harness shapes may be kept with a decode loss of at most 2%, recorded in
+   the performance record (design D2).
+3. **The guard.** One A/B against `main` on Q2, bitwise. The step is kept if a
+   prefill metric gains at least 10% and no decode metric's pooled median is
+   below -2%.
+4. **Closing:** parity with Q2 and Q4, the MTP limits, record rows for both
+   packs, the Q2 figures in `docs/SSD_STREAMING.md` (the streamed path runs the
+   same tails), and the `496b153` line of the registry.
+5. **Comparison with ds4.** At the owner's request, the child is measured
+   against upstream ds4 at its merge-base with upstream's own methods, for both
+   packs, with and without MTP. The README gains a short section on how token
+   quality and performance are checked, and the table with the change in
+   percent (design D6).
 
-   No probe code lands.
-3. **D2, the decision.** From D1, one of:
-   - **(a) the cost is fixed per decode phase:** the tails land as the default
-     on M5 for 16/10. A new clause in `openspec/config.yaml` defines when a
-     fixed per-request cost may be traded against a measured saving. If D1
-     found the source and it can be removed bit-identically, that fix lands
-     too.
-   - **(b) the cost is per token and a probe removes it:** the tails land with
-     the fix, under the existing rule.
-   - **(c) the cost is per token and nothing removes it:** the owner decides
-     between the trade-off clause (the tails on by default, with the loss
-     recorded) and the tails staying off, with `DS4_QWEN4_MOE_TAILS=1`
-     documented as the prefill-first setting.
-4. **Closing:** parity with Q2 and Q4, the MTP limits, an A/B against `main`
-   and a record row for both packs, and the `496b153` line of the registry.
+Dropped from the first plan, since the owner's decision no longer depends on
+it:
+- the `--gen N` harness option; `80`'s `--bench-arg=-n --bench-arg=N` already
+  runs longer decode phases if the question comes back;
+- the fixed-or-per-token diagnosis and the source probes.
 
 Not in scope:
 - changing the tails for Q4_K/MXFP4 or for M3 Ultra;
@@ -171,15 +168,12 @@ Not in scope:
 None.
 
 ### Modified Capabilities
-- `perf-harness`: a generation-length override, so that a fixed per-phase cost
-  can be told apart from a per-token cost.
+None. The clause is project policy in `openspec/config.yaml`, not a spec.
 
 ## Impact
 
-- `speed-bench/ab_bench.py`, `tests/test_ab_bench.py`, `speed-bench/README.md`.
-- `ds4_metal.m`: `qwen4_moe_mm_tails`, a one-line gate, only under outcomes
-  (a), (b), or (c) with the clause.
-- `openspec/config.yaml`: the trade-off clause, only under (a), or under (c)
-  with the owner's approval.
-- `docs/upstream-prs.md` (`496b153` line), `speed-bench/perf-record.md`.
+- `ds4_metal.m`: `qwen4_moe_mm_tails`, a one-line gate.
+- `openspec/config.yaml`: the trade-off clause.
+- `docs/upstream-prs.md` (`496b153` and #1056 lines), `docs/SSD_STREAMING.md`,
+  `docs/QWEN38_FLASH_NEXT.md`, `speed-bench/perf-record.md`, `README.md`.
 - No model format, API or output change: the tails are bit-identical.

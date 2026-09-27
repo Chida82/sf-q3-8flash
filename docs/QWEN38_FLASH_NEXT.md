@@ -27,6 +27,11 @@ Batched server sessions share the prefill workspace while recurrent and
 attention state stays per session. Images and steering use the ordered fallback.
 `--mtp-exact-sampling` keeps the ordinary sampling distribution.
 
+On M5 the Q2 pack runs each expert's remainder tokens in narrower prefill
+tiles. Output is identical, and prefill on a 512-token turn is about 18%
+faster, but decode is up to about 1% slower. For workloads that generate long
+answers from short prompts, `DS4_QWEN4_MOE_TAILS=0` turns the tiles off.
+
 The native context is 262144 tokens. `DS4_QWEN4_YARN_FACTOR=2` or `=4` enables
 static YaRN beyond it, with a possible quality cost on shorter prompts.
 

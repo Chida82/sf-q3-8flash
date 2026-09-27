@@ -41198,11 +41198,12 @@ static ds4_gpu_tensor *qwen4_nax_half_operand(ds4_gpu_tensor **slot, uint64_t *s
 
 static bool qwen4_moe_mm_tails(uint32_t type, uint32_t nt) {
     /* Remainder tiles measured on M3 Ultra for the low-bit experts and on M5
-     * for Q4_K gate/up with MXFP4 down. */
+     * for both packs. On M5 the low-bit tails trade a small decode loss for a
+     * large prefill gain, which the owner accepted. */
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_TAILS");
     return nt > 1u && (override >= 0 ? override != 0 :
         ((type == 16u || type == 10u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
-        ((type == 12u || type == 39u) && ds4_gpu_device_is_m5_apple_silicon()));
+        ((type == 12u || type == 39u || type == 16u || type == 10u) && ds4_gpu_device_is_m5_apple_silicon()));
 }
 
 int ds4_gpu_qwen4_moe_mm_mid_tensor(
