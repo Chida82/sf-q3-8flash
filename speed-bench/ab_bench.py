@@ -199,7 +199,7 @@ class Monitor:
 
 # --- one run ----------------------------------------------------------------
 
-def bench_cmd(tree, kind, model, csv_path, logits_dir=None):
+def bench_cmd(tree, kind, model, csv_path, logits_dir=None, extra=()):
     k = KINDS[kind]
     cmd = [str(tree / BENCH), '-m', str(model), '--prompt-file', str(ROOT / k['prompt']),
            '--frontiers', ','.join(map(str, k['frontiers'])), '-n', str(k['gen']),
@@ -208,7 +208,7 @@ def bench_cmd(tree, kind, model, csv_path, logits_dir=None):
         cmd.append('--mtp')
     if logits_dir:
         cmd += ['--dump-frontier-logits-dir', str(logits_dir)]
-    return cmd
+    return cmd + list(extra)
 
 
 def shapes(kind):
@@ -290,12 +290,17 @@ def parse_sections(err_text, kind):
     return out
 
 
-def run_bench(n, build, tree, kind, model, env, out, phase, bitwise, sections=False):
+def bench_args(args, build):
+    """Extra bench arguments of one build: the shared ones, then B's own."""
+    return list(args.bench_arg) + (list(args.b_bench_arg) if build == 'B' else [])
+
+
+def run_bench(n, build, tree, kind, model, env, out, phase, bitwise, sections=False, extra=()):
     stem = out / 'logs' / f'{n:02d}-{build}-{kind}'
     logits_dir = out / 'logits' / f'{build}-{kind}' if phase == 'warm-up' and bitwise else None
     if logits_dir:
         logits_dir.mkdir(parents=True)
-    cmd = bench_cmd(tree, kind, model, f'{stem}.csv', logits_dir)
+    cmd = bench_cmd(tree, kind, model, f'{stem}.csv', logits_dir, extra)
     start = time.time()
     with open(f'{stem}.err', 'wb') as err:
         rc = subprocess.run(cmd, cwd=tree, env=env, stdout=subprocess.DEVNULL, stderr=err).returncode
@@ -539,6 +544,9 @@ def summary(ctx, runs, table, status, correctness, sections=None):
         t = ctx[label]
         lines.append(f'{label}  {t["path"]}  {t["commit"]}{" (uncommitted changes)" if t["dirty"] else ""}')
     lines.append(f'model  {ctx["model_name"]} ({ctx["model"]})   env  {" ".join(ctx["env"]) or "-"}')
+    extra = ctx.get('bench_args', {})
+    if any(extra.values()):
+        lines.append(f'bench args  A {" ".join(extra["A"]) or "-"}   B {" ".join(extra["B"]) or "-"}')
     lines.append(f'time  {ctx["elapsed"]:.0f} s of {ctx["budget"]} s   runs {len(runs)} '
                  f'({len(runs) - len(timed)} untimed, preheat {ctx["preheat"]:.0f} s)   '
                  f'pairs {valid} valid, {len(all_pairs) - valid} dropped')
@@ -569,7 +577,9 @@ def summary(ctx, runs, table, status, correctness, sections=None):
         thin = [f'{t["kind"]} {t["metric"]}' for t in table if t['headline'] and t['n'] < 2]
     if thin and status == 'PASS':
         lines += ['', f'INCONCLUSIVE: fewer than two valid pairs for {", ".join(thin)}']
-    if sections is None:
+    if sections is None and any(ctx.get('bench_args', {}).values()):
+        lines += ['', 'record row: none (bench arguments make the figures incomparable with the record)']
+    elif sections is None:
         lines += ['', 'record row:', record_row(ctx['B']['branch'], ctx['date'][:10], ctx['B']['commit'],
                                                  ctx['model_name'], valid, status, table)]
     return '\n'.join(lines), bool(thin)
@@ -620,6 +630,10 @@ def parse_args(argv):
     p.add_argument('--budget', type=int, default=480, help=f'wall-clock seconds, at most {MAX_BUDGET}')
     p.add_argument('--bitwise', action='store_true', help='also require bit-identical logits')
     p.add_argument('--env', action='append', default=[], metavar='KEY=VALUE', help='set for both builds')
+    p.add_argument('--bench-arg', action='append', default=[], metavar='ARG',
+                   help='extra bench argument for both builds (repeatable; write --bench-arg=--flag)')
+    p.add_argument('--b-bench-arg', action='append', default=[], metavar='ARG',
+                   help='extra bench argument for B only, e.g. --b-bench-arg=--ssd-streaming')
     p.add_argument('--max-gpu-temp', type=float, default=60.0)
     p.add_argument('--min-freq-of-median', type=float, default=0.90,
                    help="drop a pair when one of its runs ran below this fraction of the timed runs' "
@@ -671,14 +685,15 @@ def main(argv=None):
     ctx = {'date': now.strftime('%Y-%m-%d %H:%M UTC'), 'device': sample.get('system_info', {}).get('name', '?'),
            'mactop': version, 'A': trees['A'], 'B': trees['B'], 'model': str(model),
            'model_name': model_label(model), 'env': args.env,
-           'budget': args.budget, 'kinds': args.kinds, 'sections': args.sections}
+           'budget': args.budget, 'kinds': args.kinds, 'sections': args.sections,
+           'bench_args': {b: bench_args(args, b) for b in ('A', 'B')}}
     counter = iter(range(1, 10_000))
     refs = {}
     runs = []
 
     def runner(build, kind, phase):
         run = run_bench(next(counter), build, trees[build]['path'], kind, model, env, out, phase, args.bitwise,
-                        bool(args.sections))
+                        bool(args.sections), bench_args(args, build))
         monitor.check()
         refs.setdefault(kind, run)  # the first run of a kind is A's warm-up
         print(f'  run {run["n"]:2d} {build} {kind:<9} {phase:<7} {run["duration"]:.1f} s',

@@ -206,6 +206,43 @@ test-qwen4-prefill-reuse: tests/test_qwen4_conv_parallel tests/test_qwen4_moe_mm
 test-qwen4-q2: $(QWEN4_KERNEL_TEST) tests/test_qwen4_moe_mm_specialize
 	DS4_TEST_QWEN4_MV_EXACT=1 ./$(QWEN4_KERNEL_TEST)
 	./tests/test_qwen4_moe_mm_specialize
+.PHONY: test-qwen4-moe-mm-compact
+test-qwen4-moe-mm-compact:
+	python3 tests/test_qwen4_moe_mm_compact.py --sanitize
+
+
+tests/test_qwen4_ssd_experts.o: tests/test_qwen4_ssd_experts.c ds4_gpu.h
+	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
+
+tests/ds4_metal_qwen_ssd.o: ds4_metal.m ds4_gpu.h ds4_gpu_tp.h $(METAL_SRCS) tests/qwen4_ssd_pread_probe.h
+	$(CC) $(OBJCFLAGS) -include tests/qwen4_ssd_pread_probe.h -c -o $@ ds4_metal.m
+
+tests/test_qwen4_ssd_experts: tests/test_qwen4_ssd_experts.o $(filter-out ds4_metal.o,$(CORE_OBJS)) tests/ds4_metal_qwen_ssd.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-qwen4-ssd-experts
+test-qwen4-ssd-experts: tests/test_qwen4_ssd_experts
+	./tests/test_qwen4_ssd_experts
+
+tests/test_qwen4_memory.o: tests/test_qwen4_memory.c ds4.c ds4.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_qwen4_memory: tests/test_qwen4_memory.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(LDLIBS)
+
+.PHONY: test-qwen4-memory
+test-qwen4-memory: tests/test_qwen4_memory
+	./tests/test_qwen4_memory
+
+tests/test_metal_ssd_reuse.o: tests/test_metal_ssd_reuse.m ds4_metal.m ds4_gpu.h ds4_gpu_tp.h
+	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
+
+tests/test_metal_ssd_reuse: tests/test_metal_ssd_reuse.o ds4_image.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-metal-ssd-reuse
+test-metal-ssd-reuse: tests/test_metal_ssd_reuse
+	./tests/test_metal_ssd_reuse
 
 tests/test_q8_prefill_variants: tests/test_q8_prefill_variants.c $(CORE_OBJS)
 	$(CC) $(CFLAGS) -fno-fast-math -I. -o $@ $^ $(METAL_LDLIBS)
@@ -334,6 +371,7 @@ clean:
 	rm -f tests/test_layer_pack tests/test_prompt_prefix tests/test_sampling tests/test_qwen4_ngrams tests/test_qwen4_ngram_state
 	rm -f tests/test_image_decode
 	rm -f tests/test_qwen4_kernels tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_qwen4_vision
+	rm -f tests/test_qwen4_memory tests/test_qwen4_ssd_experts tests/test_metal_ssd_reuse tests/ds4_metal_qwen_ssd.o
 	rm -f tests/test_metal_tp_bulk tests/test_metal_tp_cancel tests/test_tp_link tests/test_qwen4_prefill
 	rm -f tests/test_mxfp4_metal tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_metal_ssd_experts tests/test_metal_command_memory tests/test_ssd_cache tests/test_quality_api
 	rm -f speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/session_concurrency_bench

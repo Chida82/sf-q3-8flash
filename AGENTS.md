@@ -23,6 +23,7 @@ relevant document under `docs/` before changing a subsystem.
 | Speculation | Built-in Qwen MTP (`--mtp`); no external support model or DSpark |
 | Steering | `--dir-steering-file`, FFN/attention scales, `/steer`, `dir-steering/` |
 | Distributed | TP/RDMA/pipeline plumbing stays, even where Qwen currently rejects a mode |
+| SSD streaming | `--ssd-streaming`: routed experts from disk into a bounded cache, token-identical to resident; see `docs/SSD_STREAMING.md` |
 | Upstream base | never written down: `git describe --tags --match 'sync-*' --abbrev=0` names the last sync, `git merge-base HEAD upstream/main` the base. A SHA typed into a file is a second source of truth that goes stale (SPEC.md §A) |
 
 Do not add `ds4-agent`, CUDA, ROCm, another model, or generic model-selection
@@ -180,7 +181,9 @@ When in doubt, prove it: build with the symbol removed, or add a one-line
   Qwen's graph. Qwen sessions run on `ds4_qwen4_gpu_graph`:
   `ds4_session_create` returns from the Qwen branch before
   `metal_graph_alloc_raw_cap`, so `s->graph` stays zeroed, and engine open
-  rejects TP, pipeline execution, SSD streaming and power throttling for Qwen.
+  rejects TP, pipeline execution and power throttling for Qwen. Qwen's SSD
+  streaming runs on its own graph, through `ds4_gpu_qwen4_moe_stream_tensor`
+  and the generic stream expert cache, not on this one.
   Anything that builds the DeepSeek graph on Qwen weights crashes (the removed
   `--imatrix-*` and `--metal-graph-*-test` all did). What remains of that graph
   is kept on purpose for the TP and pipeline plumbing (SPEC.md §B), not because

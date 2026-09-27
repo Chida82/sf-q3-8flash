@@ -15,7 +15,9 @@ make -j8
 The Q2 GGUF is about 137.10 GiB with 41.73 GiB of resident weights. Q4 is about
 165.11 GiB with 69.74 GiB resident. Both include MTP weights and the 95.37 GiB
 BF16 n-gram table. The n-grams remain on disk and selected rows are read from
-the GGUF, so use a fast local SSD.
+the GGUF, so use a fast local SSD. With `--ssd-streaming` the routed experts
+stay on disk as well and only 6.32 GiB of weights must be resident, so the
+model runs on smaller Macs; see `docs/SSD_STREAMING.md`.
 
 Enable built-in speculation with `--mtp`. `--nothink` disables reasoning. The
 server advertises `qwen3.8-flash-next`, `qwen3.8-flash-next-chat`, and
@@ -53,6 +55,7 @@ make test-qwen4-vision
 ```sh
 make test-qwen4-kernels test-qwen4-q2 test-qwen4-prefill-reuse
 make test-q8-prefill-variants test-qwen4-ngrams
+make test-qwen4-ssd-experts test-qwen4-memory test-metal-ssd-reuse test-qwen4-moe-mm-compact
 DS4_TEST_MODEL=/path/to/main-with-mtp.gguf DS4_TEST_GLM_MTP=1 ./ds4_test
 python3 tests/test_qwen4_checkpoint_replay.py --model /path/to/main-with-mtp.gguf
 python3 tests/test_qwen4_mtp_limits.py --model /path/to/main-with-mtp.gguf
@@ -64,6 +67,6 @@ The checkpoint tests cover chunk boundaries, rollback, repeated restores, and
 truncated payloads. The logit test compares all-row prefill with teacher-forced
 decode. The steering test covers all 48 trunk layers.
 
-Qwen tensor-parallel, pipeline, and full model-weight SSD streaming execution
-remain unavailable until their recurrent-state contracts are implemented and
-verified; their shared infrastructure stays in this child.
+Qwen tensor-parallel and pipeline execution remain unavailable until their
+recurrent-state contracts are implemented and verified; their shared
+infrastructure stays in this child.

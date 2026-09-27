@@ -273,6 +273,31 @@ class CorrectnessTest(unittest.TestCase):
         self.assertIn("vocabulary index 2", problem)
 
 
+class BenchArgsTest(unittest.TestCase):
+    def test_b_only_argument_reaches_b(self):
+        args = ab.parse_args(["--a", ".", "--b", ".", "--bench-arg=--simulate-used-memory", "--bench-arg=80GB",
+                              "--b-bench-arg=--ssd-streaming"])
+        self.assertEqual(ab.bench_args(args, "A"), ["--simulate-used-memory", "80GB"])
+        self.assertEqual(ab.bench_args(args, "B"), ["--simulate-used-memory", "80GB", "--ssd-streaming"])
+        cmd = ab.bench_cmd(Path("t"), "plain", "m.gguf", "x.csv", extra=ab.bench_args(args, "B"))
+        self.assertEqual(cmd[-3:], ["--simulate-used-memory", "80GB", "--ssd-streaming"])
+
+    def test_header_names_arguments_and_row_is_suppressed(self):
+        runs = quads("plain", [1, 1], [1, 1])
+        ctx = {"date": "2026-09-24 20:00 UTC", "device": "M5", "mactop": "2", "model": "/m.gguf",
+               "model_name": "m.gguf", "env": [], "preheat": 210, "elapsed": 1, "budget": 480,
+               "kinds": ["plain"], "bench_args": {"A": [], "B": ["--ssd-streaming"]},
+               "A": {"path": "a", "commit": "a1", "dirty": False},
+               "B": {"path": "b", "commit": "b1", "branch": "perf/x", "dirty": True}}
+        text, _ = ab.summary(ctx, runs, ab.verdict(runs, ["plain"]), "PASS", "PASS (tokens)")
+        self.assertIn("bench args  A -   B --ssd-streaming", text)
+        self.assertIn("record row: none", text)
+        self.assertNotIn("| perf/x |", text)
+        ctx["bench_args"] = {"A": [], "B": []}
+        text, _ = ab.summary(ctx, runs, ab.verdict(runs, ["plain"]), "PASS", "PASS (tokens)")
+        self.assertIn("| perf/x |", text)
+
+
 class EnvironmentTest(unittest.TestCase):
     def test_mactop_stream_and_missing_field(self):
         sample = {"timestamp": "2026-09-24T20:00:00+02:00", "thermal_state": "Nominal",

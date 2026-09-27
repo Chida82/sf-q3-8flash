@@ -55,6 +55,11 @@ Kinds (`--kinds`, default all three):
 
 `--env KEY=VALUE` sets a variable for both builds (inherited `DS4_*` variables
 are dropped), for example `--env DS4_QWEN4_MTP_DEPTH=3` to force the MTP depth.
+`--bench-arg=ARG` appends ARG to both builds' bench command and
+`--b-bench-arg=ARG` to B's only (repeatable; write the `=` form, since ARG
+starts with `--`). With `--b-bench-arg=--ssd-streaming` and the same tree as A
+and B, the correctness gate compares streamed tokens with resident ones. A
+summary made with bench arguments prints no record row.
 `-m` selects another GGUF, such as the Q2 pack.
 
 Exit status: 0 correct, with a verdict; 1 tokens or bits differ, or a run

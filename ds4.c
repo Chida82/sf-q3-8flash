@@ -13,6 +13,9 @@
  * no-copy MTLBuffers.
  */
 
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <float.h>
@@ -755,6 +758,63 @@ static bool ds4_qwen4_layer_is_ple(uint32_t il) {
 static bool ds4_qwen4_layer_is_nextn(uint32_t il) {
     return ds4_model_is_qwen4() && DS4_N_NEXTN_PREDICT != 0 &&
            il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER;
+}
+
+static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
+    const char *env = getenv("DS4_QWEN4_PREFILL_CHUNK");
+    const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : 8192ul;
+    uint32_t chunk = v == 0 || v > 65536ul ? 8192u : (uint32_t)v;
+    return chunk > ctx ? ctx : chunk;
+}
+
+static ds4_context_memory qwen4_graph_memory_estimate(uint32_t ctx, uint32_t prefill_chunk) {
+    ds4_context_memory m = {0};
+    /* Match the bounded graph workspace, including CPU staging. This API
+     * has no MTP flag, so an embedded predictor reserves its primary and
+     * both lazy verifier snapshots as well as the live recurrent state. */
+    uint64_t T = prefill_chunk ? prefill_chunk : qwen4_prefill_chunk_tokens(ctx);
+    if (T > ctx) T = ctx;
+    const uint64_t blocks = ctx / 4u + 1u, E = DS4_N_EMBD, hc_dim = E * DS4_N_HC;
+    const uint64_t kv_row = 2ull * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
+    const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
+    const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t iq_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+    const uint64_t k_blocks = DS4_N_INDEXER_TOP_K / 4u;
+    const uint64_t hc = DS4_N_HC, F = DS4_N_FF_EXP, used = DS4_N_EXPERT_USED;
+    const bool mtp = DS4_N_NEXTN_PREDICT != 0;
+    uint32_t n_attn = 0, n_linear = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_qwen4_layer_is_linear(il)) n_linear++;
+        else n_attn++;
+    }
+    m.prefill_cap = (uint32_t)T;
+    m.raw_cap = ctx;
+    m.comp_cap = (uint32_t)blocks;
+    m.raw_bytes = (uint64_t)n_attn * ctx * kv_row + (uint64_t)ctx * 16u;
+    m.compressed_bytes = (uint64_t)n_attn * ((uint64_t)ctx * DS4_N_INDEXER_HEAD_DIM * 4u + blocks * DS4_N_INDEXER_HEAD_DIM * 2u);
+    const uint64_t old_row = 12u * hc_dim + 24u * E + (used + 1u) * (E + 2u * F) + 2u * blocks;
+    /* qwen4_graph_alloc: eight HC chunks; decode attention has 64 splits.
+     * Keep these constants available to the CPU-only memory estimator. */
+    const uint64_t gpu_row = 6u * hc_dim + 2u * DS4_N_HC_LOWRANK + 16u * hc * hc +
+        5u * E + conv_dim + 2u * v_dim + 2u * DS4_N_LIN_V_HEAD + 5u * q_dim +
+        2u * kv_dim + 2u * iq_dim + DS4_N_INDEXER_HEAD_DIM + blocks + blocks / 8u +
+        5u * k_blocks + 7u + 2u * DS4_N_EXPERT + 2u * used + (used + 1u) * (F + E) + 3u * F;
+    const uint64_t state = (uint64_t)n_linear *
+        (v_dim * DS4_N_LIN_HEAD_DIM + (DS4_N_LIN_CONV - 1u) * conv_dim) +
+        (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * hc_dim;
+    const uint64_t attn_part = 3u * (uint64_t)DS4_N_HEAD * 64u * (2u + DS4_N_HEAD_DIM);
+    /* GPU + host logits, session logits/probabilities, and four verify
+     * rows. Predictor vocabulary subsets and optional steering are extra
+     * model allocations, not graph workspace. */
+    uint64_t fixed = (mtp ? 4u : 1u) * state + attn_part + DS4_N_EXPERT +
+        (uint64_t)(mtp ? 12u : 4u) * DS4_N_VOCAB;
+    if (mtp) fixed += 12u * (hc + 1u) * E + 1u +
+        2u * (((uint64_t)DS4_N_VOCAB + 4095u) / 4096u);
+    m.scratch_bytes = (T * ((gpu_row > old_row ? gpu_row : old_row) + hc_dim + 4u) + fixed) * 4u;
+    m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
+    return m;
 }
 
 static int g_ds4_lock_fd = -1;
@@ -3796,6 +3856,36 @@ static bool streaming_layer_routed_expert_bytes(
     return true;
 }
 
+static DS4_MAYBE_UNUSED bool streaming_layer_gate_down_expert_bytes(
+        const ds4_layer_weights *layer,
+        uint64_t               *gate_expert_bytes,
+        uint64_t               *down_expert_bytes) {
+    if (gate_expert_bytes) *gate_expert_bytes = 0;
+    if (down_expert_bytes) *down_expert_bytes = 0;
+    if (!layer ||
+        !gate_expert_bytes ||
+        !down_expert_bytes ||
+        !layer->ffn_gate_exps ||
+        !layer->ffn_down_exps) {
+        return false;
+    }
+
+    const uint64_t gate_row_bytes =
+        routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t down_row_bytes =
+        routed_expert_row_bytes(layer->ffn_down_exps);
+    if (gate_row_bytes == 0 ||
+        down_row_bytes == 0 ||
+        layer->ffn_gate_exps->dim[1] > UINT64_MAX / gate_row_bytes ||
+        layer->ffn_down_exps->dim[1] > UINT64_MAX / down_row_bytes) {
+        return false;
+    }
+
+    *gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
+    *down_expert_bytes = layer->ffn_down_exps->dim[1] * down_row_bytes;
+    return *gate_expert_bytes != 0 && *down_expert_bytes != 0;
+}
+
 static bool ds4_streaming_routed_expert_bytes(
         const ds4_weights *weights,
         uint64_t          *per_expert_bytes_out) {
@@ -3994,6 +4084,11 @@ static uint64_t ds4_streaming_manual_cache_safe_bytes(
 
 static uint64_t ds4_add_sat_u64(uint64_t a, uint64_t b) {
     return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+}
+
+static uint64_t ds4_mul_sat_u64(uint64_t a, uint64_t b) {
+    if (a != 0 && b > UINT64_MAX / a) return UINT64_MAX;
+    return a * b;
 }
 
 static double ds4_bytes_to_gib(uint64_t bytes) {
@@ -28704,12 +28799,6 @@ static void glm_debug_dump_prefill_logits(const float *logits) {
 
 
 
-static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
-    const char *env = getenv("DS4_QWEN4_PREFILL_CHUNK");
-    const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : 8192ul;
-    uint32_t chunk = v == 0 || v > 65536ul ? 8192u : (uint32_t)v;
-    return chunk > ctx ? ctx : chunk;
-}
 
 ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         ds4_backend backend,
@@ -28722,6 +28811,8 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
     (void)ssd_streaming;
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
+    if (ds4_backend_uses_graph(backend) && ds4_model_is_qwen4() && ssd_streaming)
+        return qwen4_graph_memory_estimate(ctx, prefill_chunk);
     if (ds4_backend_uses_graph(backend) && ds4_model_is_qwen4()) {
         /* per-token f16 K/V and raw indexer keys per attention layer, pooled
          * block keys, rope positions; transients scale with the prefill chunk */
@@ -28970,6 +29061,8 @@ typedef enum {
 
 struct ds4_engine {
     char *model_path;
+    uint64_t qwen4_session_bytes;
+    uint64_t qwen4_emulated_available; /* --simulate-used-memory: RAM left at open */
     ds4_model model;
     ds4_model vision_model;
     ds4_vocab vocab;
@@ -31524,6 +31617,7 @@ typedef struct ds4_qwen4_gpu_graph {
     uint32_t sel_stride;
     /* false when the scratch above is borrowed from the engine's arena */
     bool owns_scratch;
+    bool ssd_streaming;
     ds4_gpu_tensor *R, *xn, *lo, *inj, *mixed, *blk;
     ds4_gpu_tensor *qkv, *z, *ga, *gb, *lin_o;
     ds4_gpu_tensor *ple_emb, *ple_key, *ple_val, *ple_gated, *ple_normed, *ple_hist;
@@ -32533,8 +32627,9 @@ static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elaps
     return qwen4_graph_begin_commands_if_needed();
 }
 
-static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T) {
-    const bool profile = T > 8u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
+static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                           uint32_t il, uint32_t T) {
+    const bool profile = !g->ssd_streaming && T > 8u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
     double elapsed[7] = {0}, last = 0;
     if (!qwen4_moe_profile_boundary(profile, &last, &elapsed[0])) return false;
     bool ok = qwen4_gemv(g->router, m, l->ffn_gate_inp, g->mixed, T) &&
@@ -32564,6 +32659,49 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
         qwen4_expert_type_has_mm(l->ffn_down_exps->type) &&
         qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
         qwen4_graph_dense_ok(l->ffn_down_shexp);
+    if (g->ssd_streaming) {
+        /* The shared expert takes the resident path's form: dense projections
+         * for prefill tiles and for batches above eight rows (as shared_dense
+         * below), a slot of the row kernels otherwise. */
+        const bool shared_dense = mm || (T > 8u &&
+            qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
+            qwen4_graph_dense_ok(l->ffn_down_shexp));
+        uint64_t gate_bytes = 0, down_bytes = 0;
+        if (!streaming_layer_gate_down_expert_bytes(l, &gate_bytes, &down_bytes) ||
+            l->ffn_gate_exps->type != l->ffn_up_exps->type ||
+            l->ffn_gate_exps->bytes != l->ffn_up_exps->bytes) return false;
+        const ds4_gpu_stream_expert_table table = {
+            .model_map = m->map, .model_size = m->size, .layer = il,
+            .n_total_expert = DS4_N_EXPERT,
+            .gate_offset = l->ffn_gate_exps->abs_offset,
+            .up_offset = l->ffn_up_exps->abs_offset,
+            .down_offset = l->ffn_down_exps->abs_offset,
+            .gate_expert_bytes = gate_bytes, .down_expert_bytes = down_bytes,
+        };
+        /* Keep prefill's expert lists and the shared expert's form exactly as
+         * in the resident path. Only routed weight storage changes; the final
+         * slot reduction and HC combine remain unchanged. */
+        if (ok && mm) ok = ds4_gpu_qwen4_moe_build_lists_tensor(
+            g->moe_lists, g->moe_counts, g->selected, T, DS4_N_EXPERT_USED,
+            DS4_N_EXPERT, g->cap_tokens) != 0;
+        if (ok) ok = ds4_gpu_qwen4_moe_stream_tensor(
+            g->mid, g->part, g->mixed, g->selected,
+            mm ? g->moe_lists : NULL, mm ? g->moe_counts : NULL, &table,
+            l->ffn_gate_exps->type, l->ffn_down_exps->type, T, DS4_N_EXPERT_USED,
+            DS4_N_EMBD, DS4_N_FF_EXP, g->cap_tokens,
+            l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+            l->ffn_down_shexp->abs_offset,
+            shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type,
+            shared_dense ? UINT32_MAX : l->ffn_down_shexp->type) != 0;
+        if (ok && shared_dense) ok = qwen4_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
+            qwen4_gemv(g->sh_up, m, l->ffn_up_shexp, g->mixed, T) &&
+            ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * DS4_N_FF_EXP, 0.0f, 1.0f) &&
+            qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->sh_mid, T);
+        return ok && ds4_gpu_qwen4_moe_reduce_tensor(
+            g->blk, g->part, g->weights, g->sh_gate_logit, shared_dense ? g->sh_out : NULL,
+            g->R, g->inj, T, DS4_N_EXPERT_USED, DS4_N_EXPERT_USED + (shared_dense ? 0u : 1u),
+            DS4_N_EMBD, DS4_N_HC) != 0;
+    }
     if (mm) {
         if (ok) {
             ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, DS4_N_EXPERT_USED,
@@ -32832,7 +32970,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
         }
         if (ok) ok = qwen4_prof_cut(g, QWEN4_PROF_HC_FFN);
-        if (ok) ok = qwen4_graph_moe(g, m, l, T);   /* the reduce folds the combine in */
+        if (ok) ok = qwen4_graph_moe(g, m, l, il, T);   /* the reduce folds the combine in */
         if (ok && g->prompt_rows)
             metal_graph_debug_dump_tensor("qwen_router", g->router,
                                            (uint64_t)T * DS4_N_EXPERT, il, pos0);
@@ -33080,7 +33218,7 @@ static bool qwen4_graph_nextn_layer(ds4_qwen4_gpu_graph *g, const ds4_model *m, 
            qwen4_graph_attention(g, m, l, il, idx, T) &&
            ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0 &&
            qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T) &&
-           qwen4_graph_moe(g, m, l, T);
+           qwen4_graph_moe(g, m, l, il, T);
 }
 
 /* The steering bank contains trunk layers only. The predictor remains
@@ -33268,6 +33406,8 @@ static int generate_qwen4_metal_argmax(
         const token_vec   * prompt,
         int                 n_predict,
         int                 ctx_size,
+        bool                ssd_streaming,
+        uint32_t            prefill_chunk,
         const char        * directional_steering_file,
         float               directional_steering_attn,
         float               directional_steering_ffn,
@@ -33281,10 +33421,13 @@ static int generate_qwen4_metal_argmax(
         return 1;
     }
     ds4_qwen4_gpu_graph *g = xcalloc(1, sizeof(*g));
-    if (!qwen4_graph_alloc(g, weights, (uint32_t)ctx_size, qwen4_prefill_chunk_tokens((uint32_t)ctx_size), false, NULL, NULL, NULL, 0)) {
+    const uint32_t cap = prefill_chunk && prefill_chunk < (uint32_t)ctx_size ?
+        prefill_chunk : qwen4_prefill_chunk_tokens((uint32_t)ctx_size);
+    if (!qwen4_graph_alloc(g, weights, (uint32_t)ctx_size, cap, false, NULL, NULL, NULL, 0)) {
         free(g);
         return 1;
     }
+    g->ssd_streaming = ssd_streaming;
     if (!qwen4_graph_load_steering(g, directional_steering_file,
                                   directional_steering_attn, directional_steering_ffn)) {
         qwen4_graph_free(g);
@@ -33381,7 +33524,8 @@ static int generate_metal_graph_raw_swa(
         fprintf(stderr, "ds4: prompt is empty or exceeds context size\n");
         return 1;
     }
-    return generate_qwen4_metal_argmax(model, vocab, weights, prompt, n_predict, ctx_size,
+    return generate_qwen4_metal_argmax(model, vocab, weights, prompt, n_predict, ctx_size, ssd_streaming,
+                                       prefill_chunk,
                                        directional_steering_file,
                                        directional_steering_attn, directional_steering_ffn,
                                        emit, done, emit_ud, progress, progress_ud);
@@ -33399,6 +33543,8 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
     (void)ssd_streaming;
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
+    if (ds4_backend_uses_graph(backend) && ds4_model_is_qwen4())
+        return qwen4_graph_memory_estimate(ctx, prefill_chunk);
 
     m.raw_cap = ds4_default_raw_cap(ctx);
     m.raw_bytes = (uint64_t)DS4_N_LAYER *
@@ -33790,6 +33936,7 @@ struct ds4_session {
     ds4_gpu_graph graph;
 #ifdef DS4_HAS_QWEN4_GPU
     ds4_qwen4_gpu_graph qwen4_graph;
+    uint64_t qwen4_reserved_graph_bytes;
     bool qwen4_graph_ready;
     int qwen4_slot;   /* -1 when the session holds private recurrent state */
     bool qwen4_rewound;
@@ -36367,6 +36514,21 @@ int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen)
  * 4. fall back to ordinary one-token decode if the fast verifier cannot prove
  *    the target stream. */
 
+static uint64_t glm_graph_host_memory_bytes(void) {
+#if defined(__APPLE__)
+    uint64_t mem = 0;
+    size_t len = sizeof(mem);
+    if (sysctlbyname("hw.memsize", &mem, &len, NULL, 0) != 0) return 0;
+    return mem;
+#else
+    return 0;
+#endif
+}
+
+#ifdef DS4_HAS_QWEN4_METAL
+static bool qwen4_streaming_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cache);
+#endif
+
 int ds4_engine_generate_argmax(
         ds4_engine        *e,
         const ds4_tokens  *prompt,
@@ -36444,7 +36606,23 @@ int ds4_engine_generate_argmax(
             ds4_session_free(s);
             return rc;
         }
-        return generate_metal_graph_raw_swa(model, vocab, weights, prompt,
+#ifdef DS4_HAS_QWEN4_METAL
+        uint64_t qwen4_reserved = 0;
+        if (ds4_model_is_qwen4() && e->ssd_streaming) {
+            if (ctx_size <= 0) return 1;
+            const uint32_t cap = e->prefill_chunk && e->prefill_chunk < (uint32_t)ctx_size ?
+                e->prefill_chunk : qwen4_prefill_chunk_tokens((uint32_t)ctx_size);
+            const ds4_context_memory memory = ds4_context_memory_estimate_with_prefill_mode(
+                e->backend, ctx_size, cap, true);
+            if (!qwen4_streaming_memory_admit(e,
+                    ds4_add_sat_u64(e->qwen4_session_bytes, memory.total_bytes), false)) return 1;
+            /* This API owns a temporary graph; reserve it across callbacks
+             * as well, so sessions created there include the live graph. */
+            qwen4_reserved = memory.total_bytes;
+            e->qwen4_session_bytes += qwen4_reserved;
+        }
+#endif
+        const int result = generate_metal_graph_raw_swa(model, vocab, weights, prompt,
                                             n_predict, ctx_size, e->quality,
                                             e->ssd_streaming,
                                             e->ssd_streaming_cold,
@@ -36458,6 +36636,10 @@ int ds4_engine_generate_argmax(
                                             e->directional_steering_ffn_scale,
                                             emit, done, emit_ud,
                                             progress, progress_ud);
+#ifdef DS4_HAS_QWEN4_METAL
+        e->qwen4_session_bytes -= qwen4_reserved;
+#endif
+        return result;
 #else
         fprintf(stderr, "ds4: %s generation requested but this build has no graph backend support\n",
                 ds4_backend_name(e->backend));
@@ -38945,6 +39127,148 @@ static bool engine_warm_full_model(const ds4_engine_options *opt) {
            opt->distributed.role == DS4_DISTRIBUTED_NONE;
 }
 
+/* Keep two full trunk windows for prefill. Predictor prefix catch-up only
+ * builds KV; draft and chain MoE consume one row (N_EXPERT_USED experts).
+ * Compact staging also owns three full expert-ID address tables.
+ *
+ * Retain one full predictor layer for the no-gpuAddress/older-Metal fallback
+ * and any multirow diagnostic caller. The streamed MoE wrapper drains prior
+ * commands and releases their transient buffers before allocating weights;
+ * the address fallback releases compact payloads before allocating the full
+ * layer. Thus a full predictor fallback cannot overlap earlier staging. */
+static DS4_MAYBE_UNUSED bool qwen4_streaming_staging_bytes(
+        const ds4_weights *weights, bool mtp, uint64_t *bytes_out) {
+    if (!bytes_out) return false;
+    *bytes_out = 0;
+    if (!weights || DS4_N_LAYER == 0 || DS4_N_LAYER > DS4_MAX_LAYER ||
+        DS4_N_NEXTN_PREDICT >= DS4_N_LAYER || DS4_N_EXPERT == 0 ||
+        DS4_N_EXPERT_USED == 0 || DS4_N_EXPERT_USED > DS4_N_EXPERT) return false;
+    const uint32_t trunk_layers = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const uint32_t layers = mtp ? DS4_N_LAYER : trunk_layers;
+    const uint64_t addresses = ds4_mul_sat_u64(DS4_N_EXPERT, 3u * sizeof(uint64_t));
+    uint64_t staging = 0;
+    for (uint32_t il = 0; il < layers; il++) {
+        uint64_t expert = 0;
+        if (!streaming_layer_routed_expert_bytes(&weights->layer[il], &expert)) return false;
+        const uint64_t full = ds4_mul_sat_u64(expert, DS4_N_EXPERT);
+        uint64_t window = ds4_mul_sat_u64(full, 2u);
+        if (il >= trunk_layers) {
+            const uint64_t compact = ds4_add_sat_u64(
+                ds4_mul_sat_u64(expert, DS4_N_EXPERT_USED), addresses);
+            window = ds4_mul_sat_u64(compact, 2u);
+            if (window < full) window = full;
+        }
+        if (staging < window) staging = window;
+    }
+    *bytes_out = staging;
+    return true;
+}
+
+/* Leave host headroom while respecting Metal's working-set recommendation.
+ * Do not discount that recommendation again: admission separately reserves
+ * graph/staging storage and another 2 GiB for the runtime. */
+static DS4_MAYBE_UNUSED uint64_t qwen4_streaming_memory_budget(
+        uint64_t host, uint64_t recommended) {
+    const uint64_t host_budget = host / 8u * 7u;
+    return host_budget < recommended ? host_budget : recommended;
+}
+
+#ifdef DS4_HAS_QWEN4_METAL
+/* Dense/GDN/HC weights stay mapped; bound routed staging before assigning the
+ * remaining working set to the persistent expert cache. */
+static bool qwen4_streaming_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cache) {
+    if (!e->ssd_streaming) return true;
+    const uint64_t gib = UINT64_C(1073741824);
+    const uint64_t host = glm_graph_host_memory_bytes();
+    const uint64_t recommended = ds4_gpu_recommended_working_set_size();
+    if (!host || !recommended) {
+        fprintf(stderr, "ds4: cannot determine Qwen SSD memory budget\n");
+        return false;
+    }
+    /* --simulate-used-memory locks memory to emulate a smaller machine: plan
+     * with the RAM left and Metal's recommendation scaled to it, as that
+     * machine would report them. */
+    const uint64_t used = e->simulated_memory.bytes < host ? e->simulated_memory.bytes : host;
+    uint64_t left = host - used;
+    if (used) {
+        /* This machine also runs other processes, which the emulated one
+         * would not. Plan within what was available right after the lock,
+         * sampled once at open (later calls would count our own cache), so
+         * the emulation cannot push the real host into swap. */
+        vm_statistics64_data_t vm;
+        mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+        vm_size_t page = 0;
+        const host_t self = fit_cache ? mach_host_self() : MACH_PORT_NULL;
+        const bool sampled = fit_cache && host_page_size(self, &page) == KERN_SUCCESS &&
+            host_statistics64(self, HOST_VM_INFO64, (host_info64_t)&vm, &count) == KERN_SUCCESS;
+        if (self != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), self);
+        if (sampled) {
+            /* wired (the lock included) and app memory are taken; file cache is not */
+            const uint64_t taken = ((uint64_t)vm.wire_count + vm.internal_page_count + vm.compressor_page_count -
+                                    (vm.purgeable_count < vm.internal_page_count ? vm.purgeable_count : 0)) * page;
+            e->qwen4_emulated_available = taken < host ? host - taken : 1;
+            /* Metal buffers in use are wired, and the lock already holds most
+             * of the host's user wire limit: plan within what is left of it. */
+            uint64_t wire_limit = 0;
+            size_t len = sizeof(wire_limit);
+            const uint64_t wired = (uint64_t)vm.wire_count * page;
+            if (sysctlbyname("vm.user_wire_limit", &wire_limit, &len, NULL, 0) == 0 && wire_limit != 0) {
+                const uint64_t room = wire_limit > wired ? wire_limit - wired : 1;
+                if (room < e->qwen4_emulated_available) e->qwen4_emulated_available = room;
+            }
+        }
+        if (e->qwen4_emulated_available && e->qwen4_emulated_available < left) left = e->qwen4_emulated_available;
+    }
+    const uint64_t budget = qwen4_streaming_memory_budget(left,
+        used ? (uint64_t)((double)recommended * ((double)left / (double)host)) : recommended);
+    uint64_t statics = 0, expert_bytes = 0, max_experts = 0, staging = 0;
+    if (!weights_streaming_non_routed_bytes(&e->weights, &statics) ||
+        !ds4_streaming_routed_expert_bytes(&e->weights, &expert_bytes) ||
+        !ds4_streaming_cacheable_expert_count(&e->weights, &max_experts, NULL) ||
+        !qwen4_streaming_staging_bytes(&e->weights, e->glm_mtp, &staging)) return false;
+    const uint64_t fixed = ds4_add_sat_u64(ds4_add_sat_u64(statics, e->vision_model.size),
+        ds4_add_sat_u64(graph_bytes, ds4_add_sat_u64(staging, 2u * gib)));
+    if (fixed >= budget || budget - fixed < expert_bytes) {
+        fprintf(stderr, "ds4: Qwen SSD needs %.2f GiB before the expert cache; safe budget %.2f GiB. "
+                        "Reduce context or prefill chunk.\n",
+                ds4_bytes_to_gib(fixed), ds4_bytes_to_gib(budget));
+        return false;
+    }
+    uint64_t count = (budget - fixed) / expert_bytes;
+    if (count > max_experts) count = max_experts;
+    if (!fit_cache) {
+        if (e->ssd_streaming_cache_experts > count) {
+            fprintf(stderr, "ds4: no room for another Qwen SSD session; reduce context or expert cache\n");
+            return false;
+        }
+        return true;
+    }
+    uint64_t requested = e->ssd_streaming_cache_experts;
+    if (e->ssd_streaming_cache_bytes) {
+        if (e->ssd_streaming_cache_bytes <= staging ||
+            e->ssd_streaming_cache_bytes - staging < expert_bytes) {
+            fprintf(stderr, "ds4: Qwen SSD cache target must exceed %.2f GiB for prefill staging\n",
+                    ds4_bytes_to_gib(staging + expert_bytes));
+            return false;
+        }
+        requested = (e->ssd_streaming_cache_bytes - staging) / expert_bytes;
+    }
+    if (requested && requested < count) count = requested;
+    if (requested > count) fprintf(stderr, "ds4: Qwen SSD cache capped from %llu to %llu experts\n",
+                                  (unsigned long long)requested, (unsigned long long)count);
+    e->ssd_streaming_cache_experts = (uint32_t)count;
+    e->ssd_streaming_cache_bytes = count * expert_bytes;
+    e->ssd_streaming_prefill_headroom_bytes = staging;
+    e->ssd_streaming_static_decode_map = true;
+    e->ssd_streaming_decode_map_bytes = statics;
+    fprintf(stderr, "ds4: Qwen SSD: %.2f GiB static weights, %.2f GiB graph reserve, "
+                    "%.2f GiB staging, %u cached experts (%.2f GiB)\n",
+            ds4_bytes_to_gib(statics), ds4_bytes_to_gib(graph_bytes), ds4_bytes_to_gib(staging),
+            e->ssd_streaming_cache_experts, ds4_bytes_to_gib(e->ssd_streaming_cache_bytes));
+    return true;
+}
+#endif
+
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     return ds4_engine_open_internal(out, opt, NULL);
@@ -39035,6 +39359,23 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->share_session_prefill_workspace = opt->share_session_prefill_workspace;
     ds4_acquire_instance_lock();
 
+    if (opt->simulate_used_memory_bytes != 0 && !e->ssd_streaming) {
+        /* A resident model has nothing to adapt: locking the emulated memory
+         * beside it thrashes the whole machine (it hung a 128 GiB Mac once).
+         * Refuse before locking unless model plus lock fit the host budget. */
+        struct stat st;
+        const uint64_t host = glm_graph_host_memory_bytes();
+        if (stat(opt->model_path, &st) == 0 && host != 0 &&
+            ds4_add_sat_u64((uint64_t)st.st_size, opt->simulate_used_memory_bytes) > host / 8u * 7u) {
+            fprintf(stderr, "ds4: --simulate-used-memory %.2f GiB plus the resident model (%.2f GiB) exceeds "
+                            "the %.2f GiB host budget; use --ssd-streaming or a smaller value\n",
+                    ds4_bytes_to_gib(opt->simulate_used_memory_bytes), ds4_bytes_to_gib((uint64_t)st.st_size),
+                    ds4_bytes_to_gib(host / 8u * 7u));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+    }
     if (opt->simulate_used_memory_bytes != 0 &&
         !ds4_ssd_memory_lock_acquire(&e->simulated_memory,
                                      opt->simulate_used_memory_bytes)) {
@@ -39067,6 +39408,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     config_validate_model(&e->model);
     if (ds4_model_is_qwen4() && !opt->inspect_only) {
+        if (e->ssd_streaming && (e->ssd_streaming_full_layers || e->ssd_streaming_preload_experts)) {
+            fprintf(stderr, "ds4: Qwen SSD fills its expert cache on demand; full resident layers "
+                            "and popularity preload are not supported\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         const bool backend_ok =
 #ifdef DS4_HAS_QWEN4_GPU
             e->backend == DS4_BACKEND_METAL ||
@@ -39077,9 +39425,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (!backend_ok || opt->tp.role != DS4_TP_NONE || opt->cuda_tensor_parallel ||
             (gpu_cfg && gpu_cfg->n_gpus > 1) ||
             opt->distributed.role != DS4_DISTRIBUTED_NONE || load_slice ||
-            e->ssd_streaming || e->power_percent != 100) {
+            (e->ssd_streaming && opt->first_token_test) || e->power_percent != 100) {
             fprintf(stderr, "ds4: Qwen3.8 requires Metal (or --cpu --first-token-test); "
-                            "tensor parallelism, pipeline execution, SSD streaming "
+                            "tensor parallelism, pipeline execution, SSD first-token tests "
                             "and power throttling are not supported\n");
             ds4_engine_close(e);
             *out = NULL;
@@ -39238,7 +39586,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
-    if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
+#ifdef DS4_HAS_QWEN4_METAL
+    const bool qwen4_ssd = e->ssd_streaming &&
+        e->backend == DS4_BACKEND_METAL && ds4_model_is_qwen4();
+#else
+    const bool qwen4_ssd = false;
+#endif
+    /* Qwen admission below fits explicit and automatic cache requests against
+     * one complete budget, including static weights and every session graph. */
+    if (!qwen4_ssd && e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
         const uint64_t requested_cache_bytes = e->ssd_streaming_cache_bytes;
         const uint64_t safe_cache_bytes =
             ds4_streaming_manual_cache_safe_bytes(e->backend,
@@ -39413,12 +39769,21 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         ds4_gpu_set_quality(e->quality);
         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
-        if (!ds4_engine_configure_streaming_auto_cache(e, opt->context_size)) {
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        if (!ds4_engine_configure_streaming_cache_budget(e)) {
+#ifdef DS4_HAS_QWEN4_METAL
+        if (qwen4_ssd) {
+            const ds4_context_memory memory = ds4_context_memory_estimate_with_prefill_mode(
+                e->backend, opt->context_size > 0 ? opt->context_size : 4096, e->prefill_chunk, true);
+            const uint32_t sessions = e->placement_session_count_hint > 0 ?
+                (uint32_t)e->placement_session_count_hint : 1u;
+            if (!qwen4_streaming_memory_admit(e, ds4_mul_sat_u64(memory.total_bytes, sessions), true)) {
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+        } else
+#endif
+        if (!ds4_engine_configure_streaming_auto_cache(e, opt->context_size) ||
+            !ds4_engine_configure_streaming_cache_budget(e)) {
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -39431,16 +39796,20 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (e->ssd_streaming && !load_slice && !tp_shard &&
             getenv("DS4_METAL_DISABLE_STREAMING_STATIC_LOCK") == NULL) {
             ds4_model_map_span_vec spans;
-            uint64_t static_bytes = 0;
-            const uint64_t budget = ds4_streaming_manual_cache_safe_bytes(
-                    e->backend, opt->context_size, e->prefill_chunk, true);
-            const uint64_t experts = ds4_add_sat_u64(
-                    ds4_engine_dynamic_expert_cache_bytes(e),
-                    ds4_add_sat_u64(e->ssd_streaming_prefill_headroom_bytes,
-                                   e->ssd_streaming_full_layer_bytes));
-            const bool fits =
-                weights_streaming_non_routed_bytes(&e->weights, &static_bytes) &&
-                static_bytes <= budget && experts <= budget - static_bytes;
+            /* Qwen's admission already includes these static bytes. Applying
+             * the generic cache cap again would make admitted weights pageable. */
+            bool fits = qwen4_ssd;
+            if (!fits) {
+                uint64_t static_bytes = 0;
+                const uint64_t budget = ds4_streaming_manual_cache_safe_bytes(
+                        e->backend, opt->context_size, e->prefill_chunk, true);
+                const uint64_t experts = ds4_add_sat_u64(
+                        ds4_engine_dynamic_expert_cache_bytes(e),
+                        ds4_add_sat_u64(e->ssd_streaming_prefill_headroom_bytes,
+                                       e->ssd_streaming_full_layer_bytes));
+                fits = weights_streaming_non_routed_bytes(&e->weights, &static_bytes) &&
+                    static_bytes <= budget && experts <= budget - static_bytes;
+            }
             if (!fits) {
                 fprintf(stderr, "ds4: Metal SSD static weights remain pageable"
                         " to preserve runtime headroom\n");
@@ -39492,7 +39861,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     routed++;
                     if (!weights_streaming_layer_experts_uniform(&e->weights, il)) boosted++;
                 }
-                if (boosted > 0) {
+                if (boosted > 0 && !ds4_model_is_qwen4()) {
                     fprintf(stderr,
                             "ds4: SSD streaming mixed-precision model: %u/%u routed layers "
                             "off the slab size class will bypass the expert cache and read "
@@ -39546,7 +39915,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                       weights_have_output_head(&e->weights)));
             ds4_model_map_span_vec spans;
             bool spans_ok = false;
-                    if (load_slice) {
+            if (ds4_model_is_qwen4()) {
+                spans_ok = weights_model_map_decode_static_spans(&e->weights, true, true, &spans);
+            } else if (load_slice) {
                 if (e->ssd_streaming_static_decode_map) {
                     spans_ok = weights_model_map_decode_runtime_slice_spans(
                             &e->weights,
@@ -40375,6 +40746,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         const uint32_t cap_tokens = e->prefill_chunk && e->prefill_chunk < (uint32_t)ctx_size ?
             e->prefill_chunk : qwen4_prefill_chunk_tokens((uint32_t)ctx_size);
+        const ds4_context_memory memory = ds4_context_memory_estimate_with_prefill_mode(
+            e->backend, ctx_size, cap_tokens, e->ssd_streaming);
+        if (!qwen4_streaming_memory_admit(e,
+                ds4_add_sat_u64(e->qwen4_session_bytes, memory.total_bytes), false)) {
+            free(s);
+            return 1;
+        }
         /* Every slot of a batched server has the same shape, so one arena of
          * transients serves them all and each extra session then costs only
          * its own caches.  A session that needs a wider arena replaces it
@@ -40419,6 +40797,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                     "each further session costs its caches only\n",
                     cap_tokens, (double)arena / (1024.0 * 1024.0 * 1024.0));
         }
+        s->qwen4_graph.ssd_streaming = e->ssd_streaming;
         qwen4_graph_reset(&s->qwen4_graph);
         if (!qwen4_graph_load_steering(&s->qwen4_graph,
                                        e->directional_steering_file,
@@ -40431,6 +40810,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         s->qwen4_graph_ready = true;
         if (!s->qwen4_graph.owns_scratch) e->qwen4_arena_users++;
+        s->qwen4_reserved_graph_bytes = memory.total_bytes;
+        e->qwen4_session_bytes += memory.total_bytes;
         s->prefill_cap = (uint32_t)ctx_size;
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
@@ -40597,6 +40978,7 @@ void ds4_session_free(ds4_session *s) {
     else {
 #ifdef DS4_HAS_QWEN4_GPU
         if (ds4_session_is_qwen4(s)) {
+            if (s->engine) s->engine->qwen4_session_bytes -= s->qwen4_reserved_graph_bytes;
             if (s->engine && s->engine->glm_mtp_timing && s->qwen4_spec_cycles) {
                 fprintf(stderr, "ds4: Qwen3.8 mtp: %" PRIu64 " verify cycles, %" PRIu64 " drafts accepted (%.1f%%)\n",
                         s->qwen4_spec_cycles, s->qwen4_spec_accepted,
@@ -42963,7 +43345,7 @@ static bool qwen4_graph_encode_native_session_batch(ds4_decode_item *items, int 
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down,
                                         l->hc_ffn_up, l->hc_ffn_inject, T);
         QWEN4_BATCH_PROF(5);
-        if (ok) ok = qwen4_graph_moe(g, m, l, T);
+        if (ok) ok = qwen4_graph_moe(g, m, l, il, T);
         QWEN4_BATCH_PROF(6);
     }
     /* The output matrix is the single largest weight read of a decode step,
@@ -43173,7 +43555,7 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
         }
         if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0;
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
-        if (ok) ok = qwen4_graph_moe(g, m, l, T);
+        if (ok) ok = qwen4_graph_moe(g, m, l, il, T);
     }
     if (ok) ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down, w->output_hc_up, NULL, T) &&
                  qwen4_gemv(g->batch_logits, m, w->output, g->mixed, T);
@@ -43234,7 +43616,7 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
                  qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, N);
     if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, N, E, hc) != 0;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, N);
-    if (ok) ok = qwen4_graph_moe(g, m, l, N);
+    if (ok) ok = qwen4_graph_moe(g, m, l, il, N);
     /* every session's last committed row, gathered for one pass of the head
      * mixer into the batch's head rows */
     for (int i = 0; ok && i < count; i++) {
@@ -43273,7 +43655,7 @@ static bool qwen4_graph_native_session_batch_check(ds4_decode_item *items, int c
                                                    const ds4_engine *e, bool speculative) {
     const char *env = getenv("DS4_QWEN4_SESSION_BATCH");
     if ((env && env[0] && strcmp(env, "0") == 0) ||
-        count < 2 || count > QWEN4_BATCH_MAX_ROWS ||
+        count < 2 || count > QWEN4_BATCH_MAX_ROWS || e->ssd_streaming ||
         !e->qwen4_shared_workspace) {
         return false;
     }
