@@ -143,6 +143,23 @@ lands. With the data, the owner can choose among:
 
 The rule itself is not written by this change unless the owner asks.
 
+### D7. What was found and built
+
+- **Cause:** H1. Verify rows were never bit-identical to single-token decode,
+  on either pack and before the priming too: on the harness's prose prompt,
+  `91f225a`'s MTP output already differs from plain greedy output. The
+  priming only changed which drafts reach a near tie.
+- **Sources:** the F16, F32 and Q8_0 matvecs take different kernels at one and
+  at two or three rows; the paired HC mixer rounds differently; the attention
+  core sets its split-K geometry and block universe from the whole batch.
+- **Fix:** the verify flag now covers every verify (two and three rows):
+  - the matvecs take the single-token kernel, as 2- and 3-row variants that
+    walk the weights once;
+  - HC gate/mix skips the pair kernel;
+  - attention runs the batched-session rows kernels.
+
+  The 2/1 splits for three rows were deleted.
+
 ## Risks / Trade-offs
 
 - **S0 is slow** (about 30 minutes per pack) → `--depths auto` for quick use.

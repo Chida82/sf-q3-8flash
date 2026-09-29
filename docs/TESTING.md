@@ -23,9 +23,15 @@ Model-backed checks require a Qwen3.8 GGUF:
 ```sh
 DS4_TEST_MODEL=/absolute/path/model.gguf DS4_TEST_GLM_MTP=1 ./ds4_test
 python3 tests/test_qwen4_mtp_limits.py --model /absolute/path/model.gguf
+python3 tests/test_qwen4_mtp_identity.py --model /absolute/path/model.gguf
 ./sf-q3-8flash-eval -m /absolute/path/model.gguf --suite core
 ./sf-q3-8flash-bench -m /absolute/path/model.gguf
 ```
+
+`test_qwen4_mtp_identity.py` compares MTP with plain greedy output on 12
+prompts at the automatic depth and at depths 2 and 3. Run it on both packs
+before landing MTP, prefill or decode work; it takes about 30 minutes per pack,
+or half with `--depths auto`.
 
 Vision parity additionally requires the original checkpoint, projector GGUF,
 and an image; see `make help` for the three environment variables.

@@ -94,6 +94,7 @@ Before a PR, when local GGUFs exist:
 ```sh
 DS4_TEST_MODEL=/absolute/path/model.gguf DS4_TEST_GLM_MTP=1 ./ds4_test
 python3 tests/test_qwen4_mtp_limits.py --model /absolute/path/model.gguf
+python3 tests/test_qwen4_mtp_identity.py --model /absolute/path/model.gguf   # Q2 and Q4, ~30 min each
 ./sf-q3-8flash-eval -m /absolute/path/model.gguf --suite core
 ./sf-q3-8flash-bench -m /absolute/path/model.gguf
 ```

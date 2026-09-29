@@ -20,6 +20,17 @@ depth for diagnosis. `--mtp-exact-sampling` preserves ordinary sampling
 semantics, and runs at depth two at nonzero temperature; greedy decoding accepts
 matching drafts directly.
 
+Greedy output with `--mtp` is byte-identical to plain greedy output. The verify
+pass scores two or three rows at once, and each row must compute exactly as a
+single decoded token would, or near ties can flip. So the verify rows take:
+- the single-token matvec for F16, F32 and Q8_0 weights, with 2- and 3-row
+  variants that read the weights once;
+- the per-row HC mixer, never the paired one;
+- the batched-session attention rows kernels, which give each row its own key
+  count, split geometry and block universe.
+
+`tests/test_qwen4_mtp_identity.py` checks this over 12 prompts at every depth.
+
 The predictor gathers token embeddings on the GPU, which reads f32, f16, bf16,
 q8_0 and q4_0 tables; `--mtp` refuses a model whose table is another type. The
 published GGUFs store it as bf16.
@@ -30,6 +41,7 @@ run the session and snapshot tests with built-in MTP enabled:
 ```sh
 DS4_TEST_MODEL=/absolute/path/model.gguf DS4_TEST_GLM_MTP=1 ./ds4_test
 python3 tests/test_qwen4_mtp_limits.py --model /absolute/path/model.gguf
+python3 tests/test_qwen4_mtp_identity.py --model /absolute/path/model.gguf
 ```
 
 There is no depth-verification target: the one inherited from upstream drove

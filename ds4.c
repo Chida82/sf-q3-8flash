@@ -31686,7 +31686,7 @@ typedef struct ds4_qwen4_gpu_graph {
     uint32_t n_logit_rows;
     bool snap_after_first;   /* set by the caller for a 2-token verify: snapshot the state after row 0 */
     bool snap_after_second;  /* 3-token verify: also snapshot the state after row 1 */
-    bool verify_rows_exact;  /* 3-token verify: split attention into 2/1-row sub-batches */
+    bool verify_rows_exact;  /* MTP verify: every row computes as a single-token decode would */
     bool snap_valid;
     /* multimodal: per-position (t, h, w) rope positions, the text counter
      * offset, and the image spans of the prompt being prefilled */
@@ -32359,33 +32359,6 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                qwen4_gemv(g->hc_u, m, up, g->hc_lo_act, T) &&
                ds4_gpu_qwen4_hc_mix_rows_tensor(g->mixed, g->hc_u, g->xn, T, DS4_N_EMBD, DS4_N_HC);
     }
-    if (T == 3u && g->verify_rows_exact) {
-        /* Split the 3-row gate/mix into the exact 2-row pair kernel plus the
-         * 1-row generic kernel, so every row matches its T <= 2 rounding. */
-        const uint64_t dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
-        ds4_gpu_tensor *xn2 = ds4_gpu_tensor_view(g->xn, 0, 2u * dim * sizeof(float));
-        ds4_gpu_tensor *lo2 = ds4_gpu_tensor_view(g->lo, 0, 2u * DS4_N_HC_LOWRANK * sizeof(float));
-        ds4_gpu_tensor *mixed2 = ds4_gpu_tensor_view(g->mixed, 0, 2u * DS4_N_EMBD * sizeof(float));
-        const bool ok2 = xn2 && lo2 && mixed2 &&
-            ds4_gpu_qwen4_hc_gate_mix_tensor(mixed2, xn2, lo2, m->map, m->size, up->abs_offset,
-                                             up->type, 2u, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
-        ds4_gpu_tensor_free(mixed2);
-        ds4_gpu_tensor_free(lo2);
-        ds4_gpu_tensor_free(xn2);
-        if (!ok2) return false;
-        ds4_gpu_tensor *xn1 = ds4_gpu_tensor_view(g->xn, 2u * dim * sizeof(float), dim * sizeof(float));
-        ds4_gpu_tensor *lo1 = ds4_gpu_tensor_view(g->lo, 2u * DS4_N_HC_LOWRANK * sizeof(float),
-                                                  DS4_N_HC_LOWRANK * sizeof(float));
-        ds4_gpu_tensor *mixed1 = ds4_gpu_tensor_view(g->mixed, 2u * DS4_N_EMBD * sizeof(float),
-                                                     DS4_N_EMBD * sizeof(float));
-        const bool ok1 = xn1 && lo1 && mixed1 &&
-            ds4_gpu_qwen4_hc_gate_mix_tensor(mixed1, xn1, lo1, m->map, m->size, up->abs_offset,
-                                             up->type, 1u, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
-        ds4_gpu_tensor_free(mixed1);
-        ds4_gpu_tensor_free(lo1);
-        ds4_gpu_tensor_free(xn1);
-        return ok1;
-    }
     return ok && ds4_gpu_qwen4_hc_gate_mix_tensor(g->mixed, g->xn, g->lo, m->map, m->size, up->abs_offset,
                                                   up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
 }
@@ -32515,48 +32488,19 @@ static bool qwen4_graph_attention_append(ds4_qwen4_gpu_graph *g, const ds4_model
                                               DS4_N_ROT, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
 }
 
+static bool qwen4_verify_attention_rows(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t pos0, uint32_t T);
+
 /* The per-session part of an attention layer for T rows at pos0: cache
  * appends, pooled block keys and the attention core; the projections before
  * it and the output projection after it are row-agnostic. */
 static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                        uint32_t il, uint32_t pos0, uint32_t T) {
-    const uint32_t ratio = 4u;
-    const uint32_t q_dim = DS4_N_HEAD * DS4_N_HEAD_DIM;
-    const uint32_t n_blocks_after = (pos0 + T) / ratio;
     if (!qwen4_graph_attention_append(g, m, l, il, pos0, T)) return false;
-    if (T == 3u && g->verify_rows_exact) {
-        /* 3-row speculative verify: run the attention core as 2/1-row
-         * sub-batches so every dispatch keeps the exact T <= 2 kernel paths
-         * (prefill T = 3 tails keep their own kernel selection). */
-        for (uint32_t sub0 = 0; sub0 < T; sub0 += 2u) {
-            const uint32_t subT = T - sub0 > 2u ? 2u : T - sub0;
-            ds4_gpu_tensor *q = sub0 ? ds4_gpu_tensor_view(g->q, (uint64_t)sub0 * q_dim * sizeof(float),
-                                                            (uint64_t)subT * q_dim * sizeof(float)) : g->q;
-            ds4_gpu_tensor *gate = sub0 ? ds4_gpu_tensor_view(g->gate, (uint64_t)sub0 * q_dim * sizeof(float),
-                                                               (uint64_t)subT * q_dim * sizeof(float)) : g->gate;
-            ds4_gpu_tensor *o = sub0 ? ds4_gpu_tensor_view(g->attn_o, (uint64_t)sub0 * q_dim * sizeof(float),
-                                                           (uint64_t)subT * q_dim * sizeof(float)) : g->attn_o;
-            ds4_gpu_tensor *iqn = sub0 ? ds4_gpu_tensor_view(g->iqn,
-                    (uint64_t)sub0 * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
-                    (uint64_t)subT * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float)) : g->iqn;
-            /* each sub-batch sees the block universe of its own T <= 2
-             * verify (a whole-chunk universe would let rows select blocks a
-             * true 2-row pass could not see) */
-            const uint32_t nba_sub = (pos0 + sub0 + subT) / ratio;
-            const bool ok = q && gate && o && iqn &&
-                qwen4_graph_attention_core(g, il, q, gate, iqn, o, nba_sub, pos0 + sub0, subT);
-            if (sub0) {
-                ds4_gpu_tensor_free(iqn);
-                ds4_gpu_tensor_free(o);
-                ds4_gpu_tensor_free(gate);
-                ds4_gpu_tensor_free(q);
-            }
-            if (!ok) return false;
-        }
-    } else if (!qwen4_graph_attention_core(g, il, g->q, g->gate, g->iqn, g->attn_o, n_blocks_after, pos0, T)) {
-        return false;
-    }
-    return true;
+    /* Verify rows take the batched-session rows kernels: each row sees its
+     * own key count, split geometry and block universe, as it would decoded
+     * alone. */
+    if (g->verify_rows_exact && T > 1u) return qwen4_verify_attention_rows(g, il, pos0, T);
+    return qwen4_graph_attention_core(g, il, g->q, g->gate, g->iqn, g->attn_o, (pos0 + T) / 4u, pos0, T);
 }
 
 static bool qwen4_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
@@ -41381,8 +41325,8 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     g->snap_valid = false;
     g->snap_after_second = deep && g->snap2_ple_hist != NULL;
     g->snap2_valid = false;
-    g->verify_rows_exact = deep;
-    ds4_gpu_qwen4_set_verify_rows_exact(deep);
+    g->verify_rows_exact = true;
+    ds4_gpu_qwen4_set_verify_rows_exact(true);
     const bool ok = qwen4_graph_forward_tokens(g, m, w, toks, T, rows, true);
     ds4_gpu_qwen4_set_verify_rows_exact(false);
     g->verify_rows_exact = false;
@@ -43148,6 +43092,35 @@ static bool qwen4_batch_linear(ds4_decode_item *items, int count,
  * through a staged table, keeping the single-row arithmetic (the row's split
  * count included), so the outputs are those of the per-row dispatches.
  * DS4_QWEN4_NO_BATCH_ATTN takes the per-row path for A/B. */
+
+/* Block selection and attention core over staged rows: each row takes its
+ * own block universe and the splits its key count gives it alone. */
+static bool qwen4_attention_rows_core(const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
+                                      ds4_qwen4_gpu_graph *g, uint64_t entry0, ds4_gpu_tensor *part) {
+    const uint32_t ratio = 4u;
+    uint32_t n_block_stride = 0;
+    bool any_sparse = false;
+    for (uint32_t i = 0; i < n_rows; i++) {
+        const uint32_t n_blocks = (rows[i].pos + 1u) / ratio;
+        if (n_blocks > n_block_stride) n_block_stride = n_blocks;
+        any_sparse |= rows[i].use_sel != 0;
+    }
+    bool ok = true;
+    if (any_sparse) {
+        ok = ds4_gpu_qwen4_idx_score_rows_tensor(g->score, g->tile_max, g->iqn, g->batch_attn_rows, entry0,
+                                                 rows, n_rows, n_block_stride, DS4_N_INDEXER_HEAD,
+                                                 DS4_N_INDEXER_HEAD_DIM, ratio) &&
+             ds4_gpu_qwen4_idx_select_rows_tensor(g->sel_blocks, g->score, g->tile_max, g->batch_attn_rows,
+                                                  entry0, rows, n_rows, n_block_stride, g->k_blocks) &&
+             ds4_gpu_qwen4_idx_expand_rows_tensor(g->sel_tokens, g->n_sel, g->sel_blocks, g->batch_attn_rows,
+                                                  entry0, n_rows, g->k_blocks, ratio, g->sel_stride);
+    }
+    return ok && ds4_gpu_qwen4_attn_decode_rows_tensor(g->attn_o, g->q, g->gate, g->sel_tokens, g->n_sel, part,
+                                                       g->batch_attn_rows, entry0, rows, n_rows, DS4_N_HEAD,
+                                                       DS4_N_HEAD_KV, DS4_N_HEAD_DIM, g->sel_stride,
+                                                       1.0f / sqrtf((float)DS4_N_HEAD_DIM));
+}
+
 /* The rows kernels over explicit entries, one per token of the batch in row
  * order: a session with a draft row has two entries, its caches at pos and
  * pos + 1, so the second token sees the first's keys the way a two-row
@@ -43156,15 +43129,8 @@ static bool qwen4_batch_attention_entries(ds4_gpu_qwen4_attn_row *rows, uint32_t
                                           ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                           const ds4_layer_weights *l, uint32_t il) {
     const uint32_t ratio = 4u;
-    const float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
-    uint32_t n_block_stride = 0;
-    bool any_sparse = false, any_block = false;
-    for (uint32_t i = 0; i < n_rows; i++) {
-        const uint32_t n_blocks = (rows[i].pos + 1u) / ratio;
-        if (n_blocks > n_block_stride) n_block_stride = n_blocks;
-        any_sparse |= rows[i].use_sel != 0;
-        any_block |= (rows[i].pos + 1u) % ratio == 0u;
-    }
+    bool any_block = false;
+    for (uint32_t i = 0; i < n_rows; i++) any_block |= (rows[i].pos + 1u) % ratio == 0u;
     const uint64_t entry0 = (uint64_t)il * QWEN4_BATCH_MAX_ROWS;
     bool ok = ds4_gpu_qwen4_attn_rows_stage(g->batch_attn_rows, entry0, rows, n_rows, ratio) &&
               ds4_gpu_qwen4_attn_prep_rows_tensor(g->q, g->gate, g->iqn, g->qg, g->kp, g->vp, g->iq, g->ik,
@@ -43179,19 +43145,29 @@ static bool qwen4_batch_attention_entries(ds4_gpu_qwen4_attn_row *rows, uint32_t
                                                      DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT, DS4_ROPE_FREQ_BASE,
                                                      DS4_RMS_EPS);
     }
-    if (ok && any_sparse) {
-        ok = ds4_gpu_qwen4_idx_score_rows_tensor(g->score, g->tile_max, g->iqn, g->batch_attn_rows, entry0,
-                                                 rows, n_rows, n_block_stride, DS4_N_INDEXER_HEAD,
-                                                 DS4_N_INDEXER_HEAD_DIM, ratio) &&
-             ds4_gpu_qwen4_idx_select_rows_tensor(g->sel_blocks, g->score, g->tile_max, g->batch_attn_rows,
-                                                  entry0, rows, n_rows, n_block_stride, g->k_blocks) &&
-             ds4_gpu_qwen4_idx_expand_rows_tensor(g->sel_tokens, g->n_sel, g->sel_blocks, g->batch_attn_rows,
-                                                  entry0, n_rows, g->k_blocks, ratio, g->sel_stride);
+    return ok && qwen4_attention_rows_core(rows, n_rows, g, entry0, g->batch_attn_part);
+}
+
+/* The MTP verify's rows in one session: the caches are already appended, so
+ * only the block selection and the attention core run per row, over this
+ * layer's caches at the rows' own positions. */
+static bool qwen4_verify_attention_rows(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t pos0, uint32_t T) {
+    const uint32_t sparse_pos = (g->k_blocks + 1u) * 4u - 1u;
+    if (!g->batch_attn_rows) {
+        g->batch_attn_rows = ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER * QWEN4_BATCH_MAX_ROWS *
+                                                  DS4_GPU_QWEN4_ATTN_ROW_BYTES);
+        if (!g->batch_attn_rows) return false;
     }
-    return ok && ds4_gpu_qwen4_attn_decode_rows_tensor(g->attn_o, g->q, g->gate, g->sel_tokens, g->n_sel,
-                                                       g->batch_attn_part, g->batch_attn_rows, entry0, rows,
-                                                       n_rows, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
-                                                       g->sel_stride, scale);
+    ds4_gpu_qwen4_attn_row rows[3];
+    if (T > 3u) return false;
+    for (uint32_t t = 0; t < T; t++) {
+        rows[t] = (ds4_gpu_qwen4_attn_row){ .k_cache = g->layer_k_cache[il], .v_cache = g->layer_v_cache[il],
+                                            .ik_cache = g->layer_ik_cache[il], .block_key = g->layer_block_key[il],
+                                            .pos3 = g->pos3, .pos = pos0 + t, .use_sel = pos0 + t >= sparse_pos };
+    }
+    const uint64_t entry0 = (uint64_t)il * QWEN4_BATCH_MAX_ROWS;
+    return ds4_gpu_qwen4_attn_rows_stage(g->batch_attn_rows, entry0, rows, T, 4u) &&
+           qwen4_attention_rows_core(rows, T, g, entry0, g->attn_part);
 }
 
 static bool qwen4_batch_attention_rows(int count, ds4_qwen4_gpu_graph *rowg,

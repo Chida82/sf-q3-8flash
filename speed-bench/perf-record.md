@@ -46,3 +46,9 @@ written by `30-mtp-cycle`.
 | feature/80-qwen-ssd-streaming | 2026-09-27 | this row's commit | Qwen3.8-Flash-Next-Q2.gguf | 20 | PASS | 49.5 (+8.7%) | 1118.0 (+0.1%) | 659.9 (-0.9%) | 877.8 (-0.1%) | 65.4 (+9.9%) | 1.91 (+4.5%) | 1000.8 (-0.0%) | 51.8 (+13.1%) | 1.44 (+3.4%) | 1052.9 (+0.2%) |
 | perf/81-q2-prefill-tails | 2026-09-27 | this row's commit | Qwen3.8-Flash-Next-Q4.gguf | 17 | PASS | 46.5 (+2.6%) | 1147.1 (+2.3%) | 791.3 (+10.2%) | 911.1 (+3.7%) | 65.7 (+14.0%) | 2.46 (+34.6%) | 1145.0 (+8.2%) | 49.9 (+1.4%) | 1.49 (-1.2%) | 1133.6 (+2.7%) |
 | perf/81-q2-prefill-tails | 2026-09-27 | this row's commit | Qwen3.8-Flash-Next-Q2.gguf | 20 | PASS | 46.6 (+8.0%) | 1120.5 (+2.3%) | 810.7 (+20.5%) | 911.7 (+6.0%) | 61.8 (+8.9%) | 1.91 (+4.5%) | 1066.0 (+8.7%) | 49.1 (+11.8%) | 1.44 (+3.4%) | 1098.6 (+8.0%) |
+| fix/82-mtp-greedy-divergence | 2026-09-28 | this row's commit | Qwen3.8-Flash-Next-Q4.gguf | 16 | PASS | 45.6 (+2.5%) | 1168.2 (+2.3%) | 804.5 (+9.4%) | 934.3 (+3.8%) | 64.5 (+13.4%) | 2.46 (+34.6%) | 1264.1 (+4.3%) |  |  |  |
+| fix/82-mtp-greedy-divergence | 2026-09-28 | this row's commit | Qwen3.8-Flash-Next-Q2.gguf | 16 | PASS | 47.9 (+8.9%) | 1238.3 (+2.6%) | 894.8 (+20.0%) | 1005.7 (+5.7%) | 65.2 (+10.0%) | 1.91 (+4.5%) | 1241.1 (+9.1%) |  |  |  |
+
+The `fix/82-mtp-greedy-divergence` rows leave MTP prose empty. The start
+commit's MTP output on the prose prompt is not its plain greedy output (the
+defect `82` fixed), so the token gate cannot pair the two builds on that kind.

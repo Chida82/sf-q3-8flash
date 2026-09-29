@@ -2033,6 +2033,64 @@ static void test_mv_ext_groups(arena_t *a) {
     printf("few-row matvec simdgroup counts: Q8 and F16 verify-row shapes exact at 1/2/4/8 groups\n");
 }
 
+/* MTP verify rows (the verify flag) must reproduce each row decoded alone,
+ * bit for bit: the dense matvecs of every weight format, including an
+ * output wider than 65536 rows, and the HC gate/mix of every format. */
+static int verify_rows_matvec(uint32_t type, arena_t *a, uint64_t off, uint32_t in_dim, uint32_t rows,
+                              ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t T) {
+    return type == 1u ? ds4_gpu_matmul_f16_tensor(out, a->base, a->size, off, in_dim, rows, x, T)
+         : type == 0u ? ds4_gpu_matmul_f32_tensor(out, a->base, a->size, off, in_dim, rows, x, T)
+                      : ds4_gpu_qwen4_matmul_q8_0_tensor(out, a->base, a->size, off, in_dim, rows, x, T);
+}
+
+static void test_verify_rows_decode(arena_t *a) {
+    const uint32_t mv[][3] = {{1u, 10240u, 320u}, {1u, 2560u, 641u}, {1u, 256u, 4097u}, {0u, 2560u, 512u},
+                              {0u, 260u, 2050u}, {8u, 2560u, 640u}, {8u, 256u, 65600u}};
+    const uint32_t n_mv = sizeof(mv) / sizeof(mv[0]);
+    for (uint32_t ic = 0; ic < n_mv + 3u; ic++) {
+        const bool hc = ic >= n_mv;
+        const uint32_t type = hc ? (uint32_t[]){1u, 0u, 8u}[ic - n_mv] : mv[ic][0];
+        const uint32_t E = 2560u, rank = 320u;
+        const uint32_t in_dim = hc ? 4u * E : mv[ic][1], rows = hc ? E : mv[ic][2];
+        double *sh = NULL;
+        const uint64_t w_rows = hc ? 4u * E : rows, w_cols = hc ? rank : in_dim;
+        const uint64_t off = type == 8u ? arena_q8_0(a, w_rows, w_cols, &sh, 0.05f)
+                           : type == 1u ? arena_f16(a, w_rows * w_cols, &sh, 0.05f)
+                                        : arena_f32(a, w_rows * w_cols, &sh, -0.05f, 0.05f);
+        free(sh);
+        for (uint32_t T = 2u; T <= 3u; T++) {
+            const uint64_t n = (uint64_t)T * rows, guard = 9u;
+            float *x = rand_vec((uint64_t)T * in_dim, 1.0f), *lo = rand_vec((uint64_t)T * rank, 1.0f);
+            float *ref = malloc((n + guard) * sizeof(float)), *got = malloc((n + guard) * sizeof(float));
+            require_ok(ref && got, "verify rows allocation");
+            ds4_gpu_tensor *gx = upload(x, (uint64_t)T * in_dim), *gl = upload(lo, (uint64_t)T * rank);
+            ds4_gpu_tensor *go = upload(NULL, n + guard);
+            require_ok(ds4_gpu_tensor_fill_f32(go, 127.25f, n + guard), "verify rows fill");
+            for (uint32_t r = 0; r < T; r++) {
+                ds4_gpu_tensor *xv = ds4_gpu_tensor_view(gx, (uint64_t)r * in_dim * sizeof(float), in_dim * sizeof(float));
+                ds4_gpu_tensor *lv = ds4_gpu_tensor_view(gl, (uint64_t)r * rank * sizeof(float), rank * sizeof(float));
+                ds4_gpu_tensor *ov = ds4_gpu_tensor_view(go, (uint64_t)r * rows * sizeof(float), rows * sizeof(float));
+                require_ok(xv && lv && ov && (hc ? ds4_gpu_qwen4_hc_gate_mix_tensor(ov, xv, lv, a->base, a->size, off, type, 1u, E, 4u, rank)
+                                                 : verify_rows_matvec(type, a, off, in_dim, rows, ov, xv, 1u)),
+                           "verify rows single-row reference");
+                ds4_gpu_tensor_free(ov); ds4_gpu_tensor_free(lv); ds4_gpu_tensor_free(xv);
+            }
+            require_ok(ds4_gpu_tensor_read(go, 0, ref, (n + guard) * sizeof(float)), "verify rows reference read");
+            check_exact_f32("verify rows reference finite", ref, ref, n + guard);
+            ds4_gpu_qwen4_set_verify_rows_exact(true);
+            require_ok(ds4_gpu_tensor_fill_f32(go, 127.25f, n + guard) &&
+                       (hc ? ds4_gpu_qwen4_hc_gate_mix_tensor(go, gx, gl, a->base, a->size, off, type, T, E, 4u, rank)
+                           : verify_rows_matvec(type, a, off, in_dim, rows, go, gx, T)) &&
+                       ds4_gpu_tensor_read(go, 0, got, (n + guard) * sizeof(float)), "verify rows dispatch/read");
+            ds4_gpu_qwen4_set_verify_rows_exact(false);
+            check_exact_f32(hc ? "verify rows HC gate/mix vs single rows" : "verify rows matvec vs single rows", got, ref, n + guard);
+            ds4_gpu_tensor_free(go); ds4_gpu_tensor_free(gl); ds4_gpu_tensor_free(gx);
+            free(got); free(ref); free(lo); free(x);
+        }
+    }
+    printf("MTP verify rows: F16/F32/Q8 matvecs and HC gate/mix at 2 and 3 rows byte-exact vs single rows\n");
+}
+
 #ifdef __APPLE__
 /* The grouped decode-batch kernels must reproduce the per-token kernels bit
  * for bit under heavy expert reuse (sixteen rows over eight experts). */
@@ -3508,6 +3566,7 @@ int main(void) {
     test_qwen4_argmax();
     test_hc_pair_groups(&arena);
     test_mv_ext_groups(&arena);
+    test_verify_rows_decode(&arena);
 #ifdef __APPLE__
     test_moe_grouped(&arena);
 #endif

@@ -5477,6 +5477,17 @@ void ds4_gpu_qwen4_set_verify_rows_exact(bool on) {
     g_qwen4_verify_rows_exact = on;
 }
 
+/* MTP verify rows take the single-token matvec.  The vectorized F16/F32
+ * kernels have 2- and 3-row variants that walk the weights once for all rows
+ * with each row's single-token arithmetic; NULL keeps one row per grid y. */
+static const char *ds4_gpu_mv_rows_name(const char *fn, uint64_t n_tok) {
+    if ((n_tok != 2u && n_tok != 3u) || !g_qwen4_verify_rows_exact) return NULL;
+    const bool three = n_tok == 3u;
+    if (!strcmp(fn, "kernel_mul_mv_f32_f32_4")) return three ? "kernel_mul_mv_f32_f32_4_r3" : "kernel_mul_mv_f32_f32_4_r2";
+    if (!strcmp(fn, "kernel_mul_mv_f16_f32_4")) return three ? "kernel_mul_mv_f16_f32_4_r3" : "kernel_mul_mv_f16_f32_4_r2";
+    return NULL;
+}
+
 static int16_t ds4_gpu_mv_ext_nsg(void) {
     return (int16_t)ds4_gpu_env_u64("DS4_METAL_MV_EXT_NSG", 2u, 1u, 8u);
 }
@@ -18813,8 +18824,9 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
-        if (n_tok == 1) {
-            if (ds4_gpu_mpp_available() &&
+        /* MTP verify rows each keep the single-token matvec arithmetic */
+        if (n_tok == 1 || (g_qwen4_verify_rows_exact && n_tok <= 3u)) {
+            if (n_tok == 1 && ds4_gpu_mpp_available() &&
                 prefer_decode_mpp &&
                 (in_dim % 64u) == 0) {
                 const char *nax_fn = "kernel_mul_mm_q8_0_f32_nax_direct_rhs";
@@ -18849,8 +18861,13 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
             if (out_dim > 65536u) mv_dispatch.nsg = 8;
             mv_args.nr0 = mv_dispatch.nr0;
+            mv_args.ne11 = mv_args.ne1 = (int32_t)n_tok;
+            mv_args.nb12 = mv_args.nb13 = n_tok * in_dim * sizeof(float);
+            /* 2- and 3-row verify: one weight walk for all rows */
+            const char *rows_fn = n_tok == 2u ? "kernel_mul_mv_q8_0_f32_r2" : n_tok == 3u ? "kernel_mul_mv_q8_0_f32_r3" : NULL;
+            const NSUInteger n_blk = ((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0;
             id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
+                ds4_gpu_get_mul_mv_pipeline(rows_fn ? rows_fn : mv_dispatch.function_name, mv_dispatch.nsg);
             if (!pipeline) return 0;
 
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
@@ -18860,9 +18877,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
             [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
             [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
-                                                  1,
-                                                  1)
+            [enc dispatchThreadgroups:MTLSizeMake(n_blk, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -20203,8 +20218,10 @@ static int ds4_gpu_matmul_f16_tensor_impl(
                 mv_dispatch.smem = 32u * sizeof(float);
             }
             mv_args.nr0 = mv_dispatch.nr0;
+            const char *rows_fn = ds4_gpu_mv_rows_name(mv_dispatch.function_name, n_tok);
+            const NSUInteger n_blk = ((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0;
             id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
+                ds4_gpu_get_mul_mv_pipeline(rows_fn ? rows_fn : mv_dispatch.function_name, mv_dispatch.nsg);
             if (!pipeline) return 0;
 
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
@@ -20216,9 +20233,7 @@ static int ds4_gpu_matmul_f16_tensor_impl(
             if (mv_dispatch.smem) {
                 [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
             }
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
-                                                  (NSUInteger)n_tok,
-                                                  1)
+            [enc dispatchThreadgroups:MTLSizeMake(n_blk, rows_fn ? 1u : (NSUInteger)n_tok, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -20336,7 +20351,7 @@ int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out,
                             uint64_t out_dim, const ds4_gpu_tensor *x,
                             uint64_t n_tok) {
     return ds4_gpu_matmul_f16_tensor_impl(out, model_map, model_size,
-        weight_offset, in_dim, out_dim, x, n_tok, false);
+        weight_offset, in_dim, out_dim, x, n_tok, g_qwen4_verify_rows_exact && n_tok <= 3u);
 }
 
 int ds4_gpu_matmul_f16_pair_tensor(
@@ -21066,16 +21081,19 @@ int ds4_gpu_matmul_f32_tensor(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
-        if (n_tok == 1) {
-            ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_f32_mv_args(in_dim, out_dim, 1);
+        /* MTP verify rows each keep the single-token matvec arithmetic */
+        if (n_tok == 1 || (g_qwen4_verify_rows_exact && n_tok <= 3u)) {
+            ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_f32_mv_args(in_dim, out_dim, n_tok);
             ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 1);
             if (ds4_gpu_plain_mv_single_row(out_dim)) {
                 mv_dispatch.nr0 = 1;
                 mv_dispatch.smem = 32u * sizeof(float);
             }
             mv_args.nr0 = mv_dispatch.nr0;
+            const char *rows_fn = ds4_gpu_mv_rows_name(mv_dispatch.function_name, n_tok);
+            const NSUInteger n_blk = ((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0;
             id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
+                ds4_gpu_get_mul_mv_pipeline(rows_fn ? rows_fn : mv_dispatch.function_name, mv_dispatch.nsg);
             if (!pipeline) return 0;
 
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
@@ -21087,9 +21105,7 @@ int ds4_gpu_matmul_f32_tensor(
             if (mv_dispatch.smem) {
                 [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
             }
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
-                                                  1,
-                                                  1)
+            [enc dispatchThreadgroups:MTLSizeMake(n_blk, rows_fn ? 1u : (NSUInteger)n_tok, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -39895,7 +39911,9 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
         !qwen4_bind_tensor(&b[3], mixed, (uint64_t)n_tokens * n_embd * sizeof(float), "hc mixed")) {
         return 0;
     }
-    const bool pair = n_tokens == 2u && getenv("DS4_QWEN4_NO_HC_PAIR") == NULL;
+    /* The pair kernel's rounding differs from one row's: MTP verify rows
+     * take the per-row kernels. */
+    const bool pair = n_tokens == 2u && !g_qwen4_verify_rows_exact && getenv("DS4_QWEN4_NO_HC_PAIR") == NULL;
     /* Register-prefetched F16 rows (same lane order and rounding, pinned
      * against the plain kernel by tests/test_qwen4_kernels.c); M5 default. */
     const int prefetch_override = ds4_gpu_env_bool("DS4_QWEN4_HC_MIX_PREFETCH");

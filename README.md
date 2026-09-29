@@ -105,7 +105,7 @@ documented in `AGENTS.md` and `docs/TESTING.md`. The default model file is
 ## Quality and performance
 
 **Token quality.** Performance work here must not change what the model
-writes. Every change is checked in four ways:
+writes. Every change is checked in five ways:
 - the StarForge parity oracle (`tools/parity-check.sh`) runs ten prompts
   greedily on this child and on upstream ds4 at the child's merge-base, with
   the same GGUF, and requires token-identical output;
@@ -115,6 +115,8 @@ writes. Every change is checked in four ways:
   the kernel it replaces, byte for byte at their edge sizes;
 - `tests/test_qwen4_mtp_limits.py` checks MTP's draft depth and rollback
   limits.
+- `tests/test_qwen4_mtp_identity.py` checks that greedy output with MTP equals
+  plain greedy output, over 12 prompts at every draft depth.
 
 **Performance.** `speed-bench/ab_bench.py` alternates the two builds in ABBA
 pairs for 600 s, drops pairs whose GPU clock sagged, and reports medians with
@@ -125,7 +127,8 @@ against a fixed start commit. See `speed-bench/README.md`.
 
 **Against ds4.** Measured on 2026-09-27 on an M5 Max, 128 GB, using upstream's
 own methods. The builds compared are ds4 at the merge-base `0aaea5a` and this
-child with `81-q2-prefill-tails`.
+child with `81-q2-prefill-tails`; the two MTP rows were measured again on
+2026-09-29 with `82-mtp-greedy-divergence`, ds4 and this child paired afresh.
 - The sweep rows use `ds4-bench` on *I Promessi Sposi*: 2048-token intervals up
   to 65536, and 128 generated tokens per context size.
 - Past the 1 GiB snapshot limit, both benches replay the prefix.
@@ -144,7 +147,7 @@ child with `81-q2-prefill-tails`.
 | Q2 | generation, context 32768 | 48.6 | 54.7 | +12.6% |
 | Q2 | generation, context 65536 | 43.0 | 47.3 | +10.1% |
 | Q2 | CLI generation, no MTP | 54.2 | 59.1 | +9.0% |
-| Q2 | CLI generation, MTP | 75.7 | 83.8 | +10.7% |
+| Q2 | CLI generation, MTP | 75.8 | 86.7 | +14.4% |
 | Q4 | prefill, context 2048 | 1365.9 | 1396.5 | +2.2% |
 | Q4 | prefill, context 16384 | 1261.4 | 1343.3 | +6.5% |
 | Q4 | prefill, context 32768 | 1107.9 | 1234.9 | +11.5% |
@@ -154,12 +157,14 @@ child with `81-q2-prefill-tails`.
 | Q4 | generation, context 32768 | 48.5 | 52.4 | +8.1% |
 | Q4 | generation, context 65536 | 41.7 | 44.1 | +5.9% |
 | Q4 | CLI generation, no MTP | 56.5 | 57.5 | +1.9% |
-| Q4 | CLI generation, MTP | 78.7 | 83.4 | +6.1% |
+| Q4 | CLI generation, MTP | 77.8 | 85.9 | +10.4% |
 
 Without MTP, the text of all six CLI cases is identical between ds4 and this
-child. With MTP, five of the six match plain greedy output. The exception is
-Q2 on the networking prompt, which diverges after two paragraphs. The
-divergence starts with the predictor priming taken in `30-mtp-cycle`.
+child. With MTP, this child's text equals its plain text in all six cases.
+`82-mtp-greedy-divergence` made every MTP verify row compute as a single
+decoded token would; before it, Q2 on the networking prompt diverged from plain
+greedy output under MTP. The fix changes no plain row, which stays bitwise
+identical.
 
 ## Licence
 
