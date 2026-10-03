@@ -125,6 +125,10 @@ documented in `AGENTS.md` and `docs/TESTING.md`. The default model file is
 
 ## Quality and performance
 
+> **Hardware.** Every performance number in this repository was measured on
+> one machine: an Apple **M5 Max with 128 GB** of unified memory. Other Macs
+> will give different absolute numbers.
+
 **Token quality.** Performance work here must not change what the model
 writes. Every change is checked in five ways:
 - the StarForge parity oracle (`tools/parity-check.sh`) runs ten prompts
@@ -146,10 +150,10 @@ code and prose. A step is kept only when its target gains and no metric
 clearly loses. Each change appends a row to `speed-bench/perf-record.md`
 against a fixed start commit. See `speed-bench/README.md`.
 
-**Against ds4.** Measured on 2026-09-27 on an M5 Max, 128 GB, using upstream's
-own methods. The builds compared are ds4 at the merge-base `0aaea5a` and this
-child with `81-q2-prefill-tails`; the two MTP rows were measured again on
-2026-09-29 with `82-mtp-greedy-divergence`, ds4 and this child paired afresh.
+**Against ds4.** Measured on 2026-09-27 using upstream's own methods. The
+builds compared are ds4 at the merge-base `0aaea5a` and this child with
+`81-q2-prefill-tails`; the two MTP rows were measured again on 2026-09-29 with
+`82-mtp-greedy-divergence`, ds4 and this child paired afresh.
 - The sweep rows use `ds4-bench` on *I Promessi Sposi*: 2048-token intervals up
   to 65536, and 128 generated tokens per context size.
 - Past the 1 GiB snapshot limit, both benches replay the prefix.

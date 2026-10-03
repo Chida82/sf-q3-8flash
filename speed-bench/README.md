@@ -1,5 +1,9 @@
 # Qwen3.8 benchmarks
 
+> **Hardware.** Every performance number in this repository was measured on
+> one machine: an Apple **M5 Max with 128 GB** of unified memory. Other Macs
+> will give different absolute numbers.
+
 The C benchmarks isolate Metal scheduling and prefill variants. The scripts
 measure server concurrency and plot repeatable results. Historical Qwen
 checkpoint results live in `qwen38-checkpoints/`.

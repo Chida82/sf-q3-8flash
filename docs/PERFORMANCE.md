@@ -1,5 +1,9 @@
 # Performance
 
+> **Hardware.** Every performance number in this repository was measured on
+> one machine: an Apple **M5 Max with 128 GB** of unified memory. Other Macs
+> will give different absolute numbers.
+
 Judge a change with the A/B harness, which runs the baseline and the
 candidate tree interleaved on the same GGUF, gates on identical tokens (and,
 with `--bitwise`, identical logits) and reports the median B/A ratio per metric:

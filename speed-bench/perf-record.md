@@ -1,5 +1,9 @@
 # Performance record
 
+> **Hardware.** Every performance number in this repository was measured on
+> one machine: an Apple **M5 Max with 128 GB** of unified memory. Other Macs
+> will give different absolute numbers.
+
 Where the performance work on this child started, and where it has got to.
 Each row is one `speed-bench/ab_bench.py` run, pasted from the `record row:`
 line of its summary. A cell reads `B median (B/A)`: the candidate's absolute
