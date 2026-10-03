@@ -22,6 +22,27 @@ quant layouts and tables, CPU quant/dot logic, and certain kernels. For this
 reason, and because we are genuinely grateful, we keep the GGML authors copyright
 notice in our `LICENSE` file.
 
+## Why this fork exists
+
+ds4 is built around a few models rather than as a general GGUF runner, and it
+is meant to be read and changed with a coding agent: a working template to
+adapt to your model and hardware, not a product that covers every setup. This
+fork pushes both ideas to the end: one model, one backend, and nothing else in
+the tree. Code for other models, other GPU backends and the bundled agent is
+deleted, not hidden behind flags. The result is a source tree small enough
+that a person, or an LLM, can load it whole and see how this one model
+actually runs, which makes it cheap to try an idea, measure it and keep or
+drop it.
+
+Metal is the only GPU backend because the only hardware this fork is developed
+and tested on is an Apple M5 Max; kernels are tuned for that chip.
+
+The smaller tree is also what made the rest of this work possible: open pull
+requests on ds4 were analysed against this one model and ported where they
+held up (`docs/upstream-prs.md` records the verdicts), and further
+improvements were investigated for Apple Silicon. Every change is held to the
+token-identity and speed checks below.
+
 ## Scope
 
 This repository intentionally supports one model and one production backend:
@@ -136,28 +157,35 @@ child with `81-q2-prefill-tails`; the two MTP rows were measured again on
   --nothink`) and give the mean generation speed.
 - Each value is the mean of two runs per build, in the order ds4, sf, sf, ds4.
 
-| Pack | Measurement | ds4 t/s | sf t/s | sf vs ds4 |
-|---|---|---:|---:|---:|
-| Q2 | prefill, context 2048 | 1361.0 | 1427.8 | +4.9% |
-| Q2 | prefill, context 16384 | 1293.2 | 1372.2 | +6.1% |
-| Q2 | prefill, context 32768 | 1131.5 | 1264.8 | +11.8% |
-| Q2 | prefill, context 65536 | 916.4 | 999.6 | +9.1% |
-| Q2 | generation, context 2048 | 51.9 | 56.7 | +9.3% |
-| Q2 | generation, context 16384 | 51.7 | 56.3 | +9.1% |
-| Q2 | generation, context 32768 | 48.6 | 54.7 | +12.6% |
-| Q2 | generation, context 65536 | 43.0 | 47.3 | +10.1% |
-| Q2 | CLI generation, no MTP | 54.2 | 59.1 | +9.0% |
-| Q2 | CLI generation, MTP | 75.8 | 86.7 | +14.4% |
-| Q4 | prefill, context 2048 | 1365.9 | 1396.5 | +2.2% |
-| Q4 | prefill, context 16384 | 1261.4 | 1343.3 | +6.5% |
-| Q4 | prefill, context 32768 | 1107.9 | 1234.9 | +11.5% |
-| Q4 | prefill, context 65536 | 907.4 | 994.0 | +9.5% |
-| Q4 | generation, context 2048 | 54.1 | 54.4 | +0.5% |
-| Q4 | generation, context 16384 | 53.5 | 54.0 | +0.9% |
-| Q4 | generation, context 32768 | 48.5 | 52.4 | +8.1% |
-| Q4 | generation, context 65536 | 41.7 | 44.1 | +5.9% |
-| Q4 | CLI generation, no MTP | 56.5 | 57.5 | +1.9% |
-| Q4 | CLI generation, MTP | 77.8 | 85.9 | +10.4% |
+**Q2**
+
+| Measurement | ds4 t/s | sf t/s | sf vs ds4 |
+|---|---:|---:|---:|
+| prefill, context 2048 | 1361.0 | 1427.8 | +4.9% |
+| prefill, context 16384 | 1293.2 | 1372.2 | +6.1% |
+| prefill, context 32768 | 1131.5 | 1264.8 | +11.8% |
+| prefill, context 65536 | 916.4 | 999.6 | +9.1% |
+| generation, context 2048 | 51.9 | 56.7 | +9.3% |
+| generation, context 16384 | 51.7 | 56.3 | +9.1% |
+| generation, context 32768 | 48.6 | 54.7 | +12.6% |
+| generation, context 65536 | 43.0 | 47.3 | +10.1% |
+| CLI generation, no MTP | 54.2 | 59.1 | +9.0% |
+| CLI generation, MTP | 75.8 | 86.7 | +14.4% |
+
+**Q4**
+
+| Measurement | ds4 t/s | sf t/s | sf vs ds4 |
+|---|---:|---:|---:|
+| prefill, context 2048 | 1365.9 | 1396.5 | +2.2% |
+| prefill, context 16384 | 1261.4 | 1343.3 | +6.5% |
+| prefill, context 32768 | 1107.9 | 1234.9 | +11.5% |
+| prefill, context 65536 | 907.4 | 994.0 | +9.5% |
+| generation, context 2048 | 54.1 | 54.4 | +0.5% |
+| generation, context 16384 | 53.5 | 54.0 | +0.9% |
+| generation, context 32768 | 48.5 | 52.4 | +8.1% |
+| generation, context 65536 | 41.7 | 44.1 | +5.9% |
+| CLI generation, no MTP | 56.5 | 57.5 | +1.9% |
+| CLI generation, MTP | 77.8 | 85.9 | +10.4% |
 
 Without MTP, the text of all six CLI cases is identical between ds4 and this
 child. With MTP, this child's text equals its plain text in all six cases.
