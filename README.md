@@ -40,8 +40,9 @@ and tested on is an Apple M5 Max; kernels are tuned for that chip.
 The smaller tree is also what made the rest of this work possible: open pull
 requests on ds4 were analysed against this one model and ported where they
 held up (`docs/upstream-prs.md` records the verdicts), and further
-improvements were investigated for Apple Silicon. Every change is held to the
-token-identity and speed checks below.
+improvements were investigated for Apple Silicon. None of it changed what the
+model writes: every speed-up so far keeps the output bit for bit identical
+(see "Speed without changing the output" below).
 
 ## Scope
 
@@ -129,8 +130,20 @@ documented in `AGENTS.md` and `docs/TESTING.md`. The default model file is
 > one machine: an Apple **M5 Max with 128 GB** of unified memory. Other Macs
 > will give different absolute numbers.
 
-**Token quality.** Performance work here must not change what the model
-writes. Every change is checked in five ways:
+### Speed without changing the output
+
+**Every performance change so far has left the model's output bit for bit
+identical.** No precision is traded for speed: no lower-precision KV cache, no
+approximate kernel, no route that changes a single logit.
+
+| Path | Guarantee |
+|---|---|
+| Plain prefill and decode | logits **bit-identical** to the build before each step (`ab_bench.py --bitwise`); every new kernel byte-exact against the one it replaces |
+| Against upstream ds4 | greedy output **token-identical** to ds4 at the merge-base |
+| MTP (`--mtp`) | greedy output **token-identical** to plain greedy output, at every draft depth |
+| SSD streaming | tokens **identical** to a fully resident run; the resident path stays bit-identical |
+
+**How it is checked.** Every change goes through five checks:
 - the StarForge parity oracle (`tools/parity-check.sh`) runs ten prompts
   greedily on this child and on upstream ds4 at the child's merge-base, with
   the same GGUF, and requires token-identical output;
@@ -143,7 +156,9 @@ writes. Every change is checked in five ways:
 - `tests/test_qwen4_mtp_identity.py` checks that greedy output with MTP equals
   plain greedy output, over 12 prompts at every draft depth.
 
-**Performance.** `speed-bench/ab_bench.py` alternates the two builds in ABBA
+### Speed
+
+`speed-bench/ab_bench.py` alternates the two builds in ABBA
 pairs for 600 s, drops pairs whose GPU clock sagged, and reports medians with
 bootstrap 95% intervals for plain decode, prefill at three shapes, and MTP on
 code and prose. A step is kept only when its target gains and no metric
