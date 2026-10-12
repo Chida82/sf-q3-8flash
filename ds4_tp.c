@@ -448,6 +448,17 @@ static int tp_send_frame(int fd, uint32_t type, const void *payload, uint32_t by
     return 1;
 }
 
+/* Leader -> worker frames consumed by the worker's command loop. A failed
+ * link sends nothing, and a failed send fails the link: the queues are no
+ * longer synchronized, so recovery needs a fresh connection. */
+/* sf-ablate(tp): upstream's RDMA command mailbox branch dropped; upstream never offers the mailbox on Apple (Metal gates run on a separate thread) */
+static int tp_send_command(ds4_tp *tp, uint32_t type, const void *payload, uint32_t bytes) {
+    if (!tp || ds4_tp_failed(tp)) return 0;
+    const int ok = tp_send_frame(tp->control_fd, type, payload, bytes);
+    if (!ok) ds4_tp_mark_failed(tp);
+    return ok;
+}
+
 static int tp_read_frame_header(int fd, uint32_t *type, uint32_t *bytes) {
     ds4_tp_frame_header h;
     if (!tp_read_full(fd, &h, sizeof(h))) return 0;
@@ -2071,6 +2082,7 @@ void ds4_tp_mark_failed(ds4_tp *tp) {
  * --------------------------------------------------------------------- */
 
 int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
+    if (!tp || ds4_tp_failed(tp)) return 0;
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active) return tp_rdma_gate_exchange(tp, layer, gate, seq);
 #endif
@@ -2100,12 +2112,16 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
  * sends its rows without any handshake.  Returns 1 also when RDMA is not
  * in use (the TCP fallback keeps its per-gate headers). */
 int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers) {
+    if (!tp || ds4_tp_failed(tp)) return 0;
 #ifdef DS4_TP_HAVE_VERBS
     if (!tp->rdma_active || !tp_rdma_big_gate_capable(tp)) return 1;
     if (getenv("DS4_TP_DISABLE_VERIFY_WINDOW")) return 1;
     ds4_tp_rdma *r = &tp->rdma;
-    if (rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS || n_layers == 0 || r->block_active) return 0;
-    if (!tp_rdma_drain_decode_window(tp)) return 0;
+    if (rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS || n_layers == 0) return 0;
+    if (r->block_active || !tp_rdma_drain_decode_window(tp)) {
+        ds4_tp_mark_failed(tp);
+        return 0;
+    }
     pthread_mutex_lock(&r->post_lock);
     r->block_active = true;
     r->block_rows = rows;
@@ -2114,8 +2130,11 @@ int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers) {
     r->block_recv_done = 0;
     const int ok = tp_rdma_block_post_layer(tp, 0);
     pthread_mutex_unlock(&r->post_lock);
-    if (!ok) { r->block_active = false; return 0; }
-    if (!tp_rdma_window_barrier(tp, 0xB5u)) { r->block_active = false; return 0; }
+    if (!ok || !tp_rdma_window_barrier(tp, 0xB5u)) {
+        r->block_active = false;
+        ds4_tp_mark_failed(tp);
+        return 0;
+    }
     if (getenv("DS4_TP_BIG_GATE_DEBUG"))
         fprintf(stderr, "ds4-tp: verify window armed: %u rows x %u layers\n", rows, n_layers);
     return 1;
@@ -2128,6 +2147,7 @@ int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers) {
 /* End of the verify block: every gate must have been exchanged (all
  * posted receives consumed) and our signaled sends reaped. */
 int ds4_tp_batch_block_end(ds4_tp *tp) {
+    if (!tp || ds4_tp_failed(tp)) return 0;
 #ifdef DS4_TP_HAVE_VERBS
     ds4_tp_rdma *r = &tp->rdma;
     if (!r->block_active) return 1;
@@ -2147,6 +2167,7 @@ int ds4_tp_batch_block_end(ds4_tp *tp) {
         fprintf(stderr, "ds4-tp: verify window closed: %llu/%llu rows, ok=%d\n",
                 (unsigned long long)r->block_recv_done, (unsigned long long)want, ok);
     r->block_active = false;
+    if (!ok) ds4_tp_mark_failed(tp);
     return ok;
 #else
     (void)tp;
@@ -2156,6 +2177,7 @@ int ds4_tp_batch_block_end(ds4_tp *tp) {
 
 int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                                uint64_t seq) {
+    if (!tp || ds4_tp_failed(tp)) return 0;
     if (tp->data_fd < 0 || rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS) return 0;
     const uint64_t bytes = (uint64_t)rows * tp->vec_bytes;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
@@ -2203,6 +2225,7 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
 /* Prefill batch gate: RDMA uses the pipelined registered-slab path above. */
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes) {
+    if (!tp || ds4_tp_failed(tp)) return 0;
     if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
 #ifdef DS4_TP_HAVE_VERBS
     static int dbg = -1;
@@ -2343,19 +2366,19 @@ static int tp_send_token_command(ds4_tp *tp, uint32_t type,
     memcpy(payload, &h, sizeof(h));
     int32_t *wire_tokens = (int32_t *)(payload + sizeof(h));
     for (uint32_t i = 0; i < count; i++) wire_tokens[i] = (int32_t)tokens[i];
-    const int ok = tp_send_frame(tp->control_fd, type, payload, bytes);
+    const int ok = tp_send_command(tp, type, payload, bytes);
     free(payload);
     return ok;
 }
 
 int ds4_tp_send_session_create(ds4_tp *tp, uint64_t session_id, int ctx_size) {
     ds4_tp_value_command msg = { session_id, (int32_t)ctx_size, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_SESSION_CREATE,
+    return tp_send_command(tp, DS4_TP_FRAME_SESSION_CREATE,
                          &msg, sizeof(msg));
 }
 
 int ds4_tp_send_session_destroy(ds4_tp *tp, uint64_t session_id) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_SESSION_DESTROY,
+    return tp_send_command(tp, DS4_TP_FRAME_SESSION_DESTROY,
                          &session_id, sizeof(session_id));
 }
 
@@ -2416,7 +2439,7 @@ int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
         memcpy(p, embedding->data, (size_t)data_bytes);
         p += data_bytes;
     }
-    int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_SYNC_MULTIMODAL,
+    int ok = tp_send_command(tp, DS4_TP_FRAME_SYNC_MULTIMODAL,
                            payload, (uint32_t)bytes64);
     free(payload);
     return ok;
@@ -2425,24 +2448,24 @@ int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
 int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
                      uint64_t seq, int token) {
     ds4_tp_eval_command msg = { session_id, seq, (int32_t)token, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_EVAL, &msg, sizeof(msg));
+    return tp_send_command(tp, DS4_TP_FRAME_EVAL, &msg, sizeof(msg));
 }
 
 int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
                        uint64_t seq, int token, int limit) {
     if (limit < 1 || limit > 2) return 0;
     ds4_tp_eval_command msg = { session_id, seq, (int32_t)token, (uint32_t)limit };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_GLM_MTP, &msg, sizeof(msg));
+    return tp_send_command(tp, DS4_TP_FRAME_GLM_MTP, &msg, sizeof(msg));
 }
 
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos) {
     ds4_tp_value_command msg = { session_id, (int32_t)pos, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_REWIND,
+    return tp_send_command(tp, DS4_TP_FRAME_REWIND,
                          &msg, sizeof(msg));
 }
 
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_INVALIDATE,
+    return tp_send_command(tp, DS4_TP_FRAME_INVALIDATE,
                          &session_id, sizeof(session_id));
 }
 
@@ -2457,7 +2480,7 @@ int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
     ds4_tp_batch_command_header h = { count, 0 };
     memcpy(payload, &h, sizeof(h));
     memcpy(payload + sizeof(h), items, (size_t)count * sizeof(*items));
-    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_EVAL_BATCH,
+    const int ok = tp_send_command(tp, DS4_TP_FRAME_EVAL_BATCH,
                                  payload, bytes);
     free(payload);
     return ok;
@@ -2485,7 +2508,7 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
         wire_tokens[i] = (int32_t)prompt[i];
     }
     memcpy(payload + sizeof(h) + prompt_bytes, items, (size_t)item_bytes);
-    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_MIXED_BATCH,
+    const int ok = tp_send_command(tp, DS4_TP_FRAME_MIXED_BATCH,
                                  payload, bytes);
     free(payload);
     return ok;
@@ -2559,7 +2582,7 @@ int ds4_tp_sync_checkpoint(ds4_tp *tp, uint32_t point, int current, int total,
 }
 
 int ds4_tp_send_stop(ds4_tp *tp) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_STOP, NULL, 0);
+    return tp_send_command(tp, DS4_TP_FRAME_STOP, NULL, 0);
 }
 
 void ds4_tp_command_free(ds4_tp_command *command) {
@@ -2817,7 +2840,7 @@ int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
 
 int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t mode, int32_t token_count) {
     struct { int32_t mode; int32_t count; } msg = { mode, token_count };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_VERIFY_COMMIT,
+    return tp_send_command(tp, DS4_TP_FRAME_VERIFY_COMMIT,
                          &msg, sizeof(msg));
 }
 

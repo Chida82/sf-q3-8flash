@@ -535,6 +535,28 @@ static int api_alt_token_id(ds4_engine *engine, const api_alt *alt) {
     return id;
 }
 
+static int api_top1_update(ds4_engine *engine, const api_pos *pos,
+                           int greedy, api_metrics *metrics) {
+    double best = -INFINITY;
+    for (int j = 0; j < pos->n_alts; j++) {
+        if (pos->alts[j].logprob > best) best = pos->alts[j].logprob;
+    }
+
+    /* Only exact maxima qualify, even if none map. Prefer greedy among tied
+     * maxima so a position counts once and any mapped maximum can match. */
+    int ref = -1;
+    for (int j = 0; j < pos->n_alts; j++) {
+        if (pos->alts[j].logprob != best) continue;
+        const int tok = api_alt_token_id(engine, &pos->alts[j]);
+        if (tok >= 0 && (ref < 0 || tok == greedy)) ref = tok;
+    }
+    if (ref >= 0) {
+        metrics->top1_count++;
+        if (ref == greedy) metrics->top1_match++;
+    }
+    return ref;
+}
+
 static bool local_logits(ds4_session *session, float *logits, int n_vocab,
                          double *logsum, int *argmax) {
     if (ds4_session_copy_logits(session, logits, n_vocab) != n_vocab) return false;
@@ -956,8 +978,8 @@ int main(int argc, char **argv) {
 
             if (api_aligned) {
                 const api_pos *ap = &ref.pos[i];
+                const int ref_tok = api_top1_update(engine, ap, greedy, &cm);
                 if (getenv("DS4_SCORE_DEBUG")) {
-                    const int ref_tok = ap->n_alts > 0 ? api_alt_token_id(engine, &ap->alts[0]) : -1;
                     fprintf(stderr, "  pos %d: target=%d ref_top=%d target_lp=%.3f ref_lp=%.3f greedy=%d\n",
                             i, target.v[i], ref_tok, target_lp, ap->logprob, greedy);
                 }
@@ -985,10 +1007,6 @@ int main(int argc, char **argv) {
                         if (tok < 0) continue;
                         const double lp = local_logprob(logits, n_vocab, tok, logsum);
                         if (!isfinite(lp)) continue;
-                        if (j == 0) {
-                            cm.top1_count++;
-                            if (tok == greedy) cm.top1_match++;
-                        }
                         cm.top_mapped++;
                         cm.top_logprob_count++;
                         const double delta = lp - ap->alts[j].logprob;
