@@ -58,6 +58,7 @@ static int fake_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
                       struct ibv_recv_wr **bad) {
     fake_rdma *f = qp->qp_context;
     (void)bad;
+    if (f->fault == 6) { errno = EIO; return EIO; }
     if (f->dr == f->nr && f->ds == f->ns)
         f->nr = f->dr = f->ns = f->ds = 0;
     for (; wr; wr = wr->next) {
@@ -77,6 +78,7 @@ static int fake_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
                       struct ibv_send_wr **bad) {
     fake_rdma *f = qp->qp_context;
     (void)bad;
+    if (f->fault == 5) { errno = EIO; return EIO; }
     assert(atomic_load(&decode_barriers) >= f->required_decode_barriers);
     for (; wr; wr = wr->next) {
         assert(wr->num_sge == 1 && f->ns < 1024);
@@ -90,6 +92,7 @@ static int fake_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
 
 static int fake_poll(struct ibv_cq *cq, int cap, struct ibv_wc *wc) {
     fake_rdma *f = cq->cq_context;
+    if (f->fault == 7) return -1;
     unsigned n = 0;
     if ((unsigned)cap > f->poll_batch) cap = (int)f->poll_batch;
     /* Receiving the peer's payload does not complete our outstanding sends. */
@@ -206,6 +209,46 @@ static void check_rdma(void) {
     free(tp.slab); free(in); free(out);
     puts("RDMA per-message completion accounting, bulk/decode/drain/verify: PASS");
 }
+
+/* sf-ablate(specdec): upstream's one-sided head-row fault (9) dropped with the verify-head split */
+static void check_failed_rdma(void) {
+    for (unsigned fault = 5; fault <= 8; fault++) {
+        fake_rdma f = {.fault = fault == 8 ? 7 : fault};
+        struct ibv_context ctx = {.ops = {.post_recv = fake_recv,
+            .post_send = fake_send, .poll_cq = fake_poll}};
+        struct ibv_qp qp = {.context = &ctx, .qp_context = &f};
+        struct ibv_cq cq = {.context = &ctx, .cq_context = &f};
+        struct ibv_mr mr = {.lkey = 1};
+        ds4_tp tp = {.n_layer = 40, .n_slots = 80, .vec_bytes = 5120 * 4,
+            .rdma_active = true, .gate_timeout_ms = 50, .control_fd = -1, .data_fd = -1};
+        tp_slab_layout(&tp);
+        tp.slab = calloc(1, tp.slab_bytes);
+        assert(tp.slab);
+        tp.rdma.qp = &qp; tp.rdma.cq = &cq; tp.rdma.mr = &mr;
+        tp.rdma.recv_depth = tp.rdma.send_depth = 1024;
+        assert(pthread_mutex_init(&tp.rdma.post_lock, NULL) == 0);
+        if (fault == 8) {
+            tp.rdma.block_active = true;
+            tp.rdma.block_layers = 1;
+            tp.rdma.block_rows = 2;
+            assert(!ds4_tp_batch_block_end(&tp));
+        } else {
+            tp.rdma.recv_window_active = fault != 6;
+            assert(!ds4_tp_batch_block_begin(&tp, 2, 1));
+        }
+        assert(ds4_tp_failed(&tp));
+        const unsigned posted = f.ns + f.nr;
+        assert(!ds4_tp_send_verify_commit(&tp, DS4_TP_VERIFY_ROLLBACK_REPLAY, 1));
+        assert(!ds4_tp_send_eval(&tp, 1, 1, 7));
+        assert(!ds4_tp_gate_exchange(&tp, 0, 0, 1));
+        assert(!ds4_tp_batch_block_begin(&tp, 2, 1));
+        assert(f.ns + f.nr == posted && ds4_tp_failed(&tp));
+        pthread_mutex_destroy(&tp.rdma.post_lock);
+        free(tp.rdma.win_sge); free(tp.rdma.win_rwr); free(tp.rdma.win_swr);
+        free(tp.slab);
+    }
+    puts("RDMA drain/post/end failures remain fatal: PASS");
+}
 #endif
 
 int main(void) {
@@ -214,6 +257,7 @@ int main(void) {
     check_gid();
 #endif
     check_rdma();
+    check_failed_rdma();
 #else
     puts("SKIP: RDMA completion tests require verbs headers");
 #endif

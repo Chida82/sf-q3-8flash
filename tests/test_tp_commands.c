@@ -180,11 +180,41 @@ static void check_logits_halves(void) {
     puts("TP logits halves: exact frames, reuse, canaries, EOF, invalid frames and timeout: ok");
 }
 
+static void check_failed_link(void) {
+    int fd[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
+    ds4_tp tp = {.control_fd = fd[0], .data_fd = fd[0], .n_layer = 1};
+    ds4_tp_mark_failed(&tp);
+    for (unsigned mode = 0; mode < 2; mode++) {
+#ifdef DS4_TP_HAVE_VERBS
+        tp.rdma_active = mode != 0;
+#endif
+        /* No slab or QP: a failed link must not touch either transport. */
+        const int token = 7;
+        uint32_t out = 42, in = 123;
+        assert(!ds4_tp_send_eval(&tp, 1, 1, token));
+        assert(!ds4_tp_send_verify(&tp, 1, &token, 1));
+        assert(!ds4_tp_send_verify_commit(&tp, DS4_TP_VERIFY_ROLLBACK_REPLAY, 1));
+        assert(!ds4_tp_gate_exchange(&tp, 0, 0, 1));
+        assert(!ds4_tp_batch_gate_exchange(&tp, 0, 2, 1));
+        assert(!ds4_tp_big_gate_exchange(&tp, 0, 1, &out, &in, sizeof(out)));
+        assert(!ds4_tp_batch_block_begin(&tp, 2, 1));
+        assert(!ds4_tp_batch_block_end(&tp));
+        assert(in == 123 && ds4_tp_failed(&tp));
+        char byte;
+        assert(recv(fd[1], &byte, 1, MSG_DONTWAIT) == -1 &&
+               (errno == EAGAIN || errno == EWOULDBLOCK));
+    }
+    close(fd[0]); close(fd[1]);
+    puts("TP failed links refuse commands and gates without I/O: ok");
+}
+
 int main(void) {
     check_backend_options();
     check_bulk_exchange();
     check_sync_cancellation();
     check_logits_halves();
+    check_failed_link();
     int fd[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
     ds4_tp leader = { .control_fd = fd[0] };
