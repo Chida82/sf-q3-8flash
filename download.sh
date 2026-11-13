@@ -90,6 +90,9 @@ else
     else
         CACHED=$("$HF" download "$REPO" "$FILE" --repo-type model)
     fi
+    # Under an AI agent, hf >= 2.4 prints hints and then "path=<file>".
+    CACHED=$(printf '%s\n' "$CACHED" | tail -n 1)
+    CACHED=${CACHED#path=}
     [ -n "$CACHED" ] && [ -s "$CACHED" ] || {
         echo "Download finished but the Hugging Face CLI reported no cached file" >&2
         exit 1

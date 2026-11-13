@@ -87,6 +87,12 @@ Messages, request streaming, batching, tool calls, and optional disk KV cache:
 
 See `docs/SERVER.md` and `docs/CLIENTS.md`.
 
+`sfctl` runs the server as an on-demand launchd service on port 8912
+(`sfctl start q3-8flash`, `sfctl stop q3-8flash`, `sfctl status`). It runs
+from its own worktree at `main`, never from your development branch, and never
+starts on its own. Install, commands and keeping it in sync with `main`:
+[sfctl/README.md](sfctl/README.md).
+
 ## Vision
 
 ```sh

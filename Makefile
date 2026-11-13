@@ -339,6 +339,11 @@ test: all ds4_test q4k-dot-test mxfp4-dot-test test-session-state tests/test_lay
 	./tests/test_sampling
 	./tests/test_image_decode
 	python3 tests/test_model_download.py
+	sh tests/test_sfctl.sh
+
+.PHONY: test-sfctl
+test-sfctl:
+	sh tests/test_sfctl.sh
 
 
 gguf-tools/quality-testing/score_official: gguf-tools/quality-testing/score_official.c $(CORE_OBJS) rax.o

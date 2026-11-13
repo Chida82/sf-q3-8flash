@@ -56,7 +56,11 @@ cache = Path(os.environ['FAKE_HF_CACHE'])
 cache.mkdir(parents=True, exist_ok=True)
 path = cache / args[2]
 path.write_bytes((args[2] + '\\n').encode())
-print(path)
+if os.environ.get('FAKE_HF_AGENT'):
+    print('Hint: a skill is not installed.')
+    print(f'path={path}')
+else:
+    print(path)
 """)
         hf.chmod(0o755)
         self.env = dict(os.environ, HOME=str(self.root / "home"), HF_TOKEN="",
@@ -76,6 +80,11 @@ print(path)
             self.assertEqual((self.root / "qwen3.8-flash-next.gguf").resolve(),
                              (self.out / name).resolve())
             self.assertIn("Already downloaded", self.run_download(target))
+
+    def test_agent_mode_output_is_linked(self):
+        self.env["FAKE_HF_AGENT"] = "1"
+        self.run_download("q4")
+        self.assertEqual((self.out / Q4).resolve(), (self.cache / Q4).resolve())
 
     def test_repository_only_gains_symlinks(self):
         self.run_download("q4")

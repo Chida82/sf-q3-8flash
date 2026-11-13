@@ -18,6 +18,7 @@ relevant document under `docs/` before changing a subsystem.
 | Binaries | `sf-q3-8flash`, `sf-q3-8flash-server`, `sf-q3-8flash-bench`, `sf-q3-8flash-eval` |
 | Default model | `qwen3.8-flash-next.gguf` |
 | Server port | `8004` |
+| Service | `sfctl`, port `8912`, serve worktree `~/.sf/q3-8flash/serve` at local `main` (see "Serving (sfctl)") |
 | Home / lock | `~/.sf/q3-8flash`; `/tmp/sf-q3-8flash.lock` |
 | Vision | Qwen3-VL projector supported |
 | Speculation | Built-in Qwen MTP (`--mtp`); no external support model or DSpark |
@@ -124,6 +125,18 @@ routine unit test; use an existing local GGUF or ask first.
   for example `DS4_METAL_CB_TIMES=1 ./sf-q3-8flash ...`; never export them.
 - Do not simplify away validation at GGUF, HTTP, filesystem, or snapshot trust
   boundaries.
+
+## Serving (sfctl)
+
+`sfctl/` runs this model as an on-demand launchd service from a serve worktree,
+`~/.sf/q3-8flash/serve`, detached at local `main`. A request to "sync sfctl" or
+"sync serve" means the "Syncing serve" procedure in `sfctl/README.md`, run only
+after the change is merged into `main`; never update serve from a work branch
+and never edit it. `install` and `uninstall` change the machine: ask the owner
+first. `sfctl/sfctl`, `sfctl/README.md` and `tests/test_sfctl.sh` are the same
+files in every child that has them; only `sfctl/sf-q3-8flash.conf` is this
+model's. `sfctl/` stays generic: no user name or machine path in it
+(`tests/test_sfctl.sh` checks).
 
 ## Child and upstream discipline
 
