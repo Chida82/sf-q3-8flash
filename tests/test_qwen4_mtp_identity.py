@@ -43,6 +43,7 @@ def main():
     parser.add_argument("--prompts", type=Path,
                         help="file of '<tokens>\\t<prompt>' lines in place of the default set")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--fail-fast", action="store_true", help="stop at the first DIFF or SLOW run")
     args = parser.parse_args()
     depths = args.depths.split(",")
     if any(d not in ("auto", "2", "3") for d in depths):
@@ -72,18 +73,29 @@ def main():
         speed = re.search(rb"generation: ([\d.]+) t/s", result.stderr)
         return result.stdout, speed.group(1).decode() if speed else "?"
 
-    diffs = 0
+    diffs = slows = 0
     for i, (n, prompt) in enumerate(prompts, 1):
         plain, speed = run(i, "plain", n, prompt, [], "auto")
         print(f"  {i:2}  plain       {speed:>6} t/s  {prompt[:60]}", flush=True)
         for depth in depths:
-            mtp, speed = run(i, f"mtp-{depth}", n, prompt, ["--mtp"], depth)
+            mtp, mtp_speed = run(i, f"mtp-{depth}", n, prompt, ["--mtp"], depth)
             same = mtp == plain
+            # MTP below half of plain speed is broken even when the text matches
+            # (a context replay per cycle once ran at 4.7 t/s against 59)
+            slow = speed != "?" and mtp_speed != "?" and float(mtp_speed) < 0.5 * float(speed)
             diffs += not same
+            slows += slow
             note = "" if same else "  " + first_difference(plain, mtp)
-            print(f"  {i:2}  mtp {depth:<4}    {speed:>6} t/s  {'SAME' if same else 'DIFF'}{note}", flush=True)
-    print(f"{'PASS' if not diffs else 'FAIL'}: {diffs} of {len(prompts) * len(depths)} MTP runs differ from plain")
-    sys.exit(1 if diffs else 0)
+            verdict = ("SAME" if same else "DIFF") + (" SLOW" if slow else "")
+            print(f"  {i:2}  mtp {depth:<4}    {mtp_speed:>6} t/s  {verdict}{note}", flush=True)
+            if args.fail_fast and (slow or not same):
+                break
+        if args.fail_fast and (diffs or slows):
+            break
+    bad = diffs + slows
+    print(f"{'PASS' if not bad else 'FAIL'}: {diffs} of {len(prompts) * len(depths)} MTP runs differ from plain, "
+          f"{slows} below half the plain speed")
+    sys.exit(1 if bad else 0)
 
 
 if __name__ == "__main__":

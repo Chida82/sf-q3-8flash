@@ -340,6 +340,7 @@ test: all ds4_test q4k-dot-test mxfp4-dot-test test-session-state tests/test_lay
 	./tests/test_image_decode
 	python3 tests/test_model_download.py
 	sh tests/test_sfctl.sh
+	bash -n tests/model_gates.sh && ./tests/model_gates.sh --help > /dev/null
 
 .PHONY: test-sfctl
 test-sfctl:

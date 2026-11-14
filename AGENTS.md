@@ -90,12 +90,18 @@ For vision changes, run the model-less Python metric tests first, then
 `DS4_QWEN4_IMAGE`. For server changes, always run `./ds4_test --server`; add the
 smallest existing server integration test matching the changed protocol.
 
-Before a PR, when local GGUFs exist:
+Before a PR, when local GGUFs exist, run the model gates (MTP identity and
+limits, `ds4_test` against its known failures, vision, host paths; one model
+process at a time, stopping at the first failure), on Q2 and Q4:
 
 ```sh
-DS4_TEST_MODEL=/absolute/path/model.gguf DS4_TEST_GLM_MTP=1 ./ds4_test
-python3 tests/test_qwen4_mtp_limits.py --model /absolute/path/model.gguf
-python3 tests/test_qwen4_mtp_identity.py --model /absolute/path/model.gguf   # Q2 and Q4, ~30 min each
+tests/model_gates.sh /absolute/path/model.gguf \
+    --mmproj gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf --image A.png --image B.png
+```
+
+Read the `PASS`/`FAIL` lines, not only the exit code. Then:
+
+```sh
 ./sf-q3-8flash-eval -m /absolute/path/model.gguf --suite core
 ./sf-q3-8flash-bench -m /absolute/path/model.gguf --prompt-file speed-bench/promessi_sposi.txt
 ```

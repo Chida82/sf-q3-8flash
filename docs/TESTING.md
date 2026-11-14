@@ -58,7 +58,8 @@ ds4 has 14 more failures than the child on each pack: `ds4_engine_open` in the
 cache-pressure test and every logprob-vector step, none of which reaches the
 child's kept tests.
 
-A change passes this suite when its failure list equals the child's list above:
+`tests/model_gates.sh` carries the test names of this table (`KNOWN_DS4_TEST_FAILURES`);
+change both together. A change passes this suite when its failure list equals the child's list above:
 same tests, same assertion lines, same counts. A new failing test, or a higher
 count, is a regression until shown otherwise; a change in `long-context` is the
 one to look at first, since it depends on attention.
