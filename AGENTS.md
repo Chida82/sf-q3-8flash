@@ -211,6 +211,15 @@ When in doubt, prove it: build with the symbol removed, or add a one-line
   and were removed at the sync to `0aaea5a`; the machinery they covered is now
   dead here and is a candidate for a later, separately measured ablation.
 
+- A field that shares its name with an upstream field of another meaning
+  compiles into wrong behaviour at a sync. The child's `mtp_tail_valid` (one
+  primed prompt row waiting for its next token, cleared at the first decode)
+  met upstream's (predictor state current, set while decoding) at the sync to
+  `b3f5018`: two upstream predicates that read it were merged, compiled, and
+  made every MTP cycle replay the context. The child's fields are now
+  `mtp_prime_row`, `mtp_prime_pos` and `mtp_prime_pending`, so upstream code
+  that reads `mtp_tail_*` fails to compile. When the child gives a field its
+  own meaning, it gives it its own name.
 - `make cpu` used to link over the four default binary names, so a Metal run
   after it failed with "requires Metal or single-GPU CUDA" and `make` would not
   relink: the binaries were newer than every object. Documenting it was not

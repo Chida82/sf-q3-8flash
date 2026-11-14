@@ -31687,9 +31687,9 @@ typedef struct ds4_qwen4_gpu_graph {
     /* Prompt priming of the predictor: the ids of the tokens that follow
      * each prompt row (arena) and the last row's streams, which wait for
      * the token that follows them (see qwen4_graph_mtp_prime) */
-    ds4_gpu_tensor *mtp_next, *mtp_tail;
-    uint32_t mtp_tail_pos;
-    bool mtp_tail_valid;
+    ds4_gpu_tensor *mtp_next, *mtp_prime_row;
+    uint32_t mtp_prime_pos;
+    bool mtp_prime_pending;
     /* MTP draft head over a ranked vocabulary subset: gathered Q8 rows, their
      * token ids (host and device), and whether the lazy load was attempted */
     ds4_gpu_tensor *draft_head, *draft_map;
@@ -31832,7 +31832,7 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
     if (!g) return;
     ds4_gpu_tensor **all[] = {
         &g->ple_hist, &g->logits,
-        &g->mtp_ids, &g->mtp_cat, &g->mtp_proj, &g->mtp_R, &g->mtp_tail, &g->mtp_argmax, &g->mtp_argmax_tmp,
+        &g->mtp_ids, &g->mtp_cat, &g->mtp_proj, &g->mtp_R, &g->mtp_prime_row, &g->mtp_argmax, &g->mtp_argmax_tmp,
         &g->snap_ple_hist, &g->snap2_ple_hist, &g->snap0_ple_hist, &g->pos3,
         &g->draft_head, &g->draft_map, &g->steer_dirs,
     };
@@ -32065,7 +32065,7 @@ private_state:
         QWEN4_ALLOC(mtp_cat, 3u * (hc + 1u) * 2u * E);
         QWEN4_ALLOC(mtp_proj, 3u * (hc + 1u) * E);
         QWEN4_ALLOC(mtp_R, 3u * hc_dim);
-        QWEN4_ALLOC(mtp_tail, hc_dim);
+        QWEN4_ALLOC(mtp_prime_row, hc_dim);
         QWEN4_ALLOC(mtp_argmax, 2u);
         QWEN4_ALLOC(mtp_argmax_tmp, ((DS4_N_VOCAB + 4095u) / 4096u) * 2u);
         QWEN4_ALLOC(snap_ple_hist, (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * hc_dim);
@@ -32211,7 +32211,7 @@ static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
     g->pos = 0;
     g->mtp_pos = 0;
     g->mtp_last_rows = 0;
-    g->mtp_tail_valid = false;
+    g->mtp_prime_pending = false;
     g->mrope_delta = 0;
     g->snap_valid = false;
     g->snap2_valid = false;
@@ -32946,7 +32946,7 @@ static void *qwen4_ple_prefetch_run(void *context) {
     p->read_sec = now_sec() - started;
     return NULL;
 }
-static bool qwen4_graph_mtp_tail_flush(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w, int token);
+static bool qwen4_graph_mtp_prime_flush(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w, int token);
 
 /* Stage the residual and position inputs independently of PLE disk reads. */
 static bool qwen4_graph_stage_embeddings(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
@@ -32962,7 +32962,7 @@ static bool qwen4_graph_stage_embeddings(ds4_qwen4_gpu_graph *g, const ds4_model
     /* sf-keep(mtp): the child primes the predictor over the prompt (30) instead of upstream's
      * tail-state boundary step; flush its pending row and stage the next-token ids here, where
      * both the plain and the PLE-prefetch staging paths pass. */
-    if (!qwen4_graph_mtp_tail_flush(g, m, w, tokens[0])) return false;
+    if (!qwen4_graph_mtp_prime_flush(g, m, w, tokens[0])) return false;
     if (qwen4_graph_mtp_priming(g) && T > 1u &&
         !ds4_gpu_tensor_write(g->mtp_next, 0, tokens + 1, (uint64_t)(T - 1u) * sizeof(int32_t))) return false;
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc;
@@ -33027,7 +33027,7 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
            qwen4_graph_stage_ple(g, m, tokens, T, prefetched_ple);
 }
 
-static bool qwen4_graph_mtp_tail_flush(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w, int token);
+static bool qwen4_graph_mtp_prime_flush(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w, int token);
 static bool qwen4_graph_mtp_prime(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                   uint32_t pos0, uint32_t T);
 
@@ -33519,9 +33519,9 @@ static bool qwen4_graph_mtp_step(ds4_qwen4_gpu_graph *g, const ds4_model *m, con
  * transients, idle between the trunk's last experts and the nextn layer's
  * own, and the predictor's input residual overwrites the trunk streams in
  * place.  Only the layer's cache writes run: nothing reads a history row's
- * output.  The chunk's last row waits in mtp_tail for the token that follows
+ * output.  The chunk's last row waits in mtp_prime_row for the token that follows
  * it, and runs the whole layer when the next forward brings that token
- * (qwen4_graph_mtp_tail_flush). */
+ * (qwen4_graph_mtp_prime_flush). */
 static bool qwen4_graph_mtp_prime(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                   uint32_t pos0, uint32_t T) {
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC;
@@ -33550,11 +33550,11 @@ static bool qwen4_graph_mtp_prime(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
         ds4_gpu_tensor_free(ids);
         t0 += n;
     }
-    if (ok) ok = ds4_gpu_tensor_copy(g->mtp_tail, 0, R_save, (uint64_t)(T - 1u) * row_bytes, row_bytes) != 0;
+    if (ok) ok = ds4_gpu_tensor_copy(g->mtp_prime_row, 0, R_save, (uint64_t)(T - 1u) * row_bytes, row_bytes) != 0;
     if (ok) {
         g->mtp_pos = pos0 + T - 1u;
-        g->mtp_tail_pos = pos0 + T - 1u;
-        g->mtp_tail_valid = true;
+        g->mtp_prime_pos = pos0 + T - 1u;
+        g->mtp_prime_pending = true;
     }
     return ok;
 }
@@ -33562,13 +33562,13 @@ static bool qwen4_graph_mtp_prime(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
 /* The primed chunk's last row meets its next token: the first token of the
  * forward that follows, single or batched, which calls this before staging.
  * A rewind in between leaves the tail behind. */
-static bool qwen4_graph_mtp_tail_flush(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w, int token) {
-    if (!g->mtp_tail_valid) return true;
-    g->mtp_tail_valid = false;
-    if (g->mtp_tail_pos + 1u != g->pos) return true;
+static bool qwen4_graph_mtp_prime_flush(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w, int token) {
+    if (!g->mtp_prime_pending) return true;
+    g->mtp_prime_pending = false;
+    if (g->mtp_prime_pos + 1u != g->pos) return true;
     ds4_gpu_tensor *R_save = g->R;
-    g->R = g->mtp_tail;
-    const bool ok = qwen4_graph_mtp_steps(g, m, w, 0, &token, 1u, g->mtp_tail_pos, false, NULL, NULL, NULL);
+    g->R = g->mtp_prime_row;
+    const bool ok = qwen4_graph_mtp_steps(g, m, w, 0, &token, 1u, g->mtp_prime_pos, false, NULL, NULL, NULL);
     g->R = R_save;
     return ok;
 }
@@ -35582,7 +35582,7 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
     }
     g->pos = rows;
     g->mtp_pos = mtp_rows;
-    g->mtp_tail_valid = false;
+    g->mtp_prime_pending = false;
     token_vec_free(&s->checkpoint);
     s->checkpoint = new_checkpoint;
     s->checkpoint_valid = true;
@@ -41348,7 +41348,7 @@ static int speculative_point_replacement(ds4_session *s,
 /* after a rewind past the verify snapshot the graph was reset: re-prefill the
  * kept transcript so the state matches the checkpoint again */
 static int qwen4_session_replay_if_stale(ds4_session *s, char *err, size_t errlen) {
-    /* sf-keep(mtp): upstream also replays when its MTP tail state is stale; here mtp_tail_valid is 30's one-shot primed row, cleared by the first decode, so that test replayed every cycle. */
+    /* sf-keep(mtp): upstream also replays when its MTP tail state (mtp_tail_valid) is stale; this child has no such state: mtp_prime_pending is 30's one-shot primed row, and reading it there replayed every cycle. */
     if (!s->qwen4_graph_ready || s->qwen4_graph.pos == (uint32_t)s->checkpoint.len) return 0;
     if (s->checkpoint_image_count) {
         if (errlen) snprintf(err, errlen, "Qwen3.8 image rewind requires multimodal sync");
@@ -43439,7 +43439,7 @@ static bool qwen4_graph_encode_native_session_batch(ds4_decode_item *items, int 
     const uint32_t hc_dim = DS4_N_EMBD * DS4_N_HC;
     const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     for (int i = 0; i < count; i++) {
-        if (!qwen4_graph_mtp_tail_flush(&items[i].session->qwen4_graph, m, w, items[i].token)) return false;
+        if (!qwen4_graph_mtp_prime_flush(&items[i].session->qwen4_graph, m, w, items[i].token)) return false;
     }
 
     qwen4_batch_row *views = xcalloc((size_t)count, sizeof(*views));
@@ -43631,7 +43631,7 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
     const uint32_t hc_dim = DS4_N_EMBD * DS4_N_HC;
     const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     for (int i = 0; i < count; i++) {
-        if (!qwen4_graph_mtp_tail_flush(&mem[i].session->qwen4_graph, m, w, mem[i].tokens[0])) return false;
+        if (!qwen4_graph_mtp_prime_flush(&mem[i].session->qwen4_graph, m, w, mem[i].tokens[0])) return false;
     }
     qwen4_batch_row *views = xcalloc((size_t)count, sizeof(*views));
     ds4_qwen4_gpu_graph *rowg = xmalloc((size_t)count * sizeof(*rowg));
@@ -43852,7 +43852,7 @@ static bool qwen4_graph_native_session_batch_check(ds4_decode_item *items, int c
             g->owns_scratch || g->R != arena->R ||
             g->n_block_cap > arena->n_block_cap ||
             g->pos != (uint32_t)s->checkpoint.len ||
-            /* sf-keep(mtp): no upstream MTP-tail test here; mtp_tail_valid is 30's one-shot primed row. */
+            /* sf-keep(mtp): no upstream MTP-tail (mtp_tail_valid) test here; this child has no MTP tail state. */
             g->vis_span_count != 0 || (speculative && !g->mtp_R) ||
             g->snap_after_first || g->snap_after_second ||
             g->steer_attn_scale != 0.0f || g->steer_ffn_scale != 0.0f ||
