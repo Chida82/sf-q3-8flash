@@ -18,12 +18,24 @@ make test-q8-prefill-variants
 make test-qwen4-ngrams
 ```
 
+Renderer changes can be checked without a model by rendering the same request
+before and after the change and diffing the output:
+
+```sh
+./ds4_test --qwen-render EFFORT PRESERVE MESSAGES.json [TOOLS.json]
+```
+
+`EFFORT` is a `reasoning_effort` name, `PRESERVE` is `true` or `false`
+(`preserve_thinking`), `MESSAGES.json` is a chat `messages` array and
+`TOOLS.json` a `tools` array (`-` for none). The rendered prompt goes to stdout.
+
 Model-backed checks require a Qwen3.8 GGUF:
 
 ```sh
 DS4_TEST_MODEL=/absolute/path/model.gguf DS4_TEST_GLM_MTP=1 ./ds4_test
 python3 tests/test_qwen4_mtp_limits.py --model /absolute/path/model.gguf
 python3 tests/test_qwen4_mtp_identity.py --model /absolute/path/model.gguf
+python3 tests/test_qwen4_reasoning_retention.py --model /absolute/path/model.gguf
 ./sf-q3-8flash-eval -m /absolute/path/model.gguf --suite core
 ./sf-q3-8flash-bench -m /absolute/path/model.gguf --prompt-file speed-bench/promessi_sposi.txt
 ```
@@ -32,6 +44,10 @@ python3 tests/test_qwen4_mtp_identity.py --model /absolute/path/model.gguf
 prompts at the automatic depth and at depths 2 and 3. Run it on both packs
 before landing MTP, prefill or decode work; it takes about 30 minutes per pack,
 or half with `--depths auto`.
+
+`test_qwen4_reasoning_retention.py` drives the server's `preserve_thinking`
+switch through one server run and a restart; see `docs/QWEN38_FLASH_NEXT.md`.
+Run it last and alone: it takes several minutes.
 
 Vision parity additionally requires the original checkpoint, projector GGUF,
 and an image; see `make help` for the three environment variables.

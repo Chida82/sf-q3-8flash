@@ -66,11 +66,36 @@ python3 tests/test_qwen4_checkpoint_replay.py --model /path/to/main-with-mtp.ggu
 python3 tests/test_qwen4_mtp_limits.py --model /path/to/main-with-mtp.gguf
 python3 tests/test_qwen4_logit_dump.py --model /path/to/main-with-mtp.gguf
 python3 tests/test_qwen4_steering.py --model /path/to/main-with-mtp.gguf
+python3 tests/test_qwen4_reasoning_retention.py --model /path/to/main-with-mtp.gguf
 ```
 
 The checkpoint tests cover chunk boundaries, rollback, repeated restores, and
 truncated payloads. The logit test compares all-row prefill with teacher-forced
 decode. The steering test covers all 48 trunk layers.
+
+Prompt rendering is checked without a model. `make test-frontends` runs the
+Qwen renderer assertions, including that a client which spells a tool-schema
+character as an escape on the wire (`\u2014`, or a surrogate pair for an emoji)
+is decoded before it reaches the prompt, the way the template's `tojson`
+renders it, while control characters keep the escaped spelling.
+
+`test_qwen4_reasoning_retention.py` drives the `preserve_thinking` switch on
+one server run plus a restart: prompt shape, live reuse of a growing
+retention-off loop, restart reuse by a continuation of that loop, and a
+notice-heavy loop that counts the meta-commentary class the archive used to
+replay. Artifacts (server log, trace, per-request JSON) land in `--out`, and it
+prints which check answered the checkpoint-key question, so a failure can be
+read without re-running the model. Upstream measured, on a ten-turn loop, 2053
+to 1216 prompt tokens, with 1279 of 1281 tokens reused from the live session
+and 1281 of 1281 from disk after a restart; the six-turn reproduction reused
+1229 of 1252 from disk. That settles that a continuation needs no new key, not
+that the key ignores the switch: `build_thinking_visible_text` keys a
+retention-off checkpoint by the visible transcript, which renders the frontier
+turn with an empty reasoning body, so a client that echoes `reasoning_content`
+back reuses the live prefix through the exact-token tier and still re-prefills
+from disk. Arms that judge reuse report INCONCLUSIVE rather than FAIL when the
+setup cannot settle them, which includes a frontier turn that ended truncated:
+an unclosed reasoning chain cannot be replayed into the next request.
 
 Qwen tensor-parallel and pipeline execution remain unavailable until their
 recurrent-state contracts are implemented and verified; their shared

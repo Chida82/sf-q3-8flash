@@ -255,8 +255,8 @@ sync; 90's `sync-map.md` (sections 1-2) resolves each against the child's port.
 | Commit | Subject | Verdict | Reason |
 |---|---|---|---|
 | `485902a` | qwen4: TurboQuant KV cache for the Qwen3.8 attention caches (2..8-bit) | drop | quantizes the KV cache: loses precision |
-| `f5e419d` | server: render Qwen prompts the way the fixed template does | next sync | Qwen prompt rendering fix; correctness, not performance. Not in `upstream/main` (no patch or subject match), so merging upstream does not bring it: ported by `92-qwen-template-fix-1115` |
-| `c544020` | tests: plumb the disk budget the retention test claims to set | next sync | fixes the retention test added with `f5e419d`; ported with it by `92-qwen-template-fix-1115` |
+| `f5e419d` | server: render Qwen prompts the way the fixed template does | adopt -> `92-qwen-template-fix-1115` | Qwen branches only, GLM/DeepSeek renderers and markers dropped. A 38-case render corpus: 24 byte-identical, 14 differ only in the PR's four classes (reasoning inside content, `preserve_thinking=false`, tool-schema escapes, effort aliases). Two PR bugs fixed in the port: escaped printable ASCII in schemas was re-escaped, and the closing tool-response marker in the trace table was misspelled. `chat_template_kwargs` wins over the top-level key in any order. `tests/template_parity_ab.py` not ported (its section in `docs/TESTING.md` became `--qwen-render` usage). Not in `upstream/main` |
+| `c544020` | tests: plumb the disk budget the retention test claims to set | adopt -> `92-qwen-template-fix-1115` | with `f5e419d`'s retention test. Q4 run: 15 checks pass, 1 inconclusive (D1, neither arm replayed the opener); live reuse 1279/1281 tokens, 1281/1290 after a restart (the PR reports 1279/1281 and 1281/1281) |
 
 ### #1118 (head `25def38`)
 
