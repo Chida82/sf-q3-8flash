@@ -11,6 +11,10 @@ It binds `127.0.0.1:8004` by default. Override with `--host` and `--port`.
 Supported APIs are OpenAI chat completions, Responses, text completions, and
 Anthropic Messages. `GET /v1/models` lists the Qwen aliases accepted by this
 server.
+Each entry, and `GET /v1/models/{id}`, reports `architecture.input_modalities`
+(`["text", "image"]` when `--vision` is loaded, otherwise `["text"]`) and
+`architecture.output_modalities` (`["text"]`). A request may carry up to 256
+images.
 
 Built-in MTP is enabled with `--mtp`. Add `--mtp-exact-sampling` when sampled
 requests must preserve the ordinary distribution. Supply the Qwen3-VL
