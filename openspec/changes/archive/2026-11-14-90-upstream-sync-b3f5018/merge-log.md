@@ -129,6 +129,8 @@ instead of compiling into this.
 | G7 `ds4_test` with Q4 and MTP | the five `docs/TESTING.md` failures, same assertions |
 | G8 `--ssd-streaming` vs resident, 3 prompts | identical |
 | MTP against upstream | `mtp-compare.md` |
+| A/B `--bitwise` against old `main` (Q4) | PASS; plain decode +4.1%, MTP decode +-0.3%, prefill -0.3..-1.0% |
+| Q2: plain vs upstream, MTP identity, parity | 12/12 identical, 36/36 SAME, PARITY OK 10/10 |
 
 The first G7 run reported two more failures (`qwen4-restore-reuse`,
 `session-rewind`): MTP never drafted. That `ds4_test` had been built before the

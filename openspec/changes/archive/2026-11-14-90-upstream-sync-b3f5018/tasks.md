@@ -33,7 +33,7 @@ sequential, and no build or test runs beside one. `<Q4>` is the child's
 - [x] 3.2 `python3 tests/test_qwen4_mtp_limits.py --model <Q4>` (one-row, two-rows-depth-three, unfused: PASS).
 - [x] 3.3 `DS4_TEST_MODEL=<Q4> DS4_TEST_GLM_MTP=1 ./ds4_test`, compared against the baseline in `docs/TESTING.md`: the five listed failures, same assertions (Priya 9 vs 97). A first run used a `ds4_test` built before 1.8 and failed two more tests; see merge-log.
 - [x] 3.4 Vision: `python3 tests/test_qwen4_cli_vision.py` with two images: PASS; ordinary and MTP outputs each equal old `main`'s (their mutual difference is `110`).
-- [ ] 3.5 SSD streaming: streamed tokens identical to resident (the `80` check).
+- [x] 3.5 SSD streaming: streamed tokens identical to resident (the `80` check): 3/3 prompts identical.
 
 ## 4. D4: #1238's M5 path (taken directly at merge time; see merge-log.md)
 
@@ -44,8 +44,8 @@ sequential, and no build or test runs beside one. `<Q4>` is the child's
 ## 5. Parity and record
 
 - [x] 5.1 `tools/parity-check.sh sf-q3-8flash <Q4>`: `PARITY OK`, 10/10 token-identical, every prompt within 2% or faster.
-- [ ] 5.2 A/B against the old `main` with `--bitwise`. A new segment start row in `speed-bench/perf-record.md` if the merge-base moved the reference.
-- [ ] 5.3 Q2 gates (3.1, 5.1) if 0.4 was approved.
+- [x] 5.2 A/B against the old `main` with `--bitwise`: PASS (tokens and logit bits), plain decode +4.1%, MTP decode -0.1% (code) / +0.3% (prose), prefill -0.3..-1.0% (follow-ups `95`, `97`). Greedy output did not change, so no new segment: the row against segment 1's start `91f225a` is in `speed-bench/perf-record.md` (plain decode +6.1%, MTP code +22.3%).
+- [x] 5.3 Q2 gates (3.1, 5.1) if 0.4 was approved: plain output identical to upstream on the 12 prompts, `test_qwen4_mtp_identity` 36/36, `PARITY OK` 10/10 within 2% (one prompt +6.2%).
 - [x] 5.4 Commit and tag only when the owner asks (`tools/sync-finish.sh`). Commit and merge asked 2026-11-14; tag and push not asked.
 
 ## 6. Follow-ups written as their own changes
