@@ -38,10 +38,11 @@ static inline void ds4_prompt_prefix_append(ds4_engine *engine,
     for (size_t i = 0; i < prefix->count; i++) {
         const ds4_prompt_prefix_turn *turn = &prefix->turns[i];
         const bool assistant = turn->role == DS4_PROMPT_PREFIX_ASSISTANT;
+        /* The Qwen turn already ends with <|im_end|>, which is also its EOS:
+         * no extra EOS after an assistant turn. */
         ds4_chat_append_message(engine, tokens,
                                 assistant ? "assistant" : "user",
                                 turn->content);
-        if (assistant) ds4_tokens_push(tokens, ds4_token_eos(engine));
     }
 }
 

@@ -611,6 +611,9 @@ static id<MTLComputePipelineState> g_glm_q6_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_batch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_hc_expand4_pipeline;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_pipeline_cache;
+/* g_pipeline_cache is not thread-safe.  Keep-alive threads use this copy,
+ * resolved on the starting thread before pthread_create. */
+static id<MTLComputePipelineState> g_keepalive_pipeline;
 
 enum {
     DS4_METAL_DECODE_PIPELINE_FAST_CACHE_SLOTS = 64,
@@ -1734,6 +1737,14 @@ static uint64_t ds4_gpu_effective_model_max_tensor_bytes(uint64_t map_size, uint
 }
 
 static id<MTLComputePipelineState> ds4_gpu_get_pipeline(const char *function_name);
+
+static int ds4_gpu_resolve_keepalive_pipeline(void) {
+    if (!g_keepalive_pipeline) {
+        g_keepalive_pipeline = ds4_gpu_get_pipeline("kernel_dsv4_tp_keepalive");
+    }
+    return g_keepalive_pipeline != nil;
+}
+
 static int ds4_gpu_warm_model_views(void);
 static double ds4_gpu_gib(uint64_t bytes);
 
@@ -10666,8 +10677,7 @@ static void *ds4_gpu_tp_keepalive_thread(void *arg) {
      * (~1.7x) suggest decode runs well below max clocks. More TGs raise
      * apparent utilization without eating memory bandwidth. */
     uint32_t ka_tgs = ds4_gpu_tp_keepalive_tgs_from_env();
-    id<MTLComputePipelineState> pipeline =
-        ds4_gpu_get_pipeline("kernel_dsv4_tp_keepalive");
+    id<MTLComputePipelineState> pipeline = g_keepalive_pipeline;
     if (!pipeline) {
         fprintf(stderr, "ds4: TP keep-alive pipeline missing\n");
         return NULL;
@@ -11080,6 +11090,7 @@ int ds4_gpu_tp_init(uint32_t rank,
         g_tp_keepalive_buffer = [g_device newBufferWithLength:(NSUInteger)ka_tgs * 256u * sizeof(float)
                                                       options:MTLResourceStorageModeShared];
         if (g_tp_keepalive_queue && g_tp_keepalive_buffer &&
+            ds4_gpu_resolve_keepalive_pipeline() &&
             pthread_create(&g_tp_keepalive_thread, NULL,
                            ds4_gpu_tp_keepalive_thread, NULL) == 0) {
             g_tp_keepalive_running = 1;
@@ -11591,7 +11602,7 @@ static volatile int g_queue_keepalive_stop;
 
 static void *ds4_gpu_queue_keepalive_thread(void *arg) {
     (void)arg;
-    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv4_tp_keepalive");
+    id<MTLComputePipelineState> pipeline = g_keepalive_pipeline;
     id<MTLBuffer> scratch = [g_device newBufferWithLength:256u * sizeof(float)
                                                   options:MTLResourceStorageModeShared];
     if (!pipeline || !scratch) return NULL;
@@ -11618,6 +11629,7 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) {
 static void ds4_gpu_queue_keepalive_start(void) {
     if (g_queue_keepalive_running) return;
     if (getenv("DS4_METAL_DISABLE_QUEUE_KEEPALIVE")) return;
+    if (!ds4_gpu_resolve_keepalive_pipeline()) return;
     g_queue_keepalive_stop = 0;
     if (pthread_create(&g_queue_keepalive_thread, NULL, ds4_gpu_queue_keepalive_thread, NULL) == 0)
         g_queue_keepalive_running = 1;
@@ -12138,6 +12150,7 @@ void ds4_gpu_cleanup(void) {
         ds4_gpu_model_views_clear();
         [g_pipeline_cache removeAllObjects];
         g_pipeline_cache = nil;
+        if (!g_tp_keepalive_running) g_keepalive_pipeline = nil;
         [g_q4_expert_layer_residency_cache removeAllObjects];
         g_q4_expert_layer_residency_cache = nil;
         [g_q4_expert_table_cache removeAllObjects];
@@ -13766,6 +13779,31 @@ static void ds4_gpu_stream_expert_slab_push_free_slot(uint32_t slot) {
         slot;
 }
 
+/* Returns load buffers that never reached an installed entry: a slab slot
+ * goes back on the free list (still locked, like an evicted slot), anything
+ * else is munlocked and dropped.  Nils the pointers so a second call is a
+ * no-op.  Callers must not use this on buffers a blit may still write. */
+static void ds4_gpu_stream_expert_give_back_buffers(
+        __strong id<MTLBuffer> *gate,
+        __strong id<MTLBuffer> *up,
+        __strong id<MTLBuffer> *down,
+        NSUInteger              gate_inner) {
+    uint32_t slot = 0;
+    if (*gate && *gate == *up && *gate == *down &&
+        ds4_gpu_stream_expert_slab_slot_for_buffer(*gate, gate_inner, &slot)) {
+        ds4_gpu_stream_expert_slab_push_free_slot(slot);
+    } else {
+        ds4_gpu_stream_expert_unlock_explicit_buffer(*gate);
+        if (*up != *gate) ds4_gpu_stream_expert_unlock_explicit_buffer(*up);
+        if (*down != *gate && *down != *up) {
+            ds4_gpu_stream_expert_unlock_explicit_buffer(*down);
+        }
+    }
+    *gate = nil;
+    *up = nil;
+    *down = nil;
+}
+
 static int ds4_gpu_stream_expert_slab_lock_slot(uint32_t slot) {
     if (slot >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES ||
         g_stream_expert_cache_slab_slot_locked[slot]) {
@@ -13881,6 +13919,33 @@ static int ds4_gpu_stream_expert_slab_slot_buffers(
     return 1;
 }
 
+/* The slot has already left the free list (or bumped slots_used), so a
+ * failed lock must hand it back or it is lost for the process lifetime. */
+static int ds4_gpu_stream_expert_slab_claim_slot(
+        uint32_t slot,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        __strong id<MTLBuffer> *gate_buf,
+        __strong id<MTLBuffer> *up_buf,
+        __strong id<MTLBuffer> *down_buf,
+        NSUInteger *gate_inner,
+        NSUInteger *up_inner,
+        NSUInteger *down_inner) {
+    if (ds4_gpu_stream_expert_slab_slot_buffers(slot,
+                                                gate_expert_bytes,
+                                                down_expert_bytes,
+                                                gate_buf,
+                                                up_buf,
+                                                down_buf,
+                                                gate_inner,
+                                                up_inner,
+                                                down_inner)) {
+        return 1;
+    }
+    ds4_gpu_stream_expert_slab_push_free_slot(slot);
+    return 0;
+}
+
 static int ds4_gpu_stream_expert_alloc_slab_slot(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes,
@@ -13914,15 +13979,15 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
     if (g_stream_expert_cache_free_slot_count != 0) {
         const uint32_t slot =
             g_stream_expert_cache_free_slots[--g_stream_expert_cache_free_slot_count];
-        return ds4_gpu_stream_expert_slab_slot_buffers(slot,
-                                                       gate_expert_bytes,
-                                                       down_expert_bytes,
-                                                       gate_buf,
-                                                       up_buf,
-                                                       down_buf,
-                                                       gate_inner,
-                                                       up_inner,
-                                                       down_inner);
+        return ds4_gpu_stream_expert_slab_claim_slot(slot,
+                                                     gate_expert_bytes,
+                                                     down_expert_bytes,
+                                                     gate_buf,
+                                                     up_buf,
+                                                     down_buf,
+                                                     gate_inner,
+                                                     up_inner,
+                                                     down_inner);
     }
 
     uint32_t slab = g_stream_expert_cache_slab_count;
@@ -13976,15 +14041,15 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
     const uint32_t local_slot = g_stream_expert_cache_slab_slots_used[slab]++;
     const uint32_t slot =
         g_stream_expert_cache_slab_start_slot[slab] + local_slot;
-    return ds4_gpu_stream_expert_slab_slot_buffers(slot,
-                                                   gate_expert_bytes,
-                                                   down_expert_bytes,
-                                                   gate_buf,
-                                                   up_buf,
-                                                   down_buf,
-                                                   gate_inner,
-                                                   up_inner,
-                                                   down_inner);
+    return ds4_gpu_stream_expert_slab_claim_slot(slot,
+                                                 gate_expert_bytes,
+                                                 down_expert_bytes,
+                                                 gate_buf,
+                                                 up_buf,
+                                                 down_buf,
+                                                 gate_inner,
+                                                 up_inner,
+                                                 down_inner);
 }
 
 static uint64_t ds4_gpu_stream_expert_buffer_object_count(
@@ -15221,6 +15286,7 @@ retry:
     for (uint32_t layer = 0;
          layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
          layer++) {
+        if (g_stream_expert_cache_layer_count[layer] == 0) continue;
         for (uint32_t expert = 0;
              expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
              expert++) {
@@ -15344,6 +15410,7 @@ static int ds4_gpu_stream_expert_cache_plan_reuse(
     const double t0 = timing ? ds4_gpu_now_ms() : 0.0;
     int inflight = 0;
     for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+        if (g_stream_expert_cache_layer_count[layer] == 0) continue;
         for (uint32_t expert = 0; expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
             const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert];
             if (!ds4_gpu_stream_expert_cache_entry_reusable(e, gate_expert_bytes, down_expert_bytes)) continue;
@@ -15455,6 +15522,7 @@ retry:
     for (uint32_t layer = 0;
          layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
          layer++) {
+        if (g_stream_expert_cache_layer_count[layer] == 0) continue;
         for (uint32_t expert = 0;
              expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
              expert++) {
@@ -15603,6 +15671,7 @@ static uint32_t ds4_gpu_stream_expert_cache_release_mlock_margin(
         for (uint32_t layer = 0;
              layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
              layer++) {
+            if (g_stream_expert_cache_layer_count[layer] == 0) continue;
             for (uint32_t expert = 0;
                  expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
                  expert++) {
@@ -15889,6 +15958,7 @@ static void ds4_gpu_stream_expert_cache_prune_global(
         for (uint32_t layer = 0;
              layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
              layer++) {
+            if (g_stream_expert_cache_layer_count[layer] == 0) continue;
             for (uint32_t expert = 0;
                  expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
                  expert++) {
@@ -17186,7 +17256,8 @@ static void ds4_gpu_stream_expert_cache_clear_layer(uint32_t layer) {
          expert++) {
         ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
     }
-    g_stream_expert_cache_layer_count[layer] = 0;
+    /* clear_entry decrements layer_count itself and skips in-flight
+     * entries, so forcing 0 here would desync it from the live entries. */
 }
 
 /* Optional work submitted after every selected entry is protected, but before
@@ -17703,23 +17774,15 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     free(ids);
 
     if (!ok || (*n_resources == 0 && view_served == 0)) {
-        /* clear_layer skips inflight entries, then resets its count. Finish
-         * any submitted prefix before releasing payloads or changing counts. */
+        /* clear_layer skips inflight entries. Finish any submitted prefix
+         * before releasing payloads or changing counts. */
         if (before_read_called) (void)ds4_gpu_synchronize();
         if (gate_up_ready) {
             /* These reservations never became cache entries, so clear_layer
              * cannot recycle them. No CPU/GPU reader remains after the drain. */
             for (uint32_t i = n_installed; i < n_loads; i++) {
-                uint32_t slot = 0;
-                if (gate_bufs[i] == up_bufs[i] && gate_bufs[i] == down_bufs[i] &&
-                    ds4_gpu_stream_expert_slab_slot_for_buffer(gate_bufs[i], gate_inners[i], &slot)) {
-                    ds4_gpu_stream_expert_slab_push_free_slot(slot);
-                } else {
-                    ds4_gpu_stream_expert_unlock_explicit_buffer(gate_bufs[i]);
-                    if (up_bufs[i] != gate_bufs[i]) ds4_gpu_stream_expert_unlock_explicit_buffer(up_bufs[i]);
-                    if (down_bufs[i] != gate_bufs[i] && down_bufs[i] != up_bufs[i])
-                        ds4_gpu_stream_expert_unlock_explicit_buffer(down_bufs[i]);
-                }
+                ds4_gpu_stream_expert_give_back_buffers(&gate_bufs[i], &up_bufs[i],
+                                                        &down_bufs[i], gate_inners[i]);
             }
         }
         ds4_gpu_stream_expert_cache_clear_layer(layer);
@@ -41198,7 +41261,9 @@ int ds4_gpu_qwen4_idx_block_key_tensor(
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     const uint64_t n_keys = ((uint64_t)block0 + n_blocks) * ratio;
     qwen4_bind b[4];
+    /* the kernel ropes into float tmp[64] with rope_freq[32] */
     if (n_blocks == 0 || ratio == 0 || idx_dim < 32 || idx_dim > 128 || (idx_dim % 32) != 0 || n_rot > idx_dim ||
+        n_rot > 64 || (n_rot % 2) != 0 ||
         !qwen4_bind_tensor(&b[0], ik_cache, n_keys * idx_dim * sizeof(float), "indexer k cache") ||
         !qwen4_bind_weight(&b[1], model_map, model_size, g_ik_offset, (uint64_t)idx_dim * sizeof(float),
                            "indexer k_norm") ||
@@ -41208,6 +41273,17 @@ int ds4_gpu_qwen4_idx_block_key_tensor(
     }
     return qwen4_dispatch(QWEN4_K_IDX_BLOCK_KEY, &args, sizeof(args), b, 4,
                           MTLSizeMake(n_blocks, 1, 1), MTLSizeMake(32, 1, 1), 0);
+}
+
+/* staged queries and vector key loads, plus the tile maxima the prefiltered
+ * selector needs; measured on M5 and also enabled on M6, other devices keep
+ * the scalar scorer.  Callers must not hand the selector tile maxima when
+ * this is false: the other scorers leave them stale. */
+int ds4_gpu_qwen4_idx_score_emits_tile_max(uint32_t n_tokens, uint32_t n_idx_head, uint32_t idx_dim) {
+    if (n_tokens > 2u && n_idx_head == 4u && idx_dim == 128u) return 0;
+    if (n_idx_head * idx_dim > 512u || (idx_dim & 3u) != 0u) return 0;
+    const int vec_override = ds4_gpu_env_bool("DS4_QWEN4_IDX_SCORE_VEC");
+    return vec_override >= 0 ? vec_override != 0 : ds4_gpu_device_is_m5_or_m6_apple_silicon();
 }
 
 int ds4_gpu_qwen4_idx_score_tensor(
@@ -41227,12 +41303,7 @@ int ds4_gpu_qwen4_idx_score_tensor(
         return qwen4_dispatch(QWEN4_K_IDX_SCORE_MM, &args, sizeof(args), b, 3,
                               MTLSizeMake((n_blocks + 63) / 64, (n_tokens + 15) / 16, 1), MTLSizeMake(128, 1, 1), 0);
     }
-    /* staged queries and vector key loads, plus the tile maxima the
-     * prefiltered selector needs; measured on M5 and also enabled on M6.
-     * Other devices keep the scalar scorer. */
-    const int vec_override = ds4_gpu_env_bool("DS4_QWEN4_IDX_SCORE_VEC");
-    const bool vec = tile_max && n_idx_head * idx_dim <= 512u && (idx_dim & 3u) == 0u &&
-        (vec_override >= 0 ? vec_override != 0 : ds4_gpu_device_is_m5_or_m6_apple_silicon());
+    const bool vec = tile_max && ds4_gpu_qwen4_idx_score_emits_tile_max(n_tokens, n_idx_head, idx_dim);
     if (vec) {
         if (!qwen4_bind_tensor(&b[3], tile_max, (uint64_t)n_tokens * ((n_blocks + 7u) / 8u) * sizeof(uint32_t),
                                "indexer tile maxima")) return 0;
@@ -41517,7 +41588,7 @@ int ds4_gpu_qwen4_idx_block_key_rows_tensor(
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     qwen4_bind b[2], res[QWEN4_ATTN_ROWS_MAX * 5u];
     if (n_rows == 0 || n_rows > QWEN4_ATTN_ROWS_MAX || ratio == 0 || idx_dim < 32 || idx_dim > 128 ||
-        (idx_dim % 32) != 0 || n_rot > idx_dim ||
+        (idx_dim % 32) != 0 || n_rot > idx_dim || n_rot > 64 || (n_rot % 2) != 0 ||
         !qwen4_bind_weight(&b[0], model_map, model_size, g_ik_offset, (uint64_t)idx_dim * sizeof(float), "indexer k_norm") ||
         !qwen4_bind_rows(&b[1], table, entry0, n_rows)) {
         return 0;

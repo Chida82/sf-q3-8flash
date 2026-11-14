@@ -380,16 +380,16 @@ and from `ds4_gpu_routed_moe_one_tensor`.
 
 | Commit | Subject | Verdict | Reason |
 |---|---|---|---|
-| `a0fe413` | Return streamed-expert slab slots on every load error path | next sync | not in `upstream/main`; the Qwen-reachable part is planned in `120-correctness-batch`. Reachable: a failed slot lock in `alloc_slab_slot` (through `prepare_load_buffers`) loses the slot for the process. The child's `prepare_selected_batch` already returns uninstalled reservations on its `gate_up_ready` error path. The `load_selected_missing`, `get_protected` and pending-load parts are not reachable from Qwen |
+| `a0fe413` | Return streamed-expert slab slots on every load error path | adopt -> `120-correctness-batch` (reachable part only) | not in `upstream/main`; `120-correctness-batch` ported the Qwen-reachable part as `ds4_gpu_stream_expert_slab_claim_slot`, with the give-back loop of `prepare_selected_batch` as the shared `ds4_gpu_stream_expert_give_back_buffers` (`170` reuses it). Reachable: a failed slot lock in `alloc_slab_slot` (through `prepare_load_buffers`) loses the slot for the process. The child's `prepare_selected_batch` already returns uninstalled reservations on its `gate_up_ready` error path. The `load_selected_missing`, `get_protected` and pending-load parts are not reachable from Qwen |
 | `2cf7986` | Mark GPU-copy expert entries in flight until their blit runs | not reachable from Qwen | the GPU-copy source is used only by the seed paths, which only the DeepSeek graph calls |
-| `a6fc294` | Keep per-layer expert cache counts in sync with live entries | next sync | not in `upstream/main`; planned in `120-correctness-batch`. `clear_layer` forces the count to 0 under in-flight entries; `prepare_selected_batch` calls it on its error paths |
+| `a6fc294` | Keep per-layer expert cache counts in sync with live entries | adopt -> `120-correctness-batch` | not in `upstream/main`; ported by `120-correctness-batch` (Q4 gates, parity and bitwise A/B pass). `clear_layer` forces the count to 0 under in-flight entries; `prepare_selected_batch` calls it on its error paths |
 | `6c41f9b` | Skip in-flight entries when pruning the global expert cache | not reachable from Qwen | `prune_global`'s callers are the seed paths and `ds4_gpu_routed_moe_one_tensor`, on the child's `main` and on `upstream/main` |
 
 ### #1126 (head `242da6b`)
 
 | Commit | Subject | Verdict | Reason |
 |---|---|---|---|
-| `242da6b` | Resolve the keep-alive pipeline before starting keep-alive threads | next sync | not in `upstream/main`; planned in `120-correctness-batch`. `ds4_gpu_queue_keepalive_thread` calls `ds4_gpu_get_pipeline`, which reads and writes `g_pipeline_cache` (an `NSMutableDictionary`) while the main thread compiles pipelines for the first prefill (`ds4_metal.m:11270`) |
+| `242da6b` | Resolve the keep-alive pipeline before starting keep-alive threads | adopt -> `120-correctness-batch` | not in `upstream/main`; ported by `120-correctness-batch` (Q4 gates, parity and bitwise A/B pass). `ds4_gpu_queue_keepalive_thread` calls `ds4_gpu_get_pipeline`, which reads and writes `g_pipeline_cache` (an `NSMutableDictionary`) while the main thread compiles pipelines for the first prefill (`ds4_metal.m:11270`) |
 
 ### #1128 (head `fa7bc8a`)
 
@@ -398,8 +398,8 @@ and from `ds4_gpu_routed_moe_one_tensor`.
 | `d7b0b31` | Use the BF16 mat-vec kernel when in_dim is not a multiple of 16 | not reachable from Qwen | GLM/DeepSeek vision patch embeddings; Qwen's is `3*P*P` (a multiple of 16) |
 | `82ffb0c` | Reject partial head groups in indexed mixed-batch attention | not reachable from Qwen | `ds4_gpu_attention_indexed_mixed_batch_heads_tensor` is DeepSeek graph only |
 | `3cbbb19` | Reject visual masks with more raw keys than positions | not reachable from Qwen | no caller in the child |
-| `ad14a5f` | Bound n_rot in the Qwen4 indexer block-key kernels | next sync | not in `upstream/main`; planned in `120-correctness-batch`. Latent guard: the kernels rope into `float tmp[64]` (`metal/qwen4.metal:1370`, `1532`); `n_rot` is 64 in the shipping model |
-| `fa7bc8a` | Only hand the Qwen4 selector tile maxima the scorer actually wrote | next sync | not in `upstream/main`; planned in `120-correctness-batch`. Latent: the selector gets `g->tile_max` for every `n_sparse <= 2` batch (`ds4.c:32412`), while only the vector scorer writes it. Adds `ds4_gpu_qwen4_idx_score_emits_tile_max()` |
+| `ad14a5f` | Bound n_rot in the Qwen4 indexer block-key kernels | adopt -> `120-correctness-batch` | not in `upstream/main`; ported by `120-correctness-batch` (Q4 gates, parity and bitwise A/B pass). Latent guard: the kernels rope into `float tmp[64]` (`metal/qwen4.metal:1370`, `1532`); `n_rot` is 64 in the shipping model |
+| `fa7bc8a` | Only hand the Qwen4 selector tile maxima the scorer actually wrote | adopt -> `120-correctness-batch` | not in `upstream/main`; ported by `120-correctness-batch` (Q4 gates, parity and bitwise A/B pass). Latent: the selector gets `g->tile_max` for every `n_sparse <= 2` batch (`ds4.c:32412`), while only the vector scorer writes it. Adds `ds4_gpu_qwen4_idx_score_emits_tile_max()` |
 
 ### #1288 (head `0252371`, includes #1284)
 
@@ -540,7 +540,7 @@ and from `ds4_gpu_routed_moe_one_tensor`.
 
 | Commit | Subject | Verdict | Reason |
 |---|---|---|---|
-| `7b0e2aa` (#1326) | prompt prefix: close imported Qwen assistant turns once | next sync | not in `upstream/main`; planned in `120-correctness-batch`. Bug in the child: `ds4_prompt_prefix_append` pushes EOS (`<\|im_end\|>`, `ds4.c:29722`) after `qwen4_chat_close` already closed the turn. Changes prompt tokens for `--prefix-file` only |
+| `7b0e2aa` (#1326) | prompt prefix: close imported Qwen assistant turns once | adopt -> `120-correctness-batch` | not in `upstream/main`; ported by `120-correctness-batch` (Q4 gates, parity and bitwise A/B pass). Bug in the child: `ds4_prompt_prefix_append` pushes EOS (`<\|im_end\|>`, `ds4.c:29722`) after `qwen4_chat_close` already closed the turn. Changes prompt tokens for `--prefix-file` only |
 | `46374b0` (#1325) | server: evaluate Qwen's `<\|im_end\|>` after a thinking answer | next sync | planned in `130-server-protocol-batch`. The reasoning-free live key ends with an `<\|im_end\|>\n` that was never evaluated, so the next turn sees an unclosed answer |
 | `480f2ae` (#1140) | Let Qwen and GLM make several tool calls per turn | next sync | planned in `130-server-protocol-batch`. Generation stops after the first Qwen tool call; the GLM parts drop out. Check together with #1251 |
 | `c98b444` (#1251) | server: stream Qwen tool-call arguments over OpenAI SSE | next sync | planned in `130-server-protocol-batch`. Qwen `<function=…>` syntax in the live translator; the DSML/GLM parts drop out |
@@ -567,8 +567,8 @@ and from `ds4_gpu_routed_moe_one_tensor`.
 | `15852d8` (#1162) | report max_output_tokens as the Responses incomplete reason | next sync | protocol field; planned in `130-server-protocol-batch` |
 | `5fb2ce1` (#1304) | accept OpenAI token-ID prompt arrays in completions | open | protocol; validate ids against the vocabulary (trust boundary) |
 | `6f9d7d1` (#1309) | Raise the server request body cap to 256 MiB | open | needed with 256 images per request (`f5127df`, in `upstream/main`); adds `DS4_SERVER_MAX_BODY_MB` |
-| `4fbba5d` (#1145) | Refuse duplicate tensor names and name the file of a missing tensor | next sync | not in `upstream/main`; planned in `120-correctness-batch`. GGUF trust boundary: `model_find_tensor` is first-match and nothing rejects a repeated name |
-| `f63ae1d` (#1156) | Fix the iq1_s and iq4_nl block sizes in the GGUF type table | next sync | not in `upstream/main`; planned in `120-correctness-batch`. Bug in the child (`ds4.c:2086-2087`): iq4_nl tensors are sized at about a third |
+| `4fbba5d` (#1145) | Refuse duplicate tensor names and name the file of a missing tensor | adopt -> `120-correctness-batch` | not in `upstream/main`; ported by `120-correctness-batch` (Q4 gates, parity and bitwise A/B pass). GGUF trust boundary: `model_find_tensor` is first-match and nothing rejects a repeated name |
+| `f63ae1d` (#1156) | Fix the iq1_s and iq4_nl block sizes in the GGUF type table | adopt -> `120-correctness-batch` | not in `upstream/main`; ported by `120-correctness-batch` (Q4 gates, parity and bitwise A/B pass). Bug in the child (`ds4.c:2086-2087`): iq4_nl tensors are sized at about a third |
 | `b3f552f` (#1219) | Make the BPE tokenizer and detokenizer linear | open | Qwen BPE reaches `bpe_emit_piece`. Token-identical claimed. Gate: token identity on a large corpus plus `make test-qwen4-ngrams` |
 | `142d95b` (#873) | fix bpe_emit_piece's O(n^2) merge loop | superseded by `b3f552f` | the same heap approach, smaller; take it if #1219 is too large |
 | `4104bd0` (#942) | Detach tokenizer storage from model mmap | open | low priority; overlaps #1219's arena |

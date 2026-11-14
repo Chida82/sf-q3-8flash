@@ -2099,7 +2099,7 @@ static const gguf_type_info gguf_types[] = {
     [6]  = {"q5_0",    32,  22},
     [7]  = {"q5_1",    32,  24},
     [8]  = {"q8_0",    32,  34},
-    [9]  = {"q8_1",    32,  40},
+    [9]  = {"q8_1",    32,  36},
     [10] = {"q2_k",   256,  84},
     [11] = {"q3_k",   256, 110},
     [12] = {"q4_k",   256, 144},
@@ -2109,8 +2109,8 @@ static const gguf_type_info gguf_types[] = {
     [16] = {"iq2_xxs",256,  66},
     [17] = {"iq2_xs", 256,  74},
     [18] = {"iq3_xxs",256,  98},
-    [19] = {"iq1_s",  256, 110},
-    [20] = {"iq4_nl", 256,  50},
+    [19] = {"iq1_s",  256,  50},
+    [20] = {"iq4_nl",  32,  18},
     [21] = {"iq3_s",  256, 110},
     [22] = {"iq2_s",  256,  82},
     [23] = {"iq4_xs", 256, 136},
@@ -2178,6 +2178,7 @@ typedef struct ds4_model {
 
     int ngram_fd;
     const ds4_tensor *ngram_tensor;
+    char *path;
 } ds4_model;
 
 static uint64_t scalar_value_size(uint32_t type) {
@@ -2259,6 +2260,51 @@ static bool tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes) {
     uint64_t blocks = (elements + info->block_elems - 1) / info->block_elems;
     if (blocks > UINT64_MAX / info->block_bytes) return false;
     *bytes = blocks * info->block_bytes;
+    return true;
+}
+
+/* Block geometry of the quantized types, spelled out from ggml's block
+ * structs, so a wrong table entry cannot hide behind the models that never
+ * use the type. */
+bool ds4_test_gguf_type_sizes(void) {
+    static const struct { uint32_t type, elems, bytes; } want[] = {
+        { 2,   32, 2 + 16},                                   /* q4_0 */
+        { 3,   32, 2 + 2 + 16},                               /* q4_1 */
+        { 6,   32, 2 + 4 + 16},                               /* q5_0 */
+        { 7,   32, 2 + 2 + 4 + 16},                           /* q5_1 */
+        { 8,   32, 2 + 32},                                   /* q8_0 */
+        { 9,   32, 2 + 2 + 32},                               /* q8_1 */
+        {10, QK_K, 2 + 2 + QK_K/16 + QK_K/4},                 /* q2_k */
+        {11, QK_K, 2 + QK_K/4 + QK_K/8 + 12},                 /* q3_k */
+        {12, QK_K, 2 + 2 + QK_K/2 + 12},                      /* q4_k */
+        {13, QK_K, 2 + 2 + QK_K/2 + QK_K/8 + 12},             /* q5_k */
+        {14, QK_K, 2 + QK_K/2 + QK_K/4 + QK_K/16},            /* q6_k */
+        {15, QK_K, 4 + QK_K + QK_K/8},                        /* q8_k */
+        {16, QK_K, 2 + QK_K/4},                               /* iq2_xxs */
+        {17, QK_K, 2 + QK_K/4 + QK_K/32},                     /* iq2_xs */
+        {18, QK_K, 2 + QK_K/4 + QK_K/8},                      /* iq3_xxs */
+        {19, QK_K, 2 + QK_K/8 + QK_K/16},                     /* iq1_s */
+        {20,   32, 2 + 16},                                   /* iq4_nl */
+        {21, QK_K, 2 + QK_K/4 + QK_K/8 + QK_K/32 + 4},        /* iq3_s */
+        {22, QK_K, 2 + QK_K/4 + QK_K/16},                     /* iq2_s */
+        {23, QK_K, 2 + 2 + QK_K/2 + QK_K/64},                 /* iq4_xs */
+        {29, QK_K, QK_K/8 + QK_K/16 + QK_K/32},               /* iq1_m */
+        {39,   32, 1 + 16},                                   /* mxfp4 */
+    };
+    for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+        const gguf_type_info *info = tensor_type(want[i].type);
+        uint64_t bytes = 0;
+        if (!info || info->block_elems != want[i].elems ||
+            info->block_bytes != want[i].bytes ||
+            !tensor_nbytes(want[i].type, 4ull * want[i].elems, &bytes) ||
+            bytes != 4ull * want[i].bytes)
+        {
+            fprintf(stderr, "gguf type %u (%s): table says %u values in %u bytes, ggml %u in %u\n",
+                    want[i].type, info ? info->name : "?", info ? info->block_elems : 0,
+                    info ? info->block_bytes : 0, want[i].elems, want[i].bytes);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -2346,6 +2392,7 @@ static void model_close(ds4_model *m) {
     if (m->ngram_tensor && m->ngram_fd >= 0) close(m->ngram_fd);
     free(m->kv);
     free(m->tensors);
+    free(m->path);
     if (m->map) munmap((void *)m->map, (size_t)m->size);
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
@@ -2413,6 +2460,13 @@ static void parse_metadata(ds4_model *m, ds4_cursor *c) {
 
 /* Read the tensor directory and convert relative GGUF offsets to absolute
  * mmap offsets.  Tensor bytes are still never copied here. */
+static int tensor_name_cmp(const void *a, const void *b) {
+    const ds4_tensor *ta = *(const ds4_tensor *const *)a;
+    const ds4_tensor *tb = *(const ds4_tensor *const *)b;
+    if (ta->name.len != tb->name.len) return ta->name.len < tb->name.len ? -1 : 1;
+    return memcmp(ta->name.ptr, tb->name.ptr, ta->name.len);
+}
+
 static void parse_tensors(ds4_model *m, ds4_cursor *c) {
     /* As in parse_metadata: each tensor directory entry needs at least one byte
      * in the file, so reject a count larger than the bytes remaining before the
@@ -2448,6 +2502,22 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
                 "ds4: warning: tensor %.*s has unsupported GGUF type %u\n",
                 (int)t->name.len, t->name.ptr, t->type);
         }
+    }
+
+    /* Lookups are first-match, so a repeated name would silently bind one
+     * weight to two roles. Refuse the file instead. */
+    if (m->n_tensors > 1) {
+        const ds4_tensor **sorted = malloc((size_t)m->n_tensors * sizeof(*sorted));
+        if (!sorted) ds4_die("out of memory while checking tensor names");
+        for (uint64_t i = 0; i < m->n_tensors; i++) sorted[i] = &m->tensors[i];
+        qsort(sorted, (size_t)m->n_tensors, sizeof(*sorted), tensor_name_cmp);
+        for (uint64_t i = 1; i < m->n_tensors; i++) {
+            if (tensor_name_cmp(&sorted[i - 1], &sorted[i]) != 0) continue;
+            fprintf(stderr, "ds4: duplicate tensor name in %s: %.*s\n",
+                    m->path, (int)sorted[i]->name.len, sorted[i]->name.ptr);
+            exit(1);
+        }
+        free(sorted);
     }
 
     m->tensor_data_pos = align_up(c->pos, m->alignment);
@@ -2567,6 +2637,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     memset(m, 0, sizeof(*m));
     m->fd = -1;
     m->ngram_fd = -1;
+    m->path = ds4_strdup(path);
 
     int fd = open(path, O_RDONLY);
     if (fd == -1) ds4_die_errno("cannot open model", path);
@@ -3741,7 +3812,8 @@ static float required_f32(const ds4_model *m, const char *key) {
 static ds4_tensor *required_tensor(const ds4_model *m, const char *name) {
     ds4_tensor *t = model_find_tensor(m, name);
     if (!t) {
-        fprintf(stderr, "ds4: required tensor is missing: %s\n", name);
+        fprintf(stderr, "ds4: required tensor is missing from %s: %s\n",
+                m->path ? m->path : "model", name);
         exit(1);
     }
     return t;
@@ -32489,11 +32561,14 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
     ds4_gpu_tensor *iqn = ds4_gpu_tensor_view(iqn_rows,
             (uint64_t)n_dense * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
             (uint64_t)n_sparse * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *tile_max = n_sparse <= 2u &&
+        ds4_gpu_qwen4_idx_score_emits_tile_max(n_sparse, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM) ?
+        g->tile_max : NULL;
     const bool ok = q && gate && o && iqn &&
-        ds4_gpu_qwen4_idx_score_tensor(g->score, n_sparse <= 2u ? g->tile_max : NULL, iqn,
+        ds4_gpu_qwen4_idx_score_tensor(g->score, tile_max, iqn,
                                        g->layer_block_key[il], n_sparse, n_blocks_after,
                                        DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, sp0, ratio) &&
-        qwen4_idx_select(g->sel_blocks, g->score, n_sparse <= 2u ? g->tile_max : NULL,
+        qwen4_idx_select(g->sel_blocks, g->score, tile_max,
                          n_blocks_after, n_sparse, g->k_blocks) &&
         ds4_gpu_qwen4_idx_expand_tensor(g->sel_tokens, g->n_sel, g->sel_blocks, n_sparse, g->k_blocks, ratio,
                                         sp0, g->sel_stride) &&

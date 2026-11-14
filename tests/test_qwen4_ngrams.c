@@ -51,6 +51,54 @@ static void fixture(const char *path, bool bad_alignment, uint32_t type) {
     assert(!fclose(f));
 }
 
+/* A tensor directory that repeats a name must be refused, and a missing
+ * required tensor must name the file it was expected in.  Both exit, so each
+ * runs in a forked child whose stderr comes back through a pipe. */
+static void run_refusal(bool duplicate) {
+    const char *tmp = getenv("TMPDIR");
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/ds4-gguf-refusal-XXXXXX", tmp && tmp[0] ? tmp : "/tmp");
+    int fd = mkstemp(path);
+    assert(fd >= 0);
+    FILE *f = fdopen(fd, "wb");
+    assert(f);
+    assert(fwrite("GGUF", 4, 1, f) == 1);
+    u32(f, 3); u64(f, 2); u64(f, 2);
+    str(f, "general.architecture"); u32(f, 8); str(f, "qwen4exp");
+    str(f, "general.alignment"); u32(f, 4); u32(f, 32);
+    str(f, "test.weight"); u32(f, 1); u64(f, 16); u32(f, 0); u64(f, 0);
+    str(f, duplicate ? "test.weight" : "other.weight"); u32(f, 1); u64(f, 16); u32(f, 0); u64(f, 64);
+    assert(!fflush(f) && !ftruncate(fd, ftell(f) + 4096));
+    assert(!fclose(f));
+    int err[2];
+    assert(!pipe(err));
+    fflush(stdout); /* the child exits through exit(), which would flush a copy */
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (!pid) {
+        close(err[0]);
+        dup2(err[1], STDERR_FILENO);
+        ds4_model m;
+        model_open(&m, path, false, false);
+        if (!duplicate) required_tensor(&m, "blk.0.absent.weight");
+        _exit(0);
+    }
+    close(err[1]);
+    char message[2048] = "";
+    size_t len = 0;
+    ssize_t n;
+    while ((n = read(err[0], message + len, sizeof(message) - 1 - len)) > 0) len += (size_t)n;
+    assert(n == 0);
+    message[len] = 0;
+    close(err[0]);
+    int status;
+    assert(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) != 0);
+    assert(strstr(message, duplicate ? "duplicate tensor name" : "required tensor is missing"));
+    assert(strstr(message, duplicate ? "test.weight" : "blk.0.absent.weight"));
+    assert(strstr(message, path));
+    assert(!unlink(path));
+}
+
 int main(void) {
     char path[] = "/tmp/ds4-qwen-ngrams-XXXXXX";
     int fd = mkstemp(path);
@@ -126,5 +174,8 @@ int main(void) {
     }
     free(rows); free(out); unlink(path);
     puts("Qwen BF16 n-grams: disk-only mapping, exact reads, batches and errors OK");
+    run_refusal(true);
+    run_refusal(false);
+    puts("GGUF tensor directory refusals: duplicate name and missing tensor name the file: OK");
     return 0;
 }

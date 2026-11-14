@@ -5,6 +5,7 @@
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include "../ds4_image.h"
+#include "../ds4_prompt_prefix.h"
 #include <math.h>
 
 /* sf-ablate(specdec): DSpark tests removed with the external support-model path (registry: Qwen3.8 uses built-in MTP only). */
@@ -140,6 +141,34 @@ static void test_close_engine(bool quality) {
     ds4_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
     ds4_engine_close(*slot);
     *slot = NULL;
+}
+
+/* Qwen3.8: an imported prefix closes each turn exactly once.  The chat
+ * renderer already ends a Qwen turn with <|im_end|>, which is also the EOS. */
+static void test_prompt_prefix_qwen_turn_close(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+    if (!ds4_engine_is_qwen4(engine)) {
+        puts("prompt-prefix-qwen: Qwen3.8 model required, skipped");
+        return;
+    }
+    char user[] = "What is 2+3?";
+    char assistant[] = "2 + 3 equals 5.";
+    ds4_prompt_prefix_turn turns[] = {
+        {DS4_PROMPT_PREFIX_USER, user},
+        {DS4_PROMPT_PREFIX_ASSISTANT, assistant},
+    };
+    ds4_prompt_prefix prefix = {turns, 2};
+    ds4_tokens tokens = {0};
+    ds4_prompt_prefix_append(engine, &tokens, &prefix);
+    const int eos = ds4_token_eos(engine);
+    int closes = 0;
+    for (int i = 0; i < tokens.len; i++) {
+        if (tokens.v[i] == eos) closes++;
+    }
+    TEST_ASSERT(closes == 2);
+    TEST_ASSERT(tokens.len > 0 && tokens.v[tokens.len - 1] != eos);
+    ds4_tokens_free(&tokens);
 }
 
 /* Qwen3.8 rewind: one token back restores the verify snapshot, anything else
@@ -7069,6 +7098,12 @@ static const char *test_mtp_copy_prompt(void) {
 
 #endif
 
+bool ds4_test_gguf_type_sizes(void);
+
+static void test_gguf_type_sizes(void) {
+    TEST_ASSERT(ds4_test_gguf_type_sizes());
+}
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -7088,6 +7123,7 @@ static const ds4_test_entry test_entries[] = {
     {"--qwen4-restore-reuse", "qwen4-restore-reuse", "Qwen restore discards old verifier state and rejects truncated payloads", test_qwen_restore_reused_session},
     {"--session-snapshot", "session-snapshot", "session snapshot and recurrent-state round trip", test_session_snapshot_roundtrip},
     {"--session-rewind", "session-rewind", "Qwen3.8 rewind by snapshot restore and by replay", test_session_rewind_replay},
+    {"--prompt-prefix-qwen", "prompt-prefix-qwen", "Qwen3.8 prefix import closes each turn once", test_prompt_prefix_qwen_turn_close},
     {"--session-rewind-resample", "session-rewind-resample", "exact-sampling tool-boundary resample rewind restores the block-start state", test_session_rewind_resample_boundary},
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model tool call and post-result stop regression", test_tool_call_quality},
@@ -7100,6 +7136,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
 #endif
+    {"--gguf-types", "gguf-types", "GGUF quant block sizes match ggml's block structs", test_gguf_type_sizes},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 

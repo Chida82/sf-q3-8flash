@@ -1534,6 +1534,13 @@ static void test_attention_rows(arena_t *a) {
         rows[r].pos3 = pos3[r]; rows[r].pos = pos_of[r]; rows[r].use_sel = pos_of[r] >= sparse_pos;
     }
     require_ok(table && ds4_gpu_qwen4_attn_rows_stage(table, 0, rows, R, ratio), "rows: stage");
+    /* the block-key kernels rope into float tmp[64]: a wider or odd n_rot is refused */
+    for (uint32_t bad = 63; bad <= 66; bad += 3) {
+        require_ok(!ds4_gpu_qwen4_idx_block_key_tensor(bk[0][0], ikc[0][0], pos3[0], a->base, a->size, gik_off, 0, 1,
+                                                       ratio, Di, bad, (float)base, (float)eps), "block key refuses n_rot");
+        require_ok(!ds4_gpu_qwen4_idx_block_key_rows_tensor(table, 0, rows, R, a->base, a->size, gik_off, ratio, Di, bad,
+                                                            (float)base, (float)eps), "block key rows refuses n_rot");
+    }
     require_ok(ds4_gpu_qwen4_attn_prep_rows_tensor(q[1], gate[1], iqn[1], gqg, gkp, gvp, giq, gik, table, 0, rows, R,
                                                    a->base, a->size, gq_off, gk_off, giq_off, H, Hkv, D, n_rot, Hi, Di,
                                                    (float)base, (float)eps), "rows: prep rows");
