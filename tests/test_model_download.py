@@ -52,6 +52,9 @@ import sys
 args = sys.argv[1:]
 assert args[:2] == ['download', ('ggml-org/Qwen3.8-Flash-Next-GGUF' if args[2].startswith('mmproj') else 'antirez/qwen3.8-flash-next-gguf')]
 assert '--local-dir' not in args, 'download.sh must not copy the GGUF into the repository'
+assert '--token' not in args, 'the token must not appear in argv'
+if os.environ.get('FAKE_HF_EXPECT_TOKEN'):
+    assert os.environ.get('HF_TOKEN') == os.environ['FAKE_HF_EXPECT_TOKEN'], 'token not passed in HF_TOKEN'
 cache = Path(os.environ['FAKE_HF_CACHE'])
 cache.mkdir(parents=True, exist_ok=True)
 path = cache / args[2]
@@ -85,6 +88,12 @@ else:
         self.env["FAKE_HF_AGENT"] = "1"
         self.run_download("q4")
         self.assertEqual((self.out / Q4).resolve(), (self.cache / Q4).resolve())
+
+    def test_token_goes_through_the_environment(self):
+        self.env["FAKE_HF_EXPECT_TOKEN"] = "secret-token"
+        result = subprocess.run(["sh", str(self.script), "vision", "--token", "secret-token"],
+                                env=self.env, text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_repository_only_gains_symlinks(self):
         self.run_download("q4")

@@ -42,7 +42,6 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-[ -n "$TOKEN" ] || [ ! -s "$HOME/.cache/huggingface/token" ] || TOKEN=$(cat "$HOME/.cache/huggingface/token")
 
 find_hf() {
     command -v hf 2>/dev/null && return
@@ -85,8 +84,10 @@ else
     # The CLI owns the shared Hub cache: it deduplicates, resumes and verifies
     # there. Without --local-dir it prints the cached path instead of copying
     # the file, so this repository only ever gains symlinks (SPEC.md §C).
+    # The token goes through the environment, never argv (visible in ps); with
+    # none, hf reads its own login (~/.cache/huggingface/token).
     if [ -n "$TOKEN" ]; then
-        CACHED=$("$HF" download "$REPO" "$FILE" --repo-type model --token "$TOKEN")
+        CACHED=$(HF_TOKEN=$TOKEN "$HF" download "$REPO" "$FILE" --repo-type model)
     else
         CACHED=$("$HF" download "$REPO" "$FILE" --repo-type model)
     fi
