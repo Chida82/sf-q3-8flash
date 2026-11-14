@@ -6181,22 +6181,17 @@ typedef struct {
     size_t emit_pos;
     bool active;
     bool checked_think_prefix;
-    bool guard_second_reasoning;
     bool sent_reasoning;
     bool sent_content;
     openai_tool_stream tool;
 } openai_stream;
 
-static bool stream_needs_second_reasoning_guard(const request *r) {
-    return ds4_think_mode_enabled(r->think_mode) && r->has_tools &&
-           r->model_syntax != SERVER_MODEL_SYNTAX_QWEN;
-}
+/* sf-ablate(server): second-reasoning-pass guard and its OpenAI/Anthropic text-mode blocks; upstream excludes Qwen, the only syntax here */
 
 static void openai_stream_start(const request *r, openai_stream *st) {
     memset(st, 0, sizeof(*st));
     st->active = true;
     st->mode = ds4_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
-    st->guard_second_reasoning = stream_needs_second_reasoning_guard(r);
 }
 
 static void openai_tool_stream_free(openai_tool_stream *ts) {
@@ -6955,26 +6950,6 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
     }
 
     if (st->mode == OPENAI_STREAM_TEXT) {
-        if (st->guard_second_reasoning) {
-            const char *close = strstr(raw + st->emit_pos, "</think>");
-            const char *tool = r->has_tools ?
-                find_any_tool_start(raw + st->emit_pos) : NULL;
-            if (close && (!tool || close < tool)) {
-                const size_t limit = (size_t)(close - raw);
-                if (limit > st->emit_pos &&
-                    !sse_chat_delta_n(fd, r, id, "reasoning_content",
-                                      raw + st->emit_pos,
-                                      limit - st->emit_pos)) return false;
-                if (limit > st->emit_pos) st->sent_reasoning = true;
-                st->emit_pos = limit + strlen("</think>");
-                st->guard_second_reasoning = false;
-            } else if (!tool && !final) {
-                return true;
-            } else {
-                st->guard_second_reasoning = false;
-            }
-        }
-
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
@@ -8057,7 +8032,6 @@ typedef struct {
     size_t emit_pos;
     bool active;
     bool checked_think_prefix;
-    bool guard_second_reasoning;
     bool sent_thinking;
     bool sent_text;
     anthropic_tool_stream tool;
@@ -8083,7 +8057,6 @@ static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
     memset(st, 0, sizeof(*st));
     st->active = ok;
     st->mode = ds4_think_mode_enabled(r->think_mode) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
-    st->guard_second_reasoning = stream_needs_second_reasoning_guard(r);
     return ok;
 }
 
@@ -8589,29 +8562,6 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
     }
 
     if (st->mode == ANTH_STREAM_TEXT) {
-        if (st->guard_second_reasoning) {
-            const char *close = strstr(raw + st->emit_pos, "</think>");
-            const char *tool = r->has_tools ?
-                find_any_tool_start(raw + st->emit_pos) : NULL;
-            if (close && (!tool || close < tool)) {
-                const size_t limit = (size_t)(close - raw);
-                if (limit > st->emit_pos) {
-                    if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_THINKING)) return false;
-                    if (!anthropic_sse_delta_live(fd, st, ANTH_BLOCK_THINKING,
-                                                  raw + st->emit_pos,
-                                                  limit - st->emit_pos)) return false;
-                    st->sent_thinking = true;
-                }
-                if (!anthropic_sse_close_block_live(fd, id, st)) return false;
-                st->emit_pos = limit + strlen("</think>");
-                st->guard_second_reasoning = false;
-            } else if (!tool && !final) {
-                return true;
-            } else {
-                st->guard_second_reasoning = false;
-            }
-        }
-
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);

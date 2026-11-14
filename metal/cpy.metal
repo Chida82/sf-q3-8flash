@@ -275,18 +275,6 @@ kernel void kernel_dsv4_flash_kv_stage_f16(
     dsv4_flash_kv_stage_body<false>(args, raw_src, comp_src, dst, mask_src, pad_dst, gid, (device const int *)mask_src);
 }
 
-kernel void kernel_dsv41_flash_kv_stage(
-        constant ds4_metal_args_flash_kv_stage_f16 & args,
-        device const char * raw_src,
-        device const char * comp_src,
-        device       char * dst,
-        device const char * mask_src,
-        device       char * pad_dst,
-        device const int  * ids,
-        uint gid [[thread_position_in_grid]]) {
-    dsv4_flash_kv_stage_body<true>(args, raw_src, comp_src, dst, mask_src, pad_dst, gid, ids);
-}
-
 // Tiled-row expansion of a small table: dst row t = src row (pos0 + t) % ratio.
 // Replaces the per-segment copies the compressor store used to encode (one
 // dispatch per prefill layer instead of n_tokens/ratio single-threadgroup
