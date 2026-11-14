@@ -32964,6 +32964,11 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     return qwen4_graph_moe_impl(g, m, l, il, T, false);
 }
 
+static bool qwen4_graph_moe_last(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                uint32_t il, uint32_t T) {
+    return T >= 1u && T <= 3u && qwen4_graph_moe_impl(g, m, l, il, T, true);
+}
+
 /* Prompt rows prime the predictor, whose input for row t is the embedding
  * of the token at row t + 1 (see qwen4_graph_mtp_prime); image rows have
  * no token. */
@@ -33460,14 +33465,16 @@ static bool qwen4_graph_state_swap2(ds4_qwen4_gpu_graph *g) {
     return true;
 }
 
-/* The nextn layer over T rows of g->R, whose cache entries go at idx. */
+/* The nextn layer over T rows of g->R, whose cache entries go at idx. The
+ * cache entries come from attention; after the MoE only the last row is read
+ * (head and chained draft), so the MoE runs on that row alone. */
 static bool qwen4_graph_nextn_layer(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                     uint32_t il, uint32_t idx, uint32_t T) {
     return qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T) &&
            qwen4_graph_attention(g, m, l, il, idx, T) &&
            ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0 &&
            qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T) &&
-           qwen4_graph_moe(g, m, l, il, T);
+           qwen4_graph_moe_last(g, m, l, il, T);
 }
 
 /* The steering bank contains trunk layers only. The predictor remains

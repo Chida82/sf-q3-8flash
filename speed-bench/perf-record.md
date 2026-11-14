@@ -53,7 +53,8 @@ written by `30-mtp-cycle`.
 | fix/82-mtp-greedy-divergence | 2026-09-28 | this row's commit | Qwen3.8-Flash-Next-Q4.gguf | 16 | PASS | 45.6 (+2.5%) | 1168.2 (+2.3%) | 804.5 (+9.4%) | 934.3 (+3.8%) | 64.5 (+13.4%) | 2.46 (+34.6%) | 1264.1 (+4.3%) |  |  |  |
 | fix/82-mtp-greedy-divergence | 2026-09-28 | this row's commit | Qwen3.8-Flash-Next-Q2.gguf | 16 | PASS | 47.9 (+8.9%) | 1238.3 (+2.6%) | 894.8 (+20.0%) | 1005.7 (+5.7%) | 65.2 (+10.0%) | 1.91 (+4.5%) | 1241.1 (+9.1%) |  |  |  |
 | sync/b3f5018 | 2026-11-14 | f65a331 | Qwen3.8-Flash-Next-Q4.gguf | 14 | PASS | 57.6 (+6.1%) | 1489.3 (+1.5%) | 1029.7 (+2.3%) | 1348.4 (+2.7%) | 87.6 (+22.3%) | 2.46 (+34.6%) | 1428.2 (+1.5%) |  |  |  |
+| perf/95-mtp-last-row | 2026-11-14 | this row's commit | Qwen3.8-Flash-Next-Q4.gguf | 20 | PASS | 57.7 (+6.1%) | 1482.1 (+2.2%) | 1017.6 (+1.9%) | 1344.3 (+2.4%) | 90.1 (+26.0%) | 2.46 (+34.6%) | 1416.5 (+1.6%) |  |  |  |
 
-The `fix/82-mtp-greedy-divergence` and `sync/b3f5018` rows leave MTP prose empty. The start
+The `fix/82-mtp-greedy-divergence`, `sync/b3f5018` and `perf/95-mtp-last-row` rows leave MTP prose empty. The start
 commit's MTP output on the prose prompt is not its plain greedy output (the
 defect `82` fixed), so the token gate cannot pair the two builds on that kind.

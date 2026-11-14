@@ -2000,11 +2000,15 @@ static void test_mxfp4_down_exact(arena_t *a) {
             float *reference = NULL;
             char label[128];
             snprintf(label, sizeof(label), "MXFP4 down E=%u F=%u T=%u shared=%u", E, F, T, st);
-            for (uint32_t mode = 0; mode < 5u; mode++) {
-                /* Compare NR2 reuse and specialized NR1/2/4 fallbacks with
-                 * the original plain, unspecialized down kernel. */
+            for (uint32_t mode = 0; mode < 6u; mode++) {
+                /* Compare NR2 reuse, specialized NR1/2/4 fallbacks and the
+                 * device's default dispatch (mode 5: on M5, paired rows for
+                 * T > 1, NR1 for T = 1) with the original plain, unspecialized
+                 * down kernel. */
                 const char *nr[] = {"2", "2", "2", "1", "4"};
-                require_ok(setenv(env[0], mode >= 2u ? "1" : "0", 1) == 0 &&
+                if (mode == 5u) {
+                    for (uint32_t i = 0; i < 4u; i++) require_ok(unsetenv(env[i]) == 0, "MXFP4 down default dispatch");
+                } else require_ok(setenv(env[0], mode >= 2u ? "1" : "0", 1) == 0 &&
                     setenv(env[1], nr[mode], 1) == 0 && setenv(env[2], "4", 1) == 0 &&
                     setenv(env[3], mode ? "1" : "0", 1) == 0, "select MXFP4 down oracle or prefetch");
                 require_ok(ds4_gpu_tensor_fill_f32(storage, sentinel, total) &&
@@ -2035,7 +2039,7 @@ static void test_mxfp4_down_exact(arena_t *a) {
             "restore MXFP4 down environment");
         free(saved[i]);
     }
-    printf("MXFP4 down: exact NR1/2/4, odd rows, block tails and shared slots; guards intact\n");
+    printf("MXFP4 down: exact NR1/2/4 and default dispatch at T=1..3, odd rows, block tails and shared slots; guards intact\n");
 }
 
 static void check_exact_f32(const char *what, const float *got, const float *ref, uint64_t n) {

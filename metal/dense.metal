@@ -887,7 +887,7 @@ kernel void kernel_mul_mv_q8_0_f32_bf16in(
 // K walk, per-block products, accumulation order and reduction tree, so its
 // output is kernel_mul_mv_q8_0_f32's for that row.
 template<short NR0, short NR1>
-void kernel_mul_mv_q8_0_f32_rows_impl(
+void kernel_mul_mv_q8_0_f32_vrows_impl(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0,
         device const char * src1,
@@ -958,7 +958,7 @@ void kernel_mul_mv_q8_0_f32_rows_impl(
 typedef decltype(kernel_mul_mv_q8_0_f32) kernel_mul_mv_q8_0_f32_t;
 
 template<short NR1>
-kernel void kernel_mul_mv_q8_0_f32_rows(
+kernel void kernel_mul_mv_q8_0_f32_vrows(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0,
         device const char * src1,
@@ -967,11 +967,11 @@ kernel void kernel_mul_mv_q8_0_f32_rows(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_q8_0_f32_rows_impl<N_R0_Q8_0, NR1>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q8_0_f32_vrows_impl<N_R0_Q8_0, NR1>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
-template [[host_name("kernel_mul_mv_q8_0_f32_r2")]] kernel kernel_mul_mv_q8_0_f32_t kernel_mul_mv_q8_0_f32_rows<2>;
-template [[host_name("kernel_mul_mv_q8_0_f32_r3")]] kernel kernel_mul_mv_q8_0_f32_t kernel_mul_mv_q8_0_f32_rows<3>;
+template [[host_name("kernel_mul_mv_q8_0_f32_r2")]] kernel kernel_mul_mv_q8_0_f32_t kernel_mul_mv_q8_0_f32_vrows<2>;
+template [[host_name("kernel_mul_mv_q8_0_f32_r3")]] kernel kernel_mul_mv_q8_0_f32_t kernel_mul_mv_q8_0_f32_vrows<3>;
 
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
 // K walk and reduction tree as kernel_mul_mv_q8_0_f32_impl, plus the checked
@@ -2286,7 +2286,7 @@ typedef decltype(kernel_mul_mv_t_t_4_rows<half, half4, half, half4>) mul_mv_t_t_
 // MTP verify rows: NR1 activation rows over one weight walk, each row with the
 // K walk, accumulation order and reduction tree of kernel_mul_mv_t_t_4_impl.
 template<typename T0, typename T04, typename T1, typename T14, short NR0, short NR1>
-void kernel_mul_mv_t_t_4_rows_impl(
+void kernel_mul_mv_t_t_4_vrows_impl(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0,
         device const char * src1,
@@ -2370,7 +2370,7 @@ void kernel_mul_mv_t_t_4_rows_impl(
 }
 
 template<typename T0, typename T04, typename T1, typename T14, short NR1>
-kernel void kernel_mul_mv_t_t_4_rows(
+kernel void kernel_mul_mv_t_t_4_vrows(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0,
         device const char * src1,
@@ -2380,16 +2380,16 @@ kernel void kernel_mul_mv_t_t_4_rows(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     switch (args.nr0) {
-        case 1: kernel_mul_mv_t_t_4_rows_impl<T0, T04, T1, T14, 1, NR1>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 2: kernel_mul_mv_t_t_4_rows_impl<T0, T04, T1, T14, 2, NR1>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 4: kernel_mul_mv_t_t_4_rows_impl<T0, T04, T1, T14, 4, NR1>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 1: kernel_mul_mv_t_t_4_vrows_impl<T0, T04, T1, T14, 1, NR1>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 2: kernel_mul_mv_t_t_4_vrows_impl<T0, T04, T1, T14, 2, NR1>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 4: kernel_mul_mv_t_t_4_vrows_impl<T0, T04, T1, T14, 4, NR1>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
     };
 }
 
-template [[host_name("kernel_mul_mv_f32_f32_4_r2")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4_rows<float, float4, float, float4, 2>;
-template [[host_name("kernel_mul_mv_f32_f32_4_r3")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4_rows<float, float4, float, float4, 3>;
-template [[host_name("kernel_mul_mv_f16_f32_4_r2")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4_rows<half,  half4,  float, float4, 2>;
-template [[host_name("kernel_mul_mv_f16_f32_4_r3")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4_rows<half,  half4,  float, float4, 3>;
+template [[host_name("kernel_mul_mv_f32_f32_4_r2")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4_vrows<float, float4, float, float4, 2>;
+template [[host_name("kernel_mul_mv_f32_f32_4_r3")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4_vrows<float, float4, float, float4, 3>;
+template [[host_name("kernel_mul_mv_f16_f32_4_r2")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4_vrows<half,  half4,  float, float4, 2>;
+template [[host_name("kernel_mul_mv_f16_f32_4_r3")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4_vrows<half,  half4,  float, float4, 3>;
 
 // DS4 compressor projections always compute two same-shaped F16 matvecs from
 // the same normalized activation: one for projected KV and one for pooling

@@ -5433,7 +5433,9 @@ void ds4_gpu_qwen4_set_verify_rows_exact(bool on) {
 
 /* MTP verify rows take the single-token matvec.  The vectorized F16/F32
  * kernels have 2- and 3-row variants that walk the weights once for all rows
- * with each row's single-token arithmetic; NULL keeps one row per grid y. */
+ * with each row's single-token arithmetic; NULL keeps one row per grid y.
+ * sf-keep(82): upstream's kernel_mul_mv_f16_f32_4_rows is byte-exact here too,
+ * but MTP decode lost 0.4-0.5% on it (95, 4.2); revisit if upstream retunes it. */
 static const char *ds4_gpu_mv_rows_name(const char *fn, uint64_t n_tok) {
     if ((n_tok != 2u && n_tok != 3u) || !g_qwen4_verify_rows_exact) return NULL;
     const bool three = n_tok == 3u;
@@ -39211,10 +39213,12 @@ static bool qwen4_moe_mv_specialize(uint32_t type) {
         (type == 39u && ds4_gpu_device_is_m5_or_m6_apple_silicon());
 }
 
-static uint32_t qwen4_moe_mv_rows(uint32_t type) {
+static uint32_t qwen4_moe_mv_rows(uint32_t type, uint32_t n_tokens) {
+    /* sf-keep(70): M5 MTP verify rows (T > 1) walk MXFP4 down rows in pairs, as the child did before the sync (moe_down +21% GPU time on NR1); T = 1 keeps upstream's NR1. Revisit if upstream retunes M5 verify rows. */
+    const uint32_t default_nr = type == 39u && n_tokens > 1u && ds4_gpu_device_is_m5_apple_silicon() ? 2u : 1u;
     char name[40];
     snprintf(name, sizeof(name), "DS4_QWEN4_MOE_MV_NR_%u", type);
-    return (uint32_t)ds4_gpu_env_u64(name, ds4_gpu_env_u64("DS4_QWEN4_MOE_MV_NR", 1u, 1u, 4u), 1u, 4u);
+    return (uint32_t)ds4_gpu_env_u64(name, ds4_gpu_env_u64("DS4_QWEN4_MOE_MV_NR", default_nr, 1u, 4u), 1u, 4u);
 }
 
 static uint32_t qwen4_moe_mv_groups(uint32_t type) {
@@ -39246,11 +39250,12 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
             kernel == QWEN4_K_MOE_MID_IQ2XXS || kernel == QWEN4_K_MOE_DOWN_REDUCE || q4_mid || iq2_mid || q2_down) {
             const qwen4_moe_args *a = args;
             const bool specialize = !q4_mid && !iq2_mid && !q2_down && qwen4_moe_mv_specialize(a->weight_type);
-            const uint32_t values[] = {a->weight_type, a->shared_type, specialize ? a->in_dim : 0u, specialize ? qwen4_moe_mv_rows(a->weight_type) : 0u};
-            /* Legacy batched MXFP4 shares loads across two rows.
+            const uint32_t values[] = {a->weight_type, a->shared_type, specialize ? a->in_dim : 0u, specialize ? qwen4_moe_mv_rows(a->weight_type, a->n_tokens) : 0u};
+            /* Legacy (and M5) batched MXFP4 shares loads across two rows.
              * Compile it out of single-token decode to retain its occupancy. */
             const bool pair_rows = kernel == QWEN4_K_MOE_DOWN_MXFP4_PF && a->n_tokens > 1u &&
-                (!specialize || values[3] == 2u) && ds4_gpu_qwen4_legacy_moe_tuning();
+                (!specialize || values[3] == 2u) &&
+                (ds4_gpu_qwen4_legacy_moe_tuning() || ds4_gpu_device_is_m5_apple_silicon());
             NSString *key = [NSString stringWithFormat:@"%s_type=%u_shared=%u_dim=%u_rows=%u_addr=%u_pair=%u",
                              qwen4_kernel_names[kernel], values[0], values[1], values[2], values[3], addresses, pair_rows];
             pipeline = [g_pipeline_cache objectForKey:key];
@@ -40568,7 +40573,7 @@ int ds4_gpu_qwen4_moe_mid_tensor(
     const bool specialize = !q4k && qwen4_moe_mv_specialize(weight_type);
     const uint64_t nr_env = q4k ?
         ds4_gpu_env_u64("DS4_QWEN4_Q4K_MID_NR", default_nr, 1u, UINT64_MAX) :
-        (specialize ? qwen4_moe_mv_rows(weight_type) : 2u);
+        (specialize ? qwen4_moe_mv_rows(weight_type, n_tokens) : 2u);
     const uint32_t nr = nr_env >= 1u && nr_env <= (q4k ? 2u : 4u) ? (uint32_t)nr_env : default_nr;
     /* NR2 without an NSG override restores the former ordered dispatch. */
     const uint32_t default_nsg = nr != 1u ? 2u : m3_ultra ? 8u : m5_m6_single ? 4u : 2u;
@@ -40630,7 +40635,7 @@ int ds4_gpu_qwen4_moe_down_tensor(
         b[4] = b[0];
     }
     const uint32_t nsg = qwen4_moe_mv_specialize(weight_type) ? qwen4_moe_mv_groups(weight_type) : 4u;
-    const uint32_t rows_per_tg = nsg * (qwen4_moe_mv_specialize(weight_type) ? qwen4_moe_mv_rows(weight_type) : 2u);
+    const uint32_t rows_per_tg = nsg * (qwen4_moe_mv_specialize(weight_type) ? qwen4_moe_mv_rows(weight_type, n_tokens) : 2u);
     /* Reuse activations across two Q2_K down rows without changing their
      * accumulation order. Keep other widths, row tiles and devices unchanged. */
     const bool q2 = weight_type == 10u && ff_dim == 640u && rows_per_tg == nsg * 2u &&
