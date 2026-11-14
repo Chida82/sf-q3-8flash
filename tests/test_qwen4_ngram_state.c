@@ -158,7 +158,7 @@ int main(int argc, char **argv) {
     ds4_engine *engine = NULL;
     ds4_engine_options opt = {.model_path = argv[1],
         .backend = DS4_BACKEND_METAL,
-        .glm_mtp = true, .prefill_chunk = 32,
+        .glm_mtp = true, .prefill_chunk = streaming ? 8 : 32,
         .share_session_prefill_workspace = true, .placement_session_count_hint = 4};
     if (streaming) {
         /* Account for the actual context before opening the model and leave
@@ -181,8 +181,16 @@ int main(int argc, char **argv) {
         assert(ds4_session_sync(live, &prompt, error, sizeof(error)) == 0);
         int accepted[3];
         if (mode == 2) {
-            assert(ds4_session_eval_speculative_argmax(live, ds4_session_argmax(live),
-                3, -1, accepted, 3, error, sizeof(error)) == 1);
+            /* Prefix preparation may already seed a proposal. Otherwise run
+             * a cycle, checking its committed frontier rather than assuming
+             * the first call always consumes exactly one token. */
+            for (int attempt = 0; !live->glm_mtp_have && attempt < 3; attempt++) {
+                const int before = ds4_session_pos(live);
+                const int n = ds4_session_eval_speculative_argmax(live, ds4_session_argmax(live),
+                    3, -1, accepted, 3, error, sizeof(error));
+                assert(n >= 1 && n <= 3);
+                assert(ds4_session_pos(live) == before + n);
+            }
             assert(live->glm_mtp_have);
         }
         const ds4_tokens *current = ds4_session_tokens(live);
@@ -213,14 +221,44 @@ int main(int argc, char **argv) {
         assert(ds4_session_eval(live, token, error, sizeof(error)) == 0);
         assert(ds4_session_eval(control, token, error, sizeof(error)) == 0);
         assert(!memcmp(live->logits, control->logits, DS4_N_VOCAB * sizeof(float)));
+        if (streaming) {
+            ds4_decode_item items[2] = {
+                {live, ds4_session_argmax(live)},
+                {control, ds4_session_argmax(control)}
+            };
+#if DS4_HAS_QWEN4_METAL
+            /* SSD graphs retain their own scratch and must not enter the
+             * resident batch arena or its resident-only MoE dispatch. */
+            assert(!ds4_sessions_eval_batch_metal_supported(items, 2, engine));
+            assert(!qwen4_graph_native_session_batch_check(items, 2, engine, false));
+            assert(!qwen4_graph_native_session_batch_check(items, 2, engine, true));
+#endif
+            assert(ds4_sessions_eval_batch(items, 2, error, sizeof(error)) == 0);
+            assert(live->checkpoint.len == control->checkpoint.len);
+            assert(!memcmp(live->logits, control->logits, DS4_N_VOCAB * sizeof(float)));
+            if (mode == 2) {
+                int batch_tokens[2][2], batch_counts[2];
+                items[0].token = ds4_session_argmax(live);
+                items[1].token = ds4_session_argmax(control);
+                assert(ds4_sessions_eval_batch_speculative_argmax(items, 2,
+                    batch_tokens, batch_counts, error, sizeof(error)) == 0);
+                assert(batch_counts[0] >= 1 && batch_counts[0] <= 2);
+                assert(batch_counts[0] == batch_counts[1]);
+                assert(!memcmp(batch_tokens[0], batch_tokens[1], batch_counts[0] * sizeof(int)));
+                assert(live->checkpoint.len == control->checkpoint.len);
+                assert(!memcmp(live->logits, control->logits, DS4_N_VOCAB * sizeof(float)));
+            }
+        }
         ds4_tokens_free(&frontier);
         ds4_session_free(control);
         ds4_session_free(live);
         printf("Qwen n-gram failure/recovery mode %d: exact logits OK\n", mode);
     }
-    check_batch(engine, &prompt, false);
-    check_batch(engine, &prompt, true);
-    check_arena_resize(engine, &prompt);
+    if (!streaming) {
+        check_batch(engine, &prompt, false);
+        check_batch(engine, &prompt, true);
+        check_arena_resize(engine, &prompt);
+    }
     ds4_tokens_free(&prompt);
     ds4_engine_close(engine);
     return 0;

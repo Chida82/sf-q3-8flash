@@ -71,7 +71,7 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_case
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-ds4_metal.o: ds4_metal.m ds4_gpu.h ds4_gpu_tp.h $(METAL_SRCS)
+ds4_metal.o: ds4_metal.m ds4_metal_device.h ds4_gpu.h ds4_gpu_tp.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ $<
 
 ds4_cpu.o: ds4.c
@@ -214,7 +214,7 @@ test-qwen4-moe-mm-compact:
 tests/test_qwen4_ssd_experts.o: tests/test_qwen4_ssd_experts.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
-tests/ds4_metal_qwen_ssd.o: ds4_metal.m ds4_gpu.h ds4_gpu_tp.h $(METAL_SRCS) tests/qwen4_ssd_pread_probe.h
+tests/ds4_metal_qwen_ssd.o: ds4_metal.m ds4_metal_device.h ds4_gpu.h ds4_gpu_tp.h $(METAL_SRCS) tests/qwen4_ssd_pread_probe.h
 	$(CC) $(OBJCFLAGS) -include tests/qwen4_ssd_pread_probe.h -c -o $@ ds4_metal.m
 
 tests/test_qwen4_ssd_experts: tests/test_qwen4_ssd_experts.o $(filter-out ds4_metal.o,$(CORE_OBJS)) tests/ds4_metal_qwen_ssd.o
@@ -234,7 +234,7 @@ tests/test_qwen4_memory: tests/test_qwen4_memory.o $(filter-out ds4_cpu.o,$(CPU_
 test-qwen4-memory: tests/test_qwen4_memory
 	./tests/test_qwen4_memory
 
-tests/test_metal_ssd_reuse.o: tests/test_metal_ssd_reuse.m ds4_metal.m ds4_gpu.h ds4_gpu_tp.h
+tests/test_metal_ssd_reuse.o: tests/test_metal_ssd_reuse.m ds4_metal.m ds4_metal_device.h ds4_gpu.h ds4_gpu_tp.h
 	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
 
 tests/test_metal_ssd_reuse: tests/test_metal_ssd_reuse.o ds4_image.o
@@ -380,3 +380,102 @@ clean:
 	rm -f tests/test_metal_tp_bulk tests/test_metal_tp_cancel tests/test_tp_link tests/test_qwen4_prefill
 	rm -f tests/test_mxfp4_metal tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_metal_ssd_experts tests/test_metal_command_memory tests/test_ssd_cache tests/test_quality_api
 	rm -f speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/session_concurrency_bench
+
+# Standalone Metal kernel tests taken with the sync to b3f5018 (90): they pin
+# the routed-expert, HC and Q8 kernels this child now shares with upstream.
+tests/test_metal_q8_reduction: tests/test_metal_q8_reduction.m
+	$(CC) $(OBJCFLAGS) -o $@ $< $(METAL_LDLIBS)
+
+.PHONY: test-metal-q8-reduction check-metal-q8-reduction
+test-metal-q8-reduction: tests/test_metal_q8_reduction
+	./tests/test_metal_q8_reduction
+
+check-metal-q8-reduction: tests/test_metal_q8_reduction
+	./tests/test_metal_q8_reduction --compile-only
+
+tests/test_metal_q8_gemv_reference: tests/test_metal_q8_gemv_reference.m
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
+
+.PHONY: test-metal-q8-gemv-reference check-metal-q8-gemv-reference
+test-metal-q8-gemv-reference: tests/test_metal_q8_gemv_reference
+	./tests/test_metal_q8_gemv_reference
+
+check-metal-q8-gemv-reference: tests/test_metal_q8_gemv_reference
+	./tests/test_metal_q8_gemv_reference --compile-only
+
+tests/test_metal_qwen4_moe_half: tests/test_metal_qwen4_moe_half.m
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
+
+.PHONY: test-metal-qwen4-moe-half check-metal-qwen4-moe-half
+test-metal-qwen4-moe-half: tests/test_metal_qwen4_moe_half
+	./tests/test_metal_qwen4_moe_half
+	./tests/test_metal_qwen4_moe_half --q4-k32
+
+check-metal-qwen4-moe-half: tests/test_metal_qwen4_moe_half
+	./tests/test_metal_qwen4_moe_half --compile-only
+	./tests/test_metal_qwen4_moe_half --q4-k32 --compile-only
+
+tests/test_metal_qwen4_hc: tests/test_metal_qwen4_hc.m
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
+
+.PHONY: test-metal-qwen4-hc check-metal-qwen4-hc
+test-metal-qwen4-hc: tests/test_metal_qwen4_hc
+	./tests/test_metal_qwen4_hc
+
+check-metal-qwen4-hc: tests/test_metal_qwen4_hc
+	./tests/test_metal_qwen4_hc --compile-only
+
+tests/test_metal_qwen4_moe_mid: tests/test_metal_qwen4_moe_mid.m
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
+
+.PHONY: test-metal-qwen4-moe-mid check-metal-qwen4-moe-mid
+test-metal-qwen4-moe-mid: tests/test_metal_qwen4_moe_mid
+	./tests/test_metal_qwen4_moe_mid
+
+check-metal-qwen4-moe-mid: tests/test_metal_qwen4_moe_mid
+	./tests/test_metal_qwen4_moe_mid --compile-only
+
+tests/test_metal_qwen4_moe_down: tests/test_metal_qwen4_moe_down.m
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
+
+.PHONY: test-metal-qwen4-moe-down check-metal-qwen4-moe-down
+test-metal-qwen4-moe-down: tests/test_metal_qwen4_moe_down
+	./tests/test_metal_qwen4_moe_down
+
+check-metal-qwen4-moe-down: tests/test_metal_qwen4_moe_down
+	./tests/test_metal_qwen4_moe_down --compile-only
+
+tests/test_metal_qwen4_mxfp4_stage: tests/test_metal_qwen4_mxfp4_stage.m
+	$(CC) $(filter-out -ffast-math,$(OBJCFLAGS)) -o $@ $< $(METAL_LDLIBS)
+
+.PHONY: test-metal-qwen4-mxfp4-stage
+test-metal-qwen4-mxfp4-stage: tests/test_metal_qwen4_mxfp4_stage
+	./tests/test_metal_qwen4_mxfp4_stage
+
+tests/test_metal_device_policy: tests/test_metal_device_policy.c ds4_metal_device.h
+	$(CC) $(CFLAGS) -o $@ $<
+
+.PHONY: test-metal-device-policy
+test-metal-device-policy: tests/test_metal_device_policy
+	./tests/test_metal_device_policy
+
+.PHONY: test-qwen4-metal-units
+test-qwen4-metal-units: test-metal-q8-reduction test-metal-q8-gemv-reference test-metal-qwen4-moe-half \
+	test-metal-qwen4-hc test-metal-qwen4-moe-mid test-metal-qwen4-moe-down test-metal-qwen4-mxfp4-stage \
+	test-metal-device-policy
+
+# Qwen host-path tests taken with the sync to b3f5018 (90). They include ds4.c.
+QWEN4_INCLUDES_DS4 := tests/test_qwen4_generation tests/test_qwen4_ple_prefetch tests/test_qwen4_resident_arithmetic
+$(addsuffix .o,$(QWEN4_INCLUDES_DS4)): %.o: %.c ds4.c ds4.h ds4_gpu.h ds4_qwen4_vision.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+$(QWEN4_INCLUDES_DS4): %: %.o $(filter-out ds4.o,$(CORE_OBJS))
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+
+# Model-backed: make test-qwen4-host-paths QWEN4_GGUF=/absolute/path/model.gguf
+.PHONY: test-qwen4-host-paths
+test-qwen4-host-paths: $(QWEN4_INCLUDES_DS4)
+	./tests/test_qwen4_ple_prefetch --invalid-tokens
+	./tests/test_qwen4_ple_prefetch $(QWEN4_GGUF)
+	./tests/test_qwen4_generation $(QWEN4_GGUF)
+	env -u DS4_METAL_UNRETAINED MTL_DEBUG_LAYER=1 DS4_METAL_MATH_SAFE=0 ./tests/test_qwen4_resident_arithmetic

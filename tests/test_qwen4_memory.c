@@ -13,6 +13,30 @@ static ds4_context_memory estimate(int ctx, uint32_t chunk) {
     return m;
 }
 
+static void chunk_resolution(void) {
+    const char *env = getenv("DS4_QWEN4_PREFILL_CHUNK");
+    char *saved = env ? strdup(env) : NULL;
+    assert(!env || saved);
+    assert(unsetenv("DS4_QWEN4_PREFILL_CHUNK") == 0);
+    assert(qwen4_prefill_chunk_resolve(16384, 0) == 8192);
+    assert(qwen4_prefill_chunk_resolve(512, 0) == 512);
+    assert(setenv("DS4_QWEN4_PREFILL_CHUNK", "32", 1) == 0);
+    assert(qwen4_prefill_chunk_resolve(512, 0) == 32);
+    const uint32_t requests[] = {1, 128, 511, 512, 513, UINT32_MAX};
+    const uint32_t expected[] = {1, 128, 511, 512, 512, 512};
+    for (size_t i = 0; i < sizeof(requests) / sizeof(requests[0]); i++) {
+        assert(qwen4_prefill_chunk_resolve(512, requests[i]) == expected[i]);
+        assert(estimate(512, requests[i]).prefill_cap == expected[i]);
+    }
+    assert(estimate(512, 0).prefill_cap == 32);
+    assert(setenv("DS4_QWEN4_PREFILL_CHUNK", "65537", 1) == 0);
+    assert(qwen4_prefill_chunk_resolve(16384, 0) == 8192);
+    assert(qwen4_prefill_chunk_resolve(16384, 16384) == 16384);
+    assert((saved ? setenv("DS4_QWEN4_PREFILL_CHUNK", saved, 1) :
+                    unsetenv("DS4_QWEN4_PREFILL_CHUNK")) == 0);
+    free(saved);
+}
+
 static void monotonic(void) {
     const uint32_t chunks[] = {1, 2, 8, 128, 1024, 4096, 8192};
     uint64_t previous = 0;
@@ -121,12 +145,64 @@ static void streaming_staging(void) {
     g_ds4_shape = saved;
 }
 
+/* Match the CPU selector's causal visibility rule independently: only full
+ * blocks visible to this row count against the sparse-attention budget. */
+static void check_attention_query_chunk(uint32_t pos0, uint32_t tokens, uint32_t budget) {
+    uint32_t dense = 0;
+    bool sparse = false;
+    for (uint32_t row = 0; row < tokens; row++) {
+        const uint64_t visible = (uint64_t)pos0 + row + 1u;
+        if (visible / 4u > budget) sparse = true;
+        else {
+            assert(!sparse);
+            dense++;
+        }
+    }
+    assert(qwen4_attention_dense_rows(pos0, tokens, budget) == dense);
+    assert(qwen4_attention_needs_index_query(pos0, tokens, budget, false, false) == sparse);
+    /* MTP retains its current projections even for dense rows; predictor
+     * prefix-cache population requires keys only, including beyond cutoff. */
+    assert(qwen4_attention_needs_index_query(pos0, tokens, budget, true, false) == (tokens != 0));
+    assert(!qwen4_attention_needs_index_query(pos0, tokens, budget, false, true));
+    assert(!qwen4_attention_needs_index_query(pos0, tokens, budget, true, true));
+}
+
+static void attention_query_planning(void) {
+    const uint32_t budgets[] = {2u, 512u};  /* mini and shipped Qwen shapes */
+    const uint32_t chunks[] = {0u, 1u, 2u, 3u, 4u, 8u, 63u, 128u};
+    for (size_t b = 0; b < sizeof(budgets) / sizeof(budgets[0]); b++) {
+        const uint32_t budget = budgets[b];
+        /* Walk through both sides and all four block-completion residues.
+         * Each chunk is checked row by row, not against its final block
+         * universe: later completed blocks cannot affect an earlier query. */
+        for (uint32_t pos = 0; pos <= budget * 4u + 132u; pos++) {
+            for (size_t c = 0; c < sizeof(chunks) / sizeof(chunks[0]); c++)
+                check_attention_query_chunk(pos, chunks[c], budget);
+        }
+    }
+    /* The first sparse query is position 2051, after the 513th complete block.
+     * Crossing chunks prepare every IQ row with the original GEMM shape. */
+    assert(qwen4_attention_dense_rows(1920u, 128u, 512u) == 128u);
+    assert(qwen4_attention_dense_rows(2048u, 3u, 512u) == 3u);
+    assert(!qwen4_attention_needs_index_query(2048u, 3u, 512u, false, false));
+    assert(qwen4_attention_dense_rows(2048u, 128u, 512u) == 3u);
+    assert(qwen4_attention_needs_index_query(2048u, 128u, 512u, false, false));
+    assert(qwen4_attention_dense_rows(2051u, 1u, 512u) == 0u);
+    check_attention_query_chunk(4095u, 1u, 512u);
+    /* Use wide position arithmetic even at the unsigned limit. */
+    check_attention_query_chunk(UINT32_MAX - 1u, 1u, UINT32_MAX / 4u);
+    check_attention_query_chunk(UINT32_MAX, 1u, UINT32_MAX / 4u);
+    check_attention_query_chunk(UINT32_MAX, 1u, UINT32_MAX);
+}
+
 int main(void) {
     const ds4_shape saved = g_ds4_shape;
     g_ds4_shape = DS4_SHAPE_QWEN4_EXP;
+    chunk_resolution();
     monotonic();
     streaming_budget();
     streaming_staging();
+    attention_query_planning();
 
     /* Independent allocation lower bounds for the shipped 49-layer shape:
      * 36 GDN layers, 48 value heads, 128x128 state, three convolution rows;
@@ -167,6 +243,6 @@ int main(void) {
     g_ds4_shape = DS4_SHAPE_QWEN4_MINI;
     monotonic();
     g_ds4_shape = saved;
-    puts("Qwen memory: bounded workspace, recurrent/MTP staging and monotonic budgets OK");
+    puts("Qwen memory: bounded workspace, recurrent/MTP staging, budgets and attention query planning OK");
     return 0;
 }

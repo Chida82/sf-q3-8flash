@@ -26,6 +26,99 @@ def extract(text, marker):
     raise AssertionError(marker)
 
 
+MAPPED_BODIES = (
+    "static inline void qwen4_moe_mm_mid_impl(",
+    "kernel void kernel_qwen4_moe_mm_down(",  # shared float/half template
+    "kernel void kernel_qwen4_moe_mm_mid_nax_t(",
+    "kernel void kernel_qwen4_moe_mm_down_nax_t(",
+)
+MID_WRAPPERS = (
+    ("kernel void kernel_qwen4_moe_mm_mid(", "float", "false", "nullptr"),
+    ("kernel void kernel_qwen4_moe_mm_mid_f16(", "half", "true", "mid_shadow"),
+)
+
+
+def check_shader_mapping(metal):
+    # Ignore comments: a stale example must not satisfy a dispatch safety check.
+    metal = re.sub(r'/\*.*?\*/|//[^\n]*', '', metal, flags=re.S)
+    for marker in MAPPED_BODIES:
+        body = extract(metal, marker)
+        mapping = re.search(r'\be\s*=\s*qwen4_moe_mm_expert\(args, tgpig\.y\)', body)
+        guard = re.search(r'if\s*\(e\s*>=\s*args\.n_expert\)\s*return\s*;', body)
+        reads = list(re.finditer(r'\bcounts\s*\[([^]]+)\]', body))
+        assert body.count('qwen4_moe_mm_expert(') == 1, marker
+        assert mapping and guard and reads, marker
+        assert mapping.end() < guard.start() < guard.end() < reads[0].start(), marker
+        assert all(read[1].strip() == 'e' for read in reads), marker
+
+    # Both entry points must reach that same guarded implementation, with
+    # the original compact-dispatch args/grid and the proper shadow operand.
+    for marker, scalar, shadow_enabled, shadow in MID_WRAPPERS:
+        body = extract(metal, marker)
+        calls = re.findall(r'qwen4_moe_mm_mid_impl\s*<([^>]+)>\s*\(([^;]+)\);', body)
+        assert len(calls) == 1, marker
+        template, arguments = calls[0]
+        assert [part.strip() for part in template.split(',')] == ['NT', scalar, shadow_enabled, 'KS'], marker
+        expected = ['args', 'gate_base', 'up_base', 'lists', 'counts', 'x',
+                    'mid', shadow, 'Ag', 'Au', 'Bs', 'Cs', 'tgpig', 'tid', 'sgitg']
+        assert [part.strip() for part in arguments.split(',')] == expected, marker
+        assert not re.search(r'\bcounts\s*\[|qwen4_moe_mm_expert\(', body), marker
+
+    # Half down instantiates the shared guarded down template, not another
+    # kernel body. Keep all 8/16/32/64-token instances on that implementation.
+    down_half = metal.split('#define QWEN4_MOE_MM_DOWN_F16_INSTANCE(NT_)', 1)[1]
+    down_half = down_half.split('#undef QWEN4_MOE_MM_DOWN_F16_INSTANCE', 1)[0]
+    assert 'kernel_qwen4_moe_mm_down<NT_, half, 64>(' in down_half
+    assert 'kernel_qwen4_moe_mm_down<4, half, 32>(' in metal
+    assert re.findall(r'QWEN4_MOE_MM_DOWN_F16_INSTANCE\((\d+)\)', down_half) == ['1', '2', '4', '8']
+
+
+def check_scanner_negative_controls(metal):
+    """Ensure realistic dispatch regressions are rejected by the source check."""
+    rejected = 0
+
+    def reject(original, replacement, label):
+        nonlocal rejected
+        assert original in metal and replacement != original, label
+        mutant = metal.replace(original, replacement, 1)
+        try:
+            check_shader_mapping(mutant)
+        except AssertionError:
+            rejected += 1
+        else:
+            raise AssertionError(f"scanner accepted mutation: {label}")
+
+    for marker in MAPPED_BODIES:
+        body = extract(metal, marker)
+        mapping = 'qwen4_moe_mm_expert(args, tgpig.y)'
+        guard = 'if (e >= args.n_expert) return;'
+        count = 'const uint count = (uint)counts[e];'
+        reject(body, body.replace(mapping, 'tgpig.y', 1), f'{marker}: dense expert ID')
+        reject(body, body.replace(guard, '', 1), f'{marker}: missing bounds guard')
+        late_guard = body.replace(guard, '', 1).replace(count, count + '\n' + guard, 1)
+        reject(body, late_guard, f'{marker}: late bounds guard')
+        reject(body, body.replace('counts[e]', 'counts[tgpig.y]', 1), f'{marker}: compact counts index')
+    for marker, scalar, shadow_enabled, shadow in MID_WRAPPERS:
+        body = extract(metal, marker)
+        reject(body, body.replace('lists, counts, x', 'counts, lists, x', 1), f'{marker}: swapped buffers')
+        reject(body, body.replace('Cs, tgpig, tid', 'Cs, uint3(0), tid', 1), f'{marker}: lost grid index')
+        reject(body, body.replace(f'<NT, {scalar}, {shadow_enabled}, KS>', '<NT, float, true, KS>', 1),
+               f'{marker}: wrong template arguments')
+        reject(body, body.replace(f'<NT, {scalar}, {shadow_enabled}, KS>',
+                                  f'<NT, {scalar}, {shadow_enabled}, 64>', 1),
+               f'{marker}: lost staging width')
+        wrong_shadow = 'mid_shadow' if shadow == 'nullptr' else 'nullptr'
+        reject(body, body.replace(f'mid, {shadow}, Ag', f'mid, {wrong_shadow}, Ag', 1),
+               f'{marker}: wrong shadow buffer')
+    reject('kernel_qwen4_moe_mm_down<NT_, half, 64>(', 'kernel_qwen4_moe_mm_down<NT_, float, 64>(',
+           'half down: wrong template')
+    reject('kernel_qwen4_moe_mm_down<4, half, 32>(', 'kernel_qwen4_moe_mm_down<4, half, 64>(',
+           'half down: wrong K32 staging width')
+    for nt in (1, 2, 4, 8):
+        reject(f'QWEN4_MOE_MM_DOWN_F16_INSTANCE({nt})', '', f'half down: missing NT={nt}')
+    return rejected
+
+
 def extract_cpu_code(host, metal):
     host_args = re.search(r'typedef struct \{\n    uint32_t n_tokens, n_slots, n_out, in_dim, out_rows, weight_type, row_bytes, list_cap;.*?\} qwen4_moe_mm_args;', host, re.S).group(0)
     metal_args = extract(metal, 'struct ds4_metal_args_qwen4_moe_mm') + ';'
@@ -49,10 +142,12 @@ def extract_cpu_code(host, metal):
     HOST_ARGS
     METAL_ARGS
     struct stream_table_stub { uint32_t n_total_expert; };
+    struct half_pass_stub { const void *mid; };
     struct qwen4_stream_weights {
         const stream_table_stub *table;
         const uint32_t *frequency;
         const int32_t *mm_pass_counts;
+        half_pass_stub *half_pass;
     };
     static qwen4_stream_weights *g_qwen4_stream_weights;
     HOST_HELPER
@@ -76,17 +171,7 @@ def extract_cpu_code(host, metal):
                        ('MID_EMPTY', mid_empty), ('DOWN_EMPTY', down_empty)]:
         code = code.replace(key, value)
 
-    # Each template family must resolve the original expert ID before reading
-    # counts. This catches a missed NAX/tail family even without a GPU runtime.
-    for marker in (
-        "kernel void kernel_qwen4_moe_mm_mid(",
-        "kernel void kernel_qwen4_moe_mm_down(",
-        "kernel void kernel_qwen4_moe_mm_mid_nax_t(",
-        "kernel void kernel_qwen4_moe_mm_down_nax_t(",
-    ):
-        body = extract(metal, marker)
-        assert body.count("qwen4_moe_mm_expert(args, tgpig.y)") == 1, marker
-        assert body.index("qwen4_moe_mm_expert(args, tgpig.y)") < body.index("counts[e]"), marker
+    check_shader_mapping(metal)
     for wrapper in (mid_wrapper, down_wrapper):
         assert "dispatch_experts == UINT32_MAX" in wrapper
         assert wrapper.index("if (!dispatch_experts)") < wrapper.index("qwen4_dispatch(")
@@ -118,13 +203,13 @@ SAME_FIELD(tail_base) SAME_FIELD(expert_major) SAME_FIELD(n_active_expert) SAME_
 static_assert(offsetof(qwen4_moe_mm_args, n_active_expert) == 56);
 static_assert(offsetof(qwen4_moe_mm_args, active_expert) == 60);
 
-static uint64_t mapping_cases, scheduled_cases, schedule_events, lifetime_cases, empty_state_cases;
+static uint64_t mapping_cases, scheduled_cases, schedule_events, lifetime_cases, empty_state_cases, half_state_cases;
 static stream_table_stub table{512};
 
 struct mapped_args { ds4_metal_args_qwen4_moe_mm args; uint32_t dispatch_count; };
 static mapped_args encode(const uint32_t *frequency, const int32_t *pass, uint32_t n = 512) {
     table.n_total_expert = n;
-    qwen4_stream_weights scope{&table, frequency, pass};
+    qwen4_stream_weights scope{&table, frequency, pass, nullptr};
     g_qwen4_stream_weights = &scope;
     qwen4_moe_mm_args host{};
     host.n_expert = n;
@@ -237,7 +322,7 @@ int main() {
     assert(qwen4_moe_mm_copy_active(nullptr, full, nullptr, 512) == UINT32_MAX);
     assert(qwen4_moe_mm_copy_active(scratch, nullptr, nullptr, 512) == UINT32_MAX);
     table.n_total_expert = 512;
-    qwen4_stream_weights no_frequency{&table, nullptr, nullptr};
+    qwen4_stream_weights no_frequency{&table, nullptr, nullptr, nullptr};
     g_qwen4_stream_weights = &no_frequency;
     assert(qwen4_moe_mm_dispatch_experts(&direct) == 512 && direct.n_active_expert == 0);
     no_frequency.frequency = full; table.n_total_expert = 511;
@@ -245,18 +330,30 @@ int main() {
     g_qwen4_stream_weights = nullptr;
 
     // Execute the actual extracted empty-return blocks from both public
-    // wrappers. An empty pass must invalidate a prior NAX half association;
-    // a nonempty pass must continue to the ordinary scratch code unchanged.
+    // wrappers. An empty pass must invalidate prior NAX and streamed half
+    // associations; a nonempty pass preserves both. Cover absent streaming
+    // and absent half storage as well as the active half producer record.
     int marker;
     for (auto guard : {empty_mid_guard, empty_down_guard}) {
-        g_qwen4_nax_half_mid_for = &marker; g_qwen4_nax_half_mid_count = 123;
-        assert(guard(0) == 1);
-        assert(g_qwen4_nax_half_mid_for == nullptr && g_qwen4_nax_half_mid_count == 0);
-        empty_state_cases++;
-        g_qwen4_nax_half_mid_for = &marker; g_qwen4_nax_half_mid_count = 123;
-        assert(guard(1) == 0);
-        assert(g_qwen4_nax_half_mid_for == &marker && g_qwen4_nax_half_mid_count == 123);
-        empty_state_cases++;
+        for (uint32_t mode = 0; mode < 3; ++mode) {
+            half_pass_stub half{&marker};
+            qwen4_stream_weights scope{&table, full, nullptr, mode == 2 ? &half : nullptr};
+            g_qwen4_stream_weights = mode ? &scope : nullptr;
+            g_qwen4_nax_half_mid_for = &marker; g_qwen4_nax_half_mid_count = 123;
+            assert(guard(0) == 1);
+            assert(g_qwen4_nax_half_mid_for == nullptr && g_qwen4_nax_half_mid_count == 0);
+            assert(half.mid == (mode == 2 ? nullptr : &marker));
+            empty_state_cases++;
+            if (mode == 2) half_state_cases++;
+            half.mid = &marker;
+            g_qwen4_nax_half_mid_for = &marker; g_qwen4_nax_half_mid_count = 123;
+            assert(guard(1) == 0);
+            assert(g_qwen4_nax_half_mid_for == &marker && g_qwen4_nax_half_mid_count == 123);
+            assert(half.mid == &marker);
+            empty_state_cases++;
+            if (mode == 2) half_state_cases++;
+            g_qwen4_stream_weights = nullptr;
+        }
     }
 
     // Retain three fully copied argument snapshots, then destroy/overwrite
@@ -296,9 +393,10 @@ int main() {
     }
     printf("{\"status\":\"pass\",\"argument_bytes\":%zu,\"mapping_cases\":%llu,\"schedule_cases\":%llu,"
            "\"matching_schedule_events\":%llu,\"destroyed_pointer_lifetime_cases\":%llu,"
-           "\"nax_empty_state_cases\":%llu,\"gpu_runs\":false}\n",
+           "\"nax_empty_state_cases\":%llu,\"stream_half_state_cases\":%llu,\"gpu_runs\":false}\n",
            sizeof(qwen4_moe_mm_args), (unsigned long long)mapping_cases, (unsigned long long)scheduled_cases,
-           (unsigned long long)schedule_events, (unsigned long long)lifetime_cases, (unsigned long long)empty_state_cases);
+           (unsigned long long)schedule_events, (unsigned long long)lifetime_cases,
+           (unsigned long long)empty_state_cases, (unsigned long long)half_state_cases);
 }
 '''
 
@@ -313,6 +411,7 @@ def main():
     args = parser.parse_args()
     host, metal = args.host.read_text(), args.metal.read_text()
     code = extract_cpu_code(host, metal)
+    negative_controls = check_scanner_negative_controls(metal)
     flags = ["-std=c++17", "-O2", "-Wall", "-Wextra"]
     if args.sanitize:
         flags += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
@@ -326,6 +425,7 @@ def main():
             raise AssertionError(run.stderr)
         result = json.loads(run.stdout)
         result["sanitizers"] = args.sanitize
+        result["scanner_negative_controls"] = negative_controls
         print(json.dumps(result, indent=2))
 
 
