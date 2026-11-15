@@ -349,6 +349,9 @@ bool ds4_token_is_stop_for_think_mode(ds4_engine *e,
                                       ds4_think_mode mode);
 int ds4_token_user(ds4_engine *e);
 int ds4_token_assistant(ds4_engine *e);
+/* ChatML turn markers: *prefix is <|im_start|>, *user and *assistant the
+ * role-name tokens that follow it (-1 when a name is not one token). */
+void ds4_chat_role_markers(ds4_engine *e, int *prefix, int *user, int *assistant);
 
 /* Tensor-parallel binding: allocates the GPU gate slab, registers it with
  * the transport and arms the per-layer gate machinery.  Call once, after
@@ -438,6 +441,8 @@ bool ds4_session_checkpoint_valid(const ds4_session *s);
  * for inference; free with ds4_session_free_test_checkpoint(). */
 ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n);
 void ds4_session_free_test_checkpoint(ds4_session *s);
+/* Make a test checkpoint report ds4_session_prefix_reusable() == false. */
+void ds4_session_set_test_backend_stale(ds4_session *s, bool stale);
 /* Attach synthetic image identities to a test checkpoint (copies
  * token_start/row-count/fingerprint per span).  Not usable for inference. */
 void ds4_session_set_test_images(ds4_session *s,
@@ -550,6 +555,11 @@ void ds4_session_invalidate(ds4_session *s);
  * Callers retaining images must use sync_multimodal for that rebuild. */
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
+/* True when the live checkpoint tokens and the backend state agree, so the
+ * checkpoint can be reused as a prefill prefix.  A Qwen rewind with no
+ * matching snapshot resets the recurrent graph while the token checkpoint
+ * stays valid; the next sync would then silently rebuild the whole prefix. */
+bool ds4_session_prefix_reusable(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);

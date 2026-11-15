@@ -72,7 +72,14 @@ answer's trailing newline renders a different prompt and misses that key.
 A request is served from the first tier that matches, in this order:
 
 1. Live session, by protocol: the Responses-visible transcript, then the
-   tool-call IDs of a Responses or Anthropic continuation.
+   tool-call IDs of a Responses or Anthropic continuation. A request that
+   replays the history binds by call ID only if the history before the
+   pending tool call renders exactly as the input that produced the live
+   frontier; an edited or compacted earlier history falls through to the
+   other tiers. A request that carries only tool results (after the system
+   prompt, if any) keeps binding by ID.
+   User messages after the Responses tool outputs, and system notes after the
+   Anthropic tool results, are appended after the results.
 2. Live session, by tokens: the request's tokens extend the live tokens. The
    Qwen session is never rewound, so a shorter or diverging prompt misses here.
 3. Live session, by visible text: the key of the last chat turn without its
@@ -99,7 +106,46 @@ instead of under the reasoning-free visible key.
 Continued checkpoints are written when a prefill chunk ends on an exact
 multiple of the interval (10240 tokens by default; with 8192-token chunks from
 position 0 that is every 40960 tokens); a prefill resumed off that grid writes
-none.
+none. The cold checkpoint of a short prompt is anchored at the `<|im_start|>`
+that opens the last user turn before the first assistant turn, so independent
+sessions sharing a system prompt and tools reuse it.
+
+A live session whose recurrent state was reset by a rewind without a matching
+snapshot (an MTP verify rejection, for instance) is a miss for the live tiers,
+reported as `backend-state-reset` in traces, so the disk cache can serve the
+request; only a results-only tool continuation, which has no other source,
+still binds and replays the prefix. When a prefill rebuilds a prefix the
+server had counted as cached, the progress log shows it against the whole
+prompt.
+
+## Turns and response fields
+
+- **System messages.** Leading system messages, the Responses `instructions`
+  and the Anthropic top-level `system` form the prompt's system block, as
+  before. A system message later in the conversation is rendered where it
+  occurs, as a `<|im_start|>system` turn, so a client that adds a note on
+  every turn keeps the prompt append-only and the live KV reusable. The
+  shipped template refuses such a message, so this framing is the child's.
+- **Tool calls.** A turn can hold several `<tool_call>` blocks; generation
+  continues after each one until the end token or non-call text, which is
+  dropped together with the live frontier of that turn (logged as "bytes
+  after the last closed tool call dropped"). A streamed call (OpenAI
+  `tool_calls` delta, Anthropic `tool_use` block) is sent whole as soon as
+  its `</tool_call>` arrives, with the arguments the final message carries;
+  arguments are not streamed piece by piece, so a call that a token limit or
+  a stop token cuts never reaches the client.
+- **Unfinished turns.** A thinking turn that the model ends with its stop
+  token before `</think>` returns its text as `content` (and as reasoning);
+  a stream sends it as a final content delta after the reasoning. A length
+  cut or a client stop sequence inside the reasoning stays reasoning-only. A tool call cut off by the end token goes through the
+  invalid-tool-call recovery instead of `finish_reason: "error"`.
+- **Text encoding.** JSON output is valid UTF-8: an ill-formed byte sequence,
+  such as a character split by `max_tokens`, becomes one U+FFFD. The text kept
+  by the server and the KV are unchanged.
+- **Fields.** An integer `seed` is read exactly, above 2^53 too. Anthropic
+  reports a matched stop sequence as `stop_reason: "stop_sequence"` with the
+  string in `stop_sequence` (`null` with any other stop reason). A Responses reply cut by `max_output_tokens`
+  reports `incomplete_details.reason: "max_output_tokens"`.
 
 ## Concurrency
 

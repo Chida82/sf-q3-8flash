@@ -7192,6 +7192,42 @@ static void test_keyed_prompt_free(test_keyed_prompt *k) {
     ds4_tokens_free(&k->tokens);
 }
 
+/* #1157: "user" and "assistant" are single tokens after <|im_start|>, so the
+ * cold anchor lands on the <|im_start|> that opens the task's user turn. */
+static void test_chatml_cold_anchor_qwen(void) {
+    ds4_engine *engine = test_open_engine_inspect(test_model_path());
+    TEST_ASSERT(engine != NULL);
+    if (!engine) return;
+    int prefix = -1, user = -1, assistant = -1;
+    ds4_chat_role_markers(engine, &prefix, &user, &assistant);
+    TEST_ASSERT(prefix >= 0 && user >= 0 && assistant >= 0);
+
+    chat_msgs msgs = {0};
+    chat_msg_push_text(&msgs, "system", "You are terse.", NULL);
+    chat_msg_push_text(&msgs, "user", "Hello", NULL);
+    unsigned char *trusted = NULL;
+    char *text = render_chat_prompt_text_for_syntax_masked(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, DS4_THINK_HIGH, &trusted);
+    ds4_tokens tokens = {0};
+    ds4_tokenize_rendered_chat_masked(engine, text, trusted, &tokens);
+    int user_turn = -1, starts = 0;
+    for (int i = 0; i < tokens.len; i++)
+        if (tokens.v[i] == prefix && ++starts == 2) user_turn = i;
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    kc.opt.min_tokens = 1;
+    const int anchor = kv_cache_chat_anchor_pos(&kc, &tokens, prefix, user, assistant);
+    fprintf(stderr, "chatml-cold-anchor: anchor=%d user_turn=%d tokens=%d\n",
+            anchor, user_turn, tokens.len);
+    TEST_ASSERT(user_turn > 0 && anchor == user_turn);
+    TEST_ASSERT(user_turn + 1 < tokens.len && tokens.v[user_turn + 1] == user);
+    ds4_tokens_free(&tokens);
+    free(text);
+    free(trusted);
+    chat_msgs_free(&msgs);
+    ds4_engine_close(engine);
+}
+
 static void test_special_token_injection_qwen(void) {
     ds4_engine *engine = test_open_engine_inspect(test_model_path());
     TEST_ASSERT(engine != NULL);
@@ -7384,6 +7420,9 @@ static const ds4_test_entry test_entries[] = {
     {"--special-token-injection-qwen", "special-token-injection-qwen",
      "chat content cannot inject control tokens; masked cache keys (tokenizer only)",
      test_special_token_injection_qwen},
+    {"--chatml-cold-anchor", "chatml-cold-anchor",
+     "cold KV anchor at the ChatML user turn (tokenizer only)",
+     test_chatml_cold_anchor_qwen},
 };
 
 static void test_print_help(const char *prog) {

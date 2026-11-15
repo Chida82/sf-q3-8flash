@@ -15,3 +15,11 @@ For coding agents, disable provider-side prompt caching and compaction unless
 the client requires them: the server owns live and disk KV reuse. Enable vision
 in the client only when the server was started with the Qwen projector. Keep
 server traces private because prompts and tool arguments may contain secrets.
+
+What clients see (details in `docs/SERVER.md`, "Turns and response fields"):
+one assistant turn may carry several tool calls, so handle every entry of
+`tool_calls` / every `tool_use` block. A system note sent in the middle of a
+conversation stays in place and keeps the cached prefix. An answer cut inside
+a multi-byte character ends with U+FFFD. Anthropic clients get the matched
+stop sequence in `stop_sequence`; Responses clients get
+`max_output_tokens` as the incomplete reason.

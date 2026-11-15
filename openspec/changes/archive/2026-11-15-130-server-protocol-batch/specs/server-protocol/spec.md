@@ -3,11 +3,15 @@
 ## ADDED Requirements
 
 ### Requirement: Several tool calls per turn
-A Qwen assistant turn SHALL be able to emit several tool calls. The server SHALL return every completed call of the turn, and, when streaming over OpenAI SSE, SHALL stream each call's arguments as they are generated.
+A Qwen assistant turn SHALL be able to emit several tool calls. The server SHALL return every completed call of the turn. When streaming (OpenAI SSE, Anthropic), the server SHALL send each call whole as soon as it is closed, and SHALL NOT send any part of a call the turn did not complete.
 
 #### Scenario: Two calls in one turn
 - **WHEN** the model emits two tool calls in one turn
-- **THEN** the response lists both calls in order, and a streamed response delivers both calls' argument deltas
+- **THEN** the response lists both calls in order, and a streamed response delivers each call with its whole arguments
+
+#### Scenario: Second call cut
+- **WHEN** the token limit or a stop token cuts the second call of a turn
+- **THEN** the response, streamed or not, carries only the first call
 
 ### Requirement: Completed turns keep their answer
 When a turn completes with an unterminated reasoning block, the server SHALL return the text as content instead of dropping it. When a turn ends inside an unterminated tool call, the server SHALL apply its parse-failure recovery and SHALL NOT report `finish_reason: "error"` on a successful HTTP response.

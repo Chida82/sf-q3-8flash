@@ -368,6 +368,31 @@ static bool json_int(const char **p, int *out) {
     return true;
 }
 
+/* A seed is a 64-bit integer, so read plain integers from their digits: a
+ * double rounds above 2^53, and casting one at or past 2^64 is undefined (x86
+ * turns 18446744073709551615 into 0, which means "no seed"). Other numbers
+ * keep the old reading, where zero, negatives and NaN mean no seed. */
+static bool json_seed(const char **p, uint64_t *out) {
+    json_ws(p);
+    const char *s = *p;
+    if (*s >= '0' && *s <= '9') {
+        const char *end = s;
+        while (*end >= '0' && *end <= '9') end++;
+        if (*end != '.' && *end != 'e' && *end != 'E') {
+            /* strtoull() saturates an overflowing value at ULLONG_MAX. */
+            *out = (uint64_t)strtoull(s, NULL, 10);
+            *p = end;
+            return true;
+        }
+    }
+    double v = 0.0;
+    if (!json_number(p, &v)) return false;
+    if (!(v > 0.0)) *out = 0;
+    else if (v >= 18446744073709551616.0) *out = UINT64_MAX;
+    else *out = (uint64_t)v;
+    return true;
+}
+
 static bool json_bool(const char **p, bool *out) {
     json_ws(p);
     if (json_lit(p, "true")) {
@@ -885,6 +910,7 @@ typedef struct {
     bool ignore_eos;
     int cache_read_tokens;
     int cache_write_tokens;
+    const char *stop_sequence; /* client stop sequence that ended the output, or NULL */
     ds4_think_mode think_mode;
     bool has_tools;
     /* Qwen's chat template keeps every historical reasoning block only while the
@@ -923,6 +949,17 @@ typedef struct {
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
     unsigned char *anthropic_live_suffix_trusted;
+    /* Tool-conversation identity (render_tool_flow_key), rendered before
+     * tool_memory_attach_to_messages() substitutes sampled bytes:
+     * full_input_key: this request's whole input; a request that produces a
+     *     tool-call frontier publishes it.  NULL for a results-only request.
+     * tool_parent_key: this input without its pending assistant turn and new
+     *     suffix: what that frontier's full_input_key must equal for the
+     *     tool-ID tier to reuse it.
+     * tool_delta_only: only new tool results, no parent to compare. */
+    char *full_input_key;
+    char *tool_parent_key;
+    bool tool_delta_only;
     tool_replay_stats tool_replay;
 } request;
 
@@ -1099,6 +1136,8 @@ static void request_free(request *r) {
     free(r->anthropic_live_call_ids.v);
     free(r->anthropic_live_suffix_text);
     free(r->anthropic_live_suffix_trusted);
+    free(r->full_input_key);
+    free(r->tool_parent_key);
     tool_schema_orders_free(&r->tool_orders);
     memset(r, 0, sizeof(*r));
 }
@@ -1398,6 +1437,30 @@ static int utf8_expected_len(unsigned char c) {
     if (c >= 0xe0 && c <= 0xef) return 3;
     if (c >= 0xf0 && c <= 0xf4) return 4;
     return 1;
+}
+
+/* Scan one UTF-8 character at s[0..n) and return how many bytes it uses.
+ * *valid is false for an ill-formed or truncated sequence; the returned
+ * length is then its maximal ill-formed subpart (Unicode 3.9), which callers
+ * replace with a single U+FFFD, like Python and browsers do. */
+static size_t utf8_scan_char(const unsigned char *s, size_t n, bool *valid) {
+    size_t len = (size_t)utf8_expected_len(s[0]);
+    unsigned char lo = 0x80, hi = 0xbf;
+    if (s[0] == 0xe0) lo = 0xa0;        /* overlong */
+    else if (s[0] == 0xed) hi = 0x9f;   /* UTF-16 surrogate */
+    else if (s[0] == 0xf0) lo = 0x90;   /* overlong */
+    else if (s[0] == 0xf4) hi = 0x8f;   /* above U+10FFFF */
+
+    *valid = len > 1 || s[0] < 0x80;
+    for (size_t i = 1; i < len; i++) {
+        if (i >= n || s[i] < lo || s[i] > hi) {
+            *valid = false;
+            return i;
+        }
+        lo = 0x80;
+        hi = 0xbf;
+    }
+    return len;
 }
 
 /* Tokenizers can split a multi-byte UTF-8 character across two tokens.  If an
@@ -3128,15 +3191,26 @@ static int qwen_last_query_index(const chat_msgs *msgs) {
     return last > 50 ? last : 0;
 }
 
+/* System messages before the first other message form the prompt's system
+ * block.  A later one is rendered where it occurs, so an append-only
+ * conversation stays append-only in tokens and the next request extends the
+ * live KV instead of prefilling again. */
+static int chat_leading_system_count(const chat_msgs *msgs) {
+    int n = 0;
+    while (msgs && n < msgs->len && role_is_system(msgs->v[n].role)) n++;
+    return n;
+}
+
 static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
                                      const tool_schema_orders *tool_orders, bool think,
                                      bool preserve_thinking) {
     const int last_query = qwen_last_query_index(msgs);
+    const int leading = chat_leading_system_count(msgs);
     bool pending_assistant = false;
     bool tool_open = false;
     for (int i = start; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
-        if (role_is_system(m->role)) continue;
+        if (role_is_system(m->role) && i < leading) continue;
         if (chat_msg_is_glm_tool_result(m)) {
             if (!tool_open) buf_puts_special(out, "<|im_start|>user");
             append_qwen_tool_result_message(out, m);
@@ -3148,7 +3222,13 @@ static void append_qwen_conversation(buf *out, const chat_msgs *msgs, int start,
             buf_puts_special(out, "<|im_end|>\n");
             tool_open = false;
         }
-        if (!strcmp(m->role, "user")) {
+        if (role_is_system(m->role)) {
+            /* The model's template refuses a non-first system message; render
+             * it as the system turn it would be at the head. */
+            buf_puts_special(out, "<|im_start|>system\n");
+            append_trimmed_text(out, m->content);
+            buf_puts_special(out, "<|im_end|>\n");
+        } else if (!strcmp(m->role, "user")) {
             buf_puts_special(out, "<|im_start|>user\n");
             append_trimmed_text(out, m->content);
             buf_puts_special(out, "<|im_end|>\n");
@@ -3173,11 +3253,10 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
     const char *effort = think ? ds4_qwen4_reasoning_effort_text(think_mode) : NULL;
     const bool have_tools = tool_schemas && tool_schemas[0];
     buf system = {0};
-    for (int i = 0; msgs && i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        if (!role_is_system(m->role)) continue;
+    const int leading = chat_leading_system_count(msgs);
+    for (int i = 0; i < leading; i++) {
         if (system.len) buf_puts(&system, "\n\n");
-        append_trimmed_text(&system, m->content);
+        append_trimmed_text(&system, msgs->v[i].content);
     }
     buf out = {0};
     buf_track_trusted(&out);
@@ -3485,33 +3564,115 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
     return ok;
 }
 
-/* Record the call ids and suffix candidate for a live Responses continuation.
+/* Canonical identity of a replayed tool conversation.
+ *
+ * The tool-ID tier binds a request to the live frontier by call id alone.
+ * That is sound only while the request replays the input that produced the
+ * frontier: a rewritten or compacted history can keep the pending assistant
+ * turn and its call ids while replacing what the frontier was generated from.
+ * The full-input key renders the whole message list and is published with the
+ * frontier; the parent key renders it without the pending assistant turn and
+ * its new suffix, so a faithful replay reproduces the frontier's full-input
+ * key.  Keys are in key space (ds4_chat_key_text, so a marker spelled in
+ * client text differs from the marker), with request-local image markers
+ * masked and their offsets in a leading "count,offset...;" header. */
+static ds4_engine *server_engine(const server *s);
+
+static char *render_tool_flow_key(server *s, const request *r,
+                                  const chat_msgs *msgs, const char *tool_schemas) {
+    unsigned char *trusted = NULL;
+    char *text = render_chat_prompt_text_for_syntax_masked(
+        r->model_syntax, msgs, tool_schemas, &r->tool_orders, r->think_mode, &trusted);
+    char *escaped = text ? ds4_chat_key_text(server_engine(s), text, trusted) : NULL;
+    free(trusted);
+    if (escaped) {
+        free(text);
+        text = escaped;
+    }
+    if (!text) return NULL;
+    buf key = {0};
+    size_t count = 0;
+    const char *cursor = text;
+    for (int i = 0; i < msgs->len; i++) {
+        const server_image_inputs *images = &msgs->v[i].images;
+        for (size_t j = 0; j < images->len; j++) {
+            const char *marker = images->v[j].marker;
+            const size_t len = strlen(marker);
+            char *found = len ? strstr(cursor, marker) : NULL;
+            if (!found) {
+                /* a marker left in place would make the key request-local */
+                free(text);
+                buf_free(&key);
+                return NULL;
+            }
+            buf_printf(&key, ",%zu", (size_t)(found - text));
+            memset(found, '\036', len);
+            cursor = found + len;
+            count++;
+        }
+    }
+    buf out = {0};
+    buf_printf(&out, "%zu%s;", count, key.ptr ? key.ptr : "");
+    buf_puts(&out, text);
+    buf_free(&key);
+    free(text);
+    return buf_take(&out);
+}
+
+/* Parent view: the messages before the pending assistant turn at `anchor`;
+ * that turn and everything after it (results, follow-up user or system notes)
+ * are new.  Every system prompt is in front (Responses instructions and the
+ * Anthropic top-level system are inserted there), so the view is a prefix;
+ * an edited or compacted earlier history renders a different key. */
+static char *render_tool_parent_key(server *s, const request *r,
+                                    const chat_msgs *msgs, int anchor,
+                                    const char *tool_schemas) {
+    chat_msgs parent = { .v = msgs->v, .len = anchor, .cap = anchor };
+    return render_tool_flow_key(s, r, &parent, tool_schemas);
+}
+
+/* Record the call ids, suffix candidate and identity keys for a live
+ * Responses continuation.
  *
  * This only prepares evidence.  generate_job() later checks that the live
  * server state is still exactly at the remembered token frontier before using
  * it.  If another request already replaced the session, normal token/text/disk
  * prefix matching handles the request instead. */
 static void responses_prepare_live_continuation(server *s, request *r,
-                                                const chat_msgs *msgs) {
+                                                const chat_msgs *msgs,
+                                                const char *tool_schemas) {
     if (!r || r->api != API_RESPONSES || !msgs || msgs->len == 0) return;
 
-    int tail_start = msgs->len;
+    /* User messages queued after the tool outputs are new suffix too: the
+     * live tail renders them, the parent comparison leaves them out. */
+    int tool_end = msgs->len;
+    while (tool_end > 0 && !strcmp(msgs->v[tool_end - 1].role, "user")) tool_end--;
+    int tail_start = tool_end;
     while (tail_start > 0) {
         const chat_msg *m = &msgs->v[tail_start - 1];
         if (strcmp(m->role, "tool") && strcmp(m->role, "function")) break;
         tail_start--;
     }
-    if (tail_start == msgs->len) return;
+    if (tail_start == tool_end) {
+        /* Not a continuation, but it may produce the next frontier. */
+        r->full_input_key = render_tool_flow_key(s, r, msgs, tool_schemas);
+        return;
+    }
 
     stop_list_clear(&r->responses_live_call_ids);
-    if (tail_start > 0) {
+    /* the instructions sit in front: results right after them are results-only */
+    if (tail_start > chat_leading_system_count(msgs)) {
         const int anchor = tail_start - 1;
         const chat_msg *assistant = &msgs->v[anchor];
         if (strcmp(assistant->role, "assistant") || assistant->calls.len == 0) return;
+        r->full_input_key = render_tool_flow_key(s, r, msgs, tool_schemas);
+        r->tool_parent_key = render_tool_parent_key(s, r, msgs, anchor, tool_schemas);
         for (int i = 0; i < assistant->calls.len; i++) {
             id_list_push_unique(&r->responses_live_call_ids, assistant->calls.v[i].id);
         }
     } else {
+        /* Results only: nothing here proves a full-history parent. */
+        r->tool_delta_only = true;
         for (int i = tail_start; i < msgs->len; i++) {
             chat_msg_collect_tool_call_ids(&msgs->v[i], &r->responses_live_call_ids);
         }
@@ -3587,6 +3748,17 @@ static bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
     return ok;
 }
 
+/* The API's initial system prompt goes after any leading system messages, so
+ * the system block keeps its order and a system message later in messages[]
+ * stays a later turn, rendered where it occurs. */
+static void anthropic_place_system_prompt(chat_msgs *msgs, chat_msg msg) {
+    const int at = chat_leading_system_count(msgs);
+    chat_msgs_push(msgs, msg);
+    memmove(msgs->v + at + 1, msgs->v + at,
+            (size_t)(msgs->len - 1 - at) * sizeof(msgs->v[0]));
+    msgs->v[at] = msg;
+}
+
 /* Prepare the Anthropic live-tool fast path.
  *
  * Anthropic's visible replay normally includes the assistant tool_use JSON and
@@ -3595,7 +3767,8 @@ static bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
  * frontier, generate_job() can skip replay matching entirely and append just
  * EOS + tool_result + next assistant prefix to the real KV. */
 static void anthropic_prepare_live_continuation(server *s, request *r,
-                                                const chat_msgs *msgs) {
+                                                const chat_msgs *msgs,
+                                                const char *tool_schemas) {
     if (!r || r->api != API_ANTHROPIC || !msgs || msgs->len == 0) return;
 
     int tail_end = msgs->len;
@@ -3606,7 +3779,27 @@ static void anthropic_prepare_live_continuation(server *s, request *r,
     {
         tail_start--;
     }
-    if (tail_start == tail_end) return;
+    if (tail_start == tail_end) {
+        /* Not a continuation, but it may produce the next frontier. */
+        r->full_input_key = render_tool_flow_key(s, r, msgs, tool_schemas);
+        return;
+    }
+
+    /* The results replay the assistant tool_use turn only when it is still
+     * there; without it, only a tail with nothing before it is results-only.
+     * A system message after the results (a note sent while the tool ran) is
+     * new suffix, rendered where it occurs, so it leaves the parent view too;
+     * the top-level system prompt sits in front (anthropic_place_system_prompt),
+     * so results right after the leading system messages are results-only. */
+    if (tail_start > chat_leading_system_count(msgs)) {
+        const int anchor = tail_start - 1;
+        if (strcmp(msgs->v[anchor].role, "assistant") || msgs->v[anchor].calls.len == 0)
+            return;
+        r->full_input_key = render_tool_flow_key(s, r, msgs, tool_schemas);
+        r->tool_parent_key = render_tool_parent_key(s, r, msgs, anchor, tool_schemas);
+    } else {
+        r->tool_delta_only = true;
+    }
 
     stop_list_clear(&r->anthropic_live_call_ids);
     for (int i = tail_start; i < msgs->len; i++) {
@@ -3790,12 +3983,10 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             }
             r->top_k_set = true;
         } else if (!strcmp(key, "seed")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
+            if (!json_seed(&p, &r->seed)) {
                 free(key);
                 goto bad;
             }
-            r->seed = v > 0.0 ? (uint64_t)v : 0;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -4090,8 +4281,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         msg.role = xstrdup("system");
         msg.content = system;
         system = NULL;
-        chat_msgs_push(&msgs, msg);
-
+        anthropic_place_system_prompt(&msgs, msg);
     }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
@@ -4109,9 +4299,10 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         return false;
     }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
-    tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    anthropic_prepare_live_continuation(s, r, &msgs);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    /* before attach: identity keys describe the client's canonical calls */
+    anthropic_prepare_live_continuation(s, r, &msgs, active_tool_schemas);
+    tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text_for_syntax_masked(
@@ -5140,10 +5331,11 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         return false;
     }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
+    /* before attach: identity keys describe the client's canonical calls */
+    responses_prepare_live_continuation(s, r, &msgs, active_tool_schemas);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    responses_prepare_live_continuation(s, r, &msgs);
     r->prompt_text = render_chat_prompt_text_for_syntax_masked(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode, &r->prompt_trusted);
@@ -5276,12 +5468,10 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
             }
             r->top_k_set = true;
         } else if (!strcmp(key, "seed")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
+            if (!json_seed(&p, &r->seed)) {
                 free(key);
                 goto bad;
             }
-            r->seed = v > 0.0 ? (uint64_t)v : 0;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -5390,25 +5580,11 @@ static bool send_all(int fd, const void *p, size_t n) {
     return true;
 }
 
+static void json_escape_fragment_n(buf *b, const char *s, size_t n);
+
 static void json_escape(buf *b, const char *s) {
     buf_putc(b, '"');
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
-        if (c == '"' || c == '\\') {
-            buf_putc(b, '\\');
-            buf_putc(b, (char)c);
-        } else if (c == '\n') {
-            buf_puts(b, "\\n");
-        } else if (c == '\r') {
-            buf_puts(b, "\\r");
-        } else if (c == '\t') {
-            buf_puts(b, "\\t");
-        } else if (c < 0x20) {
-            buf_printf(b, "\\u%04x", (unsigned)c);
-        } else {
-            buf_putc(b, (char)c);
-        }
-    }
+    json_escape_fragment_n(b, s, strlen(s));
     buf_putc(b, '"');
 }
 
@@ -5537,10 +5713,19 @@ static void json_recode_value(buf *b, const char *s, size_t n) {
     }
 }
 
+/* Model tokens are raw bytes and may not be valid UTF-8: max_tokens can cut a
+ * character in half, and a model can emit stray bytes.  JSON must be valid
+ * UTF-8, so ill-formed sequences become U+FFFD; valid text is copied as is. */
 static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
     for (size_t i = 0; i < n; i++) {
         unsigned char c = (unsigned char)s[i];
-        if (c == '"' || c == '\\') {
+        if (c >= 0x80) {
+            bool valid;
+            size_t len = utf8_scan_char((const unsigned char *)s + i, n - i, &valid);
+            if (valid) buf_append(b, s + i, len);
+            else buf_puts(b, "\xef\xbf\xbd");
+            i += len - 1;
+        } else if (c == '"' || c == '\\') {
             buf_putc(b, '\\');
             buf_putc(b, (char)c);
         } else if (c == '\n') {
@@ -5987,6 +6172,21 @@ static bool parse_generated_message_for_response_for_syntax(server_model_syntax 
     return false;
 }
 
+/* #1088: a thinking turn the model ended with its own stop token before
+ * </think> is complete, so its text is the answer: return it as content too
+ * (reasoning kept).  A length cut or a client stop sequence inside the
+ * reasoning is not an ending the model chose and stays reasoning-only. */
+static bool promote_unterminated_reasoning(const char *text, bool thinking,
+                                           bool model_ended, const tool_calls *calls,
+                                           char **content, char **reasoning) {
+    if (!thinking || !model_ended || calls->len || !*content || **content ||
+        !*reasoning || !**reasoning ||
+        find_tool_structural_text(text ? text : "", "</think>", true)) return false;
+    free(*content);
+    *content = xstrdup(*reasoning);
+    return true;
+}
+
 static DS4_SERVER_MAYBE_UNUSED bool parse_generated_message_for_response(
         const char *text,
         bool has_tools,
@@ -6032,13 +6232,14 @@ static void append_tool_calls_json(buf *b, const tool_calls *calls, const char *
     buf_putc(b, ']');
 }
 
-static void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *id_prefix,
+static void append_tool_call_deltas_json(buf *b, const tool_calls *calls, int first,
+                                         const char *id_prefix,
                                          const tool_schema_orders *orders) {
     (void)orders;
     buf_putc(b, '[');
-    for (int i = 0; i < calls->len; i++) {
+    for (int i = first; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
-        if (i) buf_putc(b, ',');
+        if (i > first) buf_putc(b, ',');
         char idbuf[128];
         snprintf(idbuf, sizeof(idbuf), "%s_tool_%d", id_prefix, i);
         buf_puts(b, "{\"index\":");
@@ -6285,7 +6486,7 @@ static bool sse_chat_finish(int fd, const request *r, const char *id, const char
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
-        append_tool_call_deltas_json(&b, calls, id, &r->tool_orders);
+        append_tool_call_deltas_json(&b, calls, 0, id, &r->tool_orders);
         buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     }
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
@@ -6301,41 +6502,65 @@ static bool sse_chat_finish(int fd, const request *r, const char *id, const char
 }
 
 typedef enum {
+    DSML_DECODE_OUTSIDE,
+    DSML_DECODE_STRUCTURAL,
+    DSML_DECODE_STRING_BODY,
+    DSML_DECODE_JSON_STRUCTURAL,
+    DSML_DECODE_JSON_STRING,
+} dsml_decode_state;
+
+typedef enum {
+    DSML_TRACK_SEARCH,
+    DSML_TRACK_STRUCTURAL,
+    DSML_TRACK_STRING_BODY,
+    DSML_TRACK_JSON_PARAM,
+    DSML_TRACK_BETWEEN,
+    DSML_TRACK_DONE,
+} dsml_track_mode;
+
+typedef struct {
+    const char *tool_calls_start;
+    const char *tool_calls_end;
+    const char *invoke_start;
+    const char *invoke_end;
+    const char *param_start;
+    const char *param_end;
+} dsml_syntax;
+
+static const dsml_syntax qwen_tool_syntax = {
+    "<tool_call>", "</tool_call>",
+    "<function=", "</function>", "<parameter=", "</parameter>",
+};
+
+typedef struct {
+    dsml_track_mode mode;
+    dsml_decode_state decode;
+    const dsml_syntax *syn;
+    size_t pos;
+    bool json_in_string;
+    bool json_escaped;
+    server_model_syntax model_syntax;
+    size_t calls_end;           /* text end of the last closed call */
+} dsml_decode_tracker;
+
+typedef enum {
     OPENAI_STREAM_THINKING,
     OPENAI_STREAM_TEXT,
     OPENAI_STREAM_TOOL,
     OPENAI_STREAM_SUPPRESS,
 } openai_stream_mode;
 
-typedef enum {
-    DSML_TOOL_BETWEEN_INVOKES,
-    DSML_TOOL_BETWEEN_PARAMS,
-    DSML_TOOL_PARAM_VALUE,
-    DSML_TOOL_DONE,
-    DSML_TOOL_ERROR,
-} dsml_tool_stream_state;
-
-/* Shared states for protocol-specific DSML stream projections.  The model
- * still samples DSML; these states only translate already-sampled bytes into
- * OpenAI / Anthropic wire events while final parsing remains authoritative. */
+/* Tool calls of a live stream.  A call is sent whole, once its </tool_call>
+ * arrived and the final parser read it, so a call cut by a limit or a stop
+ * token never reaches the client half-written.  ids[i] is the id sent for
+ * call i; the parsed response adopts it. */
 typedef struct {
-    dsml_tool_stream_state state;
-    const char *tool_calls_end;
-    const char *invoke_start;
-    const char *invoke_end;
-    const char *param_start;
-    const char *param_end;
-    size_t parse_pos;
-    int index;
-    bool active;
-    bool emitted_any;
-    bool args_open;
-    bool first_param;
-    bool param_is_string;
-    char *tool_name;
+    dsml_decode_tracker tracker;
+    size_t done;        /* text end of the calls already sent */
+    int index;          /* calls sent */
     char **ids;
     int ids_cap;
-} openai_tool_stream;
+} openai_tool_stream, anthropic_tool_stream;
 
 typedef struct {
     openai_stream_mode mode;
@@ -6344,6 +6569,7 @@ typedef struct {
     bool checked_think_prefix;
     bool sent_reasoning;
     bool sent_content;
+    const char *late_content;   /* answer the stream sent only as reasoning (#1088) */
     openai_tool_stream tool;
 } openai_stream;
 
@@ -6359,9 +6585,7 @@ static void openai_tool_stream_free(openai_tool_stream *ts) {
     if (!ts) return;
     for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
     free(ts->ids);
-    free(ts->tool_name);
     ts->ids = NULL;
-    ts->tool_name = NULL;
     ts->ids_cap = 0;
 }
 
@@ -6424,11 +6648,8 @@ static bool sse_chat_delta_n(int fd, const request *r, const char *id,
     return ok;
 }
 
-/* OpenAI clients can consume function.arguments as a stream of JSON text
- * fragments.  DS4 generates XML-ish DSML instead, so this parser switches to a
- * hidden tool mode at <...tool_calls>, emits the tool header once the invoke tag
- * is complete, then translates each parameter body into argument deltas while
- * holding only tiny tails for partial closing tags, UTF-8, and DSML entities. */
+/* A live tool call goes out as this header plus one arguments delta holding
+ * the whole object, once the call's </tool_call> arrived (openai_tool_stream). */
 static bool sse_chat_tool_call_start_delta(int fd, const request *r, const char *id,
                                            int index, const char *tool_id,
                                            const char *name) {
@@ -6476,11 +6697,6 @@ static bool raw_partial_lit(const char *raw, size_t raw_len, size_t pos, const c
     return !memcmp(raw + pos, lit, raw_len - pos);
 }
 
-static bool raw_partial_any(const char *raw, size_t raw_len, size_t pos,
-                            const char *a, const char *b) {
-    return raw_partial_lit(raw, raw_len, pos, a) || raw_partial_lit(raw, raw_len, pos, b);
-}
-
 static const char *find_lit_bounded(const char *s, size_t n, const char *lit) {
     size_t m = strlen(lit);
     if (m == 0) return s;
@@ -6490,46 +6706,6 @@ static const char *find_lit_bounded(const char *s, size_t n, const char *lit) {
     }
     return NULL;
 }
-
-typedef enum {
-    DSML_DECODE_OUTSIDE,
-    DSML_DECODE_STRUCTURAL,
-    DSML_DECODE_STRING_BODY,
-    DSML_DECODE_JSON_STRUCTURAL,
-    DSML_DECODE_JSON_STRING,
-} dsml_decode_state;
-
-typedef enum {
-    DSML_TRACK_SEARCH,
-    DSML_TRACK_STRUCTURAL,
-    DSML_TRACK_STRING_BODY,
-    DSML_TRACK_JSON_PARAM,
-    DSML_TRACK_DONE,
-} dsml_track_mode;
-
-typedef struct {
-    const char *tool_calls_start;
-    const char *tool_calls_end;
-    const char *invoke_start;
-    const char *invoke_end;
-    const char *param_start;
-    const char *param_end;
-} dsml_syntax;
-
-static const dsml_syntax qwen_tool_syntax = {
-    "<tool_call>", "</tool_call>",
-    "<function=", "</function>", "<parameter=", "</parameter>",
-};
-
-typedef struct {
-    dsml_track_mode mode;
-    dsml_decode_state decode;
-    const dsml_syntax *syn;
-    size_t pos;
-    bool json_in_string;
-    bool json_escaped;
-    server_model_syntax model_syntax;
-} dsml_decode_tracker;
 
 static size_t dsml_max_tool_start_len(void) {
     return strlen(qwen_tool_syntax.tool_calls_start);
@@ -6684,6 +6860,21 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
             dt->decode = DSML_DECODE_STRUCTURAL;
         }
 
+        if (dt->mode == DSML_TRACK_BETWEEN) {
+            /* every Qwen call has its own wrapper: another may follow */
+            while (dt->pos < raw_len && isspace((unsigned char)raw[dt->pos])) dt->pos++;
+            dt->decode = DSML_DECODE_OUTSIDE;
+            if (dt->pos >= raw_len ||
+                raw_partial_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_start)) return;
+            if (!raw_full_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_start)) {
+                dt->mode = DSML_TRACK_DONE;
+                return;
+            }
+            dt->pos += strlen(dt->syn->tool_calls_start);
+            dt->mode = DSML_TRACK_STRUCTURAL;
+            dt->decode = DSML_DECODE_STRUCTURAL;
+        }
+
         if (dt->mode == DSML_TRACK_STRING_BODY) {
             while (dt->pos < raw_len) {
                 if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->param_end)) {
@@ -6748,10 +6939,11 @@ structural:
             }
 
             if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_end)) {
-                dt->mode = DSML_TRACK_DONE;
                 dt->pos += strlen(dt->syn->tool_calls_end);
+                dt->calls_end = dt->pos;
+                dt->mode = DSML_TRACK_BETWEEN;
                 dt->decode = DSML_DECODE_OUTSIDE;
-                return;
+                break;
             }
             if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->invoke_end)) {
                 dt->pos += strlen(dt->syn->invoke_end);
@@ -6812,236 +7004,32 @@ static void observe_tool_markers(const dsml_decode_tracker *tracker,
         *orphan_end = true;
 }
 
-static size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
-                                               size_t raw_len, const char *param_end,
-                                               bool is_string) {
-    size_t limit = raw_len;
-    size_t end_len = strlen(param_end);
-    size_t scan = raw_len > start + end_len ? raw_len - end_len : start;
-    for (size_t i = raw_len; i > scan; i--) {
-        if (raw[i - 1] != '<') continue;
-        size_t marker = i - 1;
-        size_t tail = raw_len - marker;
-        if (tail < end_len && !memcmp(raw + marker, param_end, tail)) limit = marker;
-        break;
-    }
-    if (is_string) {
-        for (size_t i = limit; i > start; i--) {
-            if (raw[i - 1] != '&') continue;
-            if (ds4_tool_text_partial_escape(raw + i - 1, limit - i + 1, param_end))
-                limit = i - 1;
-            break;
-        }
-    }
-    return utf8_stream_safe_len(raw, start, limit, false);
+/* Streamable end of a string value: never part of </parameter>, of a
+ * tool-text escape, of a UTF-8 character, or a trailing newline. */
+static void live_tool_calls_start(openai_tool_stream *ts, size_t pos) {
+    dsml_decode_tracker_init(&ts->tracker);
+    ts->tracker.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    ts->tracker.pos = pos;
+    ts->done = pos;
 }
 
-static bool openai_tool_emit_args_fragment(int fd, const request *r, const char *id,
-                                           openai_tool_stream *ts,
-                                           const char *text, size_t len) {
-    return sse_chat_tool_call_args_delta_n(fd, r, id, ts->index, text, len);
-}
-
-static bool openai_tool_emit_string_value(int fd, const request *r, const char *id,
-                                          openai_tool_stream *ts,
-                                          const char *text, size_t len) {
-    if (len == 0) return true;
-    char *raw = xstrndup(text, len);
-    ds4_tool_text_unescape(raw, ts->param_end);
-    buf frag = {0};
-    json_escape_fragment_n(&frag, raw, strlen(raw));
-    bool ok = openai_tool_emit_args_fragment(fd, r, id, ts, frag.ptr ? frag.ptr : "", frag.len);
-    buf_free(&frag);
-    free(raw);
+/* Parse the calls closed since the last ones sent.  False when none closed,
+ * or when the block does not parse: the final parser then owns the turn. */
+static bool live_tool_calls_next(openai_tool_stream *ts, const char *raw,
+                                 size_t raw_len, const tool_schema_orders *orders,
+                                 tool_calls *calls) {
+    dsml_decode_tracker_update(&ts->tracker, raw, raw_len);
+    if (ts->tracker.calls_end <= ts->done) return false;
+    char *block = xstrndup(raw + ts->done, ts->tracker.calls_end - ts->done);
+    char *content = NULL, *reasoning = NULL;
+    bool ok = parse_qwen_generated_message_ex(block, false, &content, &reasoning,
+                                              calls, orders) && calls->len > 0;
+    free(block);
+    free(content);
+    free(reasoning);
+    ts->done = ts->tracker.calls_end;
+    if (!ok) tool_calls_free(calls);
     return ok;
-}
-
-static bool openai_tool_emit_param_prefix(int fd, const request *r, const char *id,
-                                          openai_tool_stream *ts,
-                                          const char *name, bool is_string) {
-    buf frag = {0};
-    if (ts->first_param) ts->first_param = false;
-    else buf_putc(&frag, ',');
-    json_escape(&frag, name ? name : "");
-    buf_putc(&frag, ':');
-    if (is_string) buf_putc(&frag, '"');
-    bool ok = openai_tool_emit_args_fragment(fd, r, id, ts, frag.ptr ? frag.ptr : "", frag.len);
-    buf_free(&frag);
-    return ok;
-}
-
-static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
-                                    size_t raw_len, size_t pos) {
-    openai_tool_stream_free(ts);
-    memset(ts, 0, sizeof(*ts));
-    ts->active = true;
-    ts->state = DSML_TOOL_BETWEEN_INVOKES;
-    ts->parse_pos = pos;
-    if (!raw_full_lit(raw, raw_len, pos, qwen_tool_syntax.tool_calls_start)) {
-        ts->active = false;
-        ts->state = DSML_TOOL_ERROR;
-        return false;
-    }
-    ts->parse_pos += strlen(qwen_tool_syntax.tool_calls_start);
-    ts->tool_calls_end = qwen_tool_syntax.tool_calls_end;
-    ts->invoke_start = qwen_tool_syntax.invoke_start;
-    ts->invoke_end = qwen_tool_syntax.invoke_end;
-    ts->param_start = qwen_tool_syntax.param_start;
-    ts->param_end = qwen_tool_syntax.param_end;
-    return true;
-}
-
-static bool openai_tool_stream_fail(openai_tool_stream *ts) {
-    ts->active = false;
-    ts->state = DSML_TOOL_ERROR;
-    return true;
-}
-
-static bool openai_tool_start_invoke(int fd, server *s, const request *r, const char *id,
-                                     openai_tool_stream *ts,
-                                     const char *raw, size_t raw_len) {
-    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
-    if (!tag_end) return true;
-    const char *name_start = raw + ts->parse_pos + strlen(ts->invoke_start);
-    const char *name_end = tag_end;
-    trim_const_span(&name_start, &name_end);
-    if (name_end <= name_start) return openai_tool_stream_fail(ts);
-    char *name = xstrndup(name_start, (size_t)(name_end - name_start));
-    free(ts->tool_name);
-    ts->tool_name = xstrdup(name);
-
-    const char *tool_id = openai_tool_stream_id(s, ts, ts->index);
-    bool ok = sse_chat_tool_call_start_delta(fd, r, id, ts->index, tool_id, name) &&
-              openai_tool_emit_args_fragment(fd, r, id, ts, "{", 1);
-    free(name);
-    if (!ok) return false;
-
-    ts->emitted_any = true;
-    ts->args_open = true;
-    ts->first_param = true;
-    ts->parse_pos = (size_t)(tag_end - raw) + 1;
-    ts->state = DSML_TOOL_BETWEEN_PARAMS;
-    return true;
-}
-
-static bool openai_tool_start_param(int fd, const request *r, const char *id,
-                                    openai_tool_stream *ts,
-                                    const char *raw, size_t raw_len) {
-    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
-    if (!tag_end) return true;
-    const char *name_start = raw + ts->parse_pos + strlen(ts->param_start);
-    const char *name_end = tag_end;
-    trim_const_span(&name_start, &name_end);
-    if (name_end <= name_start) return openai_tool_stream_fail(ts);
-    char *name = xstrndup(name_start, (size_t)(name_end - name_start));
-    bool string_value = qwen_param_declared_string(&r->tool_orders,
-                                                   ts->tool_name, name);
-    bool ok = openai_tool_emit_param_prefix(fd, r, id, ts, name, string_value);
-    free(name);
-    if (!ok) return false;
-
-    ts->param_is_string = string_value;
-    ts->parse_pos = (size_t)(tag_end - raw) + 1;
-    ts->state = DSML_TOOL_PARAM_VALUE;
-    return true;
-}
-
-static bool openai_tool_finish_param(int fd, const request *r, const char *id,
-                                     openai_tool_stream *ts,
-                                     const char *raw, size_t value_end) {
-    const size_t close_pos = value_end;
-    while (value_end > ts->parse_pos &&
-           (raw[value_end - 1] == '\n' || raw[value_end - 1] == '\r')) value_end--;
-    if (value_end > ts->parse_pos) {
-        bool ok = ts->param_is_string ?
-            openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,
-                                          value_end - ts->parse_pos) :
-            openai_tool_emit_args_fragment(fd, r, id, ts, raw + ts->parse_pos,
-                                           value_end - ts->parse_pos);
-        if (!ok) return false;
-    }
-    if (ts->param_is_string &&
-        !openai_tool_emit_args_fragment(fd, r, id, ts, "\"", 1)) return false;
-    ts->parse_pos = close_pos + strlen(ts->param_end);
-    ts->state = DSML_TOOL_BETWEEN_PARAMS;
-    return true;
-}
-
-static bool openai_tool_stream_update(int fd, server *s, const request *r, const char *id,
-                                      openai_tool_stream *ts,
-                                      const char *raw, size_t raw_len) {
-    while (ts->active && ts->parse_pos < raw_len) {
-        if (ts->state == DSML_TOOL_BETWEEN_INVOKES) {
-            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
-            if (ts->parse_pos >= raw_len) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->tool_calls_end)) {
-                ts->parse_pos += strlen(ts->tool_calls_end);
-                ts->active = false;
-                ts->state = DSML_TOOL_DONE;
-                return true;
-            }
-            if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->tool_calls_end, ts->invoke_start)) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_start)) {
-                size_t before_pos = ts->parse_pos;
-                dsml_tool_stream_state before_state = ts->state;
-                if (!openai_tool_start_invoke(fd, s, r, id, ts, raw, raw_len)) return false;
-                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
-                continue;
-            }
-            return openai_tool_stream_fail(ts);
-        }
-
-        if (ts->state == DSML_TOOL_BETWEEN_PARAMS) {
-            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
-            if (ts->parse_pos >= raw_len) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_end)) {
-                if (ts->args_open &&
-                    !openai_tool_emit_args_fragment(fd, r, id, ts, "}", 1)) return false;
-                ts->args_open = false;
-                ts->parse_pos += strlen(ts->invoke_end);
-                ts->index++;
-                ts->state = DSML_TOOL_BETWEEN_INVOKES;
-                continue;
-            }
-            if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->invoke_end, ts->param_start)) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->param_start)) {
-                size_t before_pos = ts->parse_pos;
-                dsml_tool_stream_state before_state = ts->state;
-                if (!openai_tool_start_param(fd, r, id, ts, raw, raw_len)) return false;
-                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
-                continue;
-            }
-            return openai_tool_stream_fail(ts);
-        }
-
-        if (ts->state == DSML_TOOL_PARAM_VALUE) {
-            if (ts->parse_pos < raw_len && raw[ts->parse_pos] == '\n') ts->parse_pos++;
-            const char *end = find_lit_bounded(raw + ts->parse_pos,
-                                               raw_len - ts->parse_pos,
-                                               ts->param_end);
-            if (end) {
-                if (!openai_tool_finish_param(fd, r, id, ts, raw,
-                                              (size_t)(end - raw))) return false;
-                continue;
-            }
-            size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
-                                                            raw_len, ts->param_end,
-                                                            ts->param_is_string);
-            if (limit > ts->parse_pos) {
-                bool ok = ts->param_is_string ?
-                    openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,
-                                                  limit - ts->parse_pos) :
-                    openai_tool_emit_args_fragment(fd, r, id, ts, raw + ts->parse_pos,
-                                                   limit - ts->parse_pos);
-                if (!ok) return false;
-                ts->parse_pos = limit;
-            }
-            return true;
-        }
-
-        return true;
-    }
-    return true;
 }
 
 static bool openai_sse_stream_update(int fd, server *s, const request *r, const char *id,
@@ -7125,19 +7113,29 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
 
         if (tool) {
             st->emit_pos = (size_t)(tool - raw);
-            if (openai_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
-                st->mode = OPENAI_STREAM_TOOL;
-            } else {
-                st->mode = OPENAI_STREAM_SUPPRESS;
-            }
+            live_tool_calls_start(&st->tool, st->emit_pos);
+            st->mode = OPENAI_STREAM_TOOL;
         } else if (final) {
             st->mode = OPENAI_STREAM_SUPPRESS;
         }
     }
 
     if (st->mode == OPENAI_STREAM_TOOL) {
-        if (!openai_tool_stream_update(fd, s, r, id, &st->tool, raw, raw_len)) return false;
-        if (!st->tool.active) st->mode = OPENAI_STREAM_SUPPRESS;
+        tool_calls calls = {0};
+        bool ok = true;
+        if (live_tool_calls_next(&st->tool, raw, raw_len, &r->tool_orders, &calls)) {
+            for (int i = 0; ok && i < calls.len; i++, st->tool.index++) {
+                const int index = st->tool.index;
+                buf args = {0};
+                append_json_object_or_empty(&args, calls.v[i].arguments);
+                ok = sse_chat_tool_call_start_delta(fd, r, id, index,
+                         openai_tool_stream_id(s, &st->tool, index), calls.v[i].name) &&
+                     sse_chat_tool_call_args_delta_n(fd, r, id, index, args.ptr, args.len);
+                buf_free(&args);
+            }
+        }
+        tool_calls_free(&calls);
+        if (!ok) return false;
     }
     return true;
 }
@@ -7149,13 +7147,18 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
                                    int completion_tokens) {
     if (!openai_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
 
+    if (st->late_content && st->late_content[0] &&
+        !sse_chat_delta_n(fd, r, id, "content", st->late_content,
+                          strlen(st->late_content))) return false;
     buf b = {0};
     long now = (long)time(NULL);
-    if (calls && calls->len && !st->tool.emitted_any) {
+    /* send only the calls the live stream did not */
+    int emitted = !calls ? 0 : st->tool.index < calls->len ? st->tool.index : calls->len;
+    if (calls && calls->len > emitted) {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
-        append_tool_call_deltas_json(&b, calls, id, &r->tool_orders);
+        append_tool_call_deltas_json(&b, calls, emitted, id, &r->tool_orders);
         buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     }
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
@@ -7235,6 +7238,7 @@ typedef struct {
     int message_index;     /* output_index of the assistant message item */
     int next_output_index; /* monotonic counter for upcoming output items */
     int sequence;          /* monotonic per-event sequence_number Codex consumes */
+    const char *late_content;   /* answer the stream sent only as reasoning (#1088) */
 } responses_stream;
 
 static void responses_stream_init(const request *r, responses_stream *st) {
@@ -7688,7 +7692,7 @@ static bool responses_sse_completed(int fd, const request *r,
         buf_puts(&b, ",\"error\":{\"code\":\"server_error\","
                      "\"message\":\"generation failed\"}");
     } else if (!strcmp(event_type, "response.incomplete")) {
-        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_tokens\"}");
+        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}");
     }
     const char *item_status = responses_item_status_for_finish(finish);
     buf_puts(&b, ",\"output\":[");
@@ -7893,9 +7897,17 @@ static bool responses_sse_finish_live(int fd, const request *r,
      * response. We use the stream cursor instead of comparing against
      * recovered_content because the raw text can begin with `<think>...</think>`
      * which the streaming side consumed as reasoning, not message text. */
+    const char *tail = NULL;
+    size_t tail_len = 0;
     if (recovered_content && raw && st->emit_pos < raw_len) {
-        const char *tail = raw + st->emit_pos;
-        size_t tail_len = raw_len - st->emit_pos;
+        tail = raw + st->emit_pos;
+        tail_len = raw_len - st->emit_pos;
+        st->emit_pos = raw_len;
+    } else if (st->late_content && st->late_content[0]) {
+        tail = st->late_content;
+        tail_len = strlen(tail);
+    }
+    if (tail) {
         if (!st->message_item_opened) {
             st->message_index = st->next_output_index++;
             if (!responses_sse_message_added(fd, st)) return false;
@@ -7908,7 +7920,6 @@ static bool responses_sse_finish_live(int fd, const request *r,
         if (!responses_sse_output_text_delta(fd, st, tail, tail_len)) return false;
         buf_append(&st->message_text, tail, tail_len);
         st->message_emitted_any = true;
-        st->emit_pos = raw_len;
     }
     if (st->message_item_opened && !st->message_item_closed) {
         if (!responses_sse_message_done(fd, st, finish)) return false;
@@ -7962,7 +7973,7 @@ static bool responses_final_response(int fd, bool enable_cors,
         buf_puts(&b, ",\"error\":{\"code\":\"server_error\","
                      "\"message\":\"generation failed\"}");
     } else if (finish && !strcmp(finish, "length")) {
-        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_tokens\"}");
+        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}");
     }
     buf_puts(&b, ",\"output\":[");
     bool wrote = false;
@@ -8047,10 +8058,20 @@ static bool final_response(int fd, bool enable_cors,
     return ok;
 }
 
-static const char *anthropic_stop_reason(const char *finish) {
+static const char *anthropic_stop_reason(const request *r, const char *finish) {
     if (finish && !strcmp(finish, "tool_calls")) return "tool_use";
     if (finish && !strcmp(finish, "length")) return "max_tokens";
+    if (r && r->stop_sequence) return "stop_sequence";
     return "end_turn";
+}
+
+/* set only with stop_reason "stop_sequence": a matched stop after a tool call
+ * still reports tool_use */
+static void append_anthropic_stop_sequence(buf *b, const request *r, const char *finish) {
+    if (!strcmp(anthropic_stop_reason(r, finish), "stop_sequence"))
+        json_escape(b, r->stop_sequence);
+    else
+        buf_puts(b, "null");
 }
 
 static void append_anthropic_tool_use(buf *b, const tool_call *tc, const char *id_prefix, int i,
@@ -8132,8 +8153,10 @@ static bool anthropic_final_response(int fd, bool enable_cors,
     buf_puts(&b, ",\"content\":");
     append_anthropic_content(&b, text, reasoning, calls, id, &r->tool_orders);
     buf_puts(&b, ",\"stop_reason\":");
-    json_escape(&b, anthropic_stop_reason(finish));
-    buf_puts(&b, ",\"stop_sequence\":null,\"usage\":");
+    json_escape(&b, anthropic_stop_reason(r, finish));
+    buf_puts(&b, ",\"stop_sequence\":");
+    append_anthropic_stop_sequence(&b, r, finish);
+    buf_puts(&b, ",\"usage\":");
     append_anthropic_usage_json(&b, r, prompt_tokens, completion_tokens);
     buf_puts(&b, "}\n");
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
@@ -8167,24 +8190,9 @@ typedef enum {
     ANTH_BLOCK_TOOL,
 } anthropic_block_type;
 
-typedef struct {
-    dsml_tool_stream_state state;
-    const dsml_syntax *syn;
-    size_t parse_pos;
-    int index;
-    bool active;
-    bool emitted_any;
-    bool args_open;
-    bool first_param;
-    bool param_is_string;
-    char *tool_name;
-    char **ids;
-    int ids_cap;
-} anthropic_tool_stream;
-
 /* Anthropic streaming uses the same sampled DSML bytes that will later be
  * parsed and remembered for exact continuation.  This state is only a wire
- * projection: it turns an in-progress DSML block into content_block/tool_use
+ * projection: it turns each closed tool call into content_block/tool_use
  * SSE events, and never rewrites the model-visible transcript or cache key. */
 typedef struct {
     anthropic_stream_mode mode;
@@ -8195,6 +8203,7 @@ typedef struct {
     bool checked_think_prefix;
     bool sent_thinking;
     bool sent_text;
+    const char *late_content;   /* answer the stream sent only as thinking (#1088) */
     anthropic_tool_stream tool;
 } anthropic_stream;
 
@@ -8225,9 +8234,7 @@ static void anthropic_tool_stream_free(anthropic_tool_stream *ts) {
     if (!ts) return;
     for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
     free(ts->ids);
-    free(ts->tool_name);
     ts->ids = NULL;
-    ts->tool_name = NULL;
     ts->ids_cap = 0;
 }
 
@@ -8269,9 +8276,8 @@ static const char *anthropic_tool_stream_id(server *s, anthropic_tool_stream *ts
     return ts->ids[index];
 }
 
-/* Text and thinking blocks have fixed JSON shapes.  Tool blocks are opened by
- * name later, after the DSML invoke tag is complete, so they use a dedicated
- * opener instead of this helper. */
+/* Text and thinking blocks have fixed JSON shapes.  Tool blocks need the
+ * call's id and name, so they use a dedicated opener instead of this helper. */
 static bool anthropic_sse_open_block(int fd, anthropic_stream *st,
                                      anthropic_block_type type) {
     if (st->open_block == type) return true;
@@ -8342,10 +8348,8 @@ static bool anthropic_sse_delta_live(int fd, const anthropic_stream *st,
     return ok;
 }
 
-/* Anthropic's input_json_delta carries a fragment of a JSON object, encoded as
- * a JSON string.  We stream exactly the same object that the final DSML parser
- * will build: an opening "{", quoted keys, raw JSON values or escaped string
- * contents, and the closing "}". */
+/* Anthropic's input_json_delta carries JSON object text, encoded as a JSON
+ * string; a live tool block sends the final parser's whole object at once. */
 static bool anthropic_sse_tool_delta_live(int fd, const anthropic_stream *st,
                                           const char *text, size_t len) {
     if (len == 0) return true;
@@ -8388,226 +8392,6 @@ static bool anthropic_sse_close_block_live(int fd, const char *id,
         st->next_index++;
     }
     return ok;
-}
-
-static bool anthropic_tool_emit_args_fragment(int fd, anthropic_stream *st,
-                                              const char *text, size_t len) {
-    return anthropic_sse_tool_delta_live(fd, st, text, len);
-}
-
-static bool anthropic_tool_emit_string_value(int fd, anthropic_stream *st,
-                                             const char *text, size_t len) {
-    if (len == 0) return true;
-    char *raw = xstrndup(text, len);
-    ds4_tool_text_unescape(raw, st->tool.syn->param_end);
-    buf frag = {0};
-    json_escape_fragment_n(&frag, raw, strlen(raw));
-    bool ok = anthropic_tool_emit_args_fragment(fd, st,
-                                                frag.ptr ? frag.ptr : "",
-                                                frag.len);
-    buf_free(&frag);
-    free(raw);
-    return ok;
-}
-
-static bool anthropic_tool_emit_param_prefix(int fd, anthropic_stream *st,
-                                             const char *name, bool is_string) {
-    anthropic_tool_stream *ts = &st->tool;
-    buf frag = {0};
-    if (ts->first_param) ts->first_param = false;
-    else buf_putc(&frag, ',');
-    json_escape(&frag, name ? name : "");
-    buf_putc(&frag, ':');
-    if (is_string) buf_putc(&frag, '"');
-    bool ok = anthropic_tool_emit_args_fragment(fd, st,
-                                                frag.ptr ? frag.ptr : "",
-                                                frag.len);
-    buf_free(&frag);
-    return ok;
-}
-
-/* The parser below mirrors the OpenAI tool-delta parser but keeps Anthropic's
- * content-block lifecycle local.  A callback abstraction would save lines, but
- * it would hide the different block/stop semantics that make this code easy to
- * audit when a client reports a streaming regression. */
-static bool anthropic_tool_stream_init(anthropic_tool_stream *ts,
-                                       const char *raw, size_t raw_len,
-                                       size_t pos) {
-    anthropic_tool_stream_free(ts);
-    memset(ts, 0, sizeof(*ts));
-    ts->active = true;
-    ts->state = DSML_TOOL_BETWEEN_INVOKES;
-    ts->syn = &qwen_tool_syntax;
-    if (!raw_full_lit(raw, raw_len, pos, ts->syn->tool_calls_start)) {
-        ts->active = false;
-        ts->state = DSML_TOOL_ERROR;
-        return false;
-    }
-    ts->parse_pos = pos + strlen(ts->syn->tool_calls_start);
-    return true;
-}
-
-static bool anthropic_tool_stream_fail(anthropic_tool_stream *ts) {
-    ts->active = false;
-    ts->state = DSML_TOOL_ERROR;
-    return true;
-}
-
-static bool anthropic_tool_start_invoke(int fd, server *s, anthropic_stream *st,
-                                        const char *raw, size_t raw_len) {
-    anthropic_tool_stream *ts = &st->tool;
-    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
-    if (!tag_end) return true;
-    const char *name_start = raw + ts->parse_pos + strlen(ts->syn->invoke_start);
-    const char *name_end = tag_end;
-    trim_const_span(&name_start, &name_end);
-    if (name_end <= name_start) return anthropic_tool_stream_fail(ts);
-    char *name = xstrndup(name_start, (size_t)(name_end - name_start));
-    free(ts->tool_name);
-    ts->tool_name = xstrdup(name);
-
-    /* This id is already visible to the client.  After final parsing,
-     * apply_anthropic_stream_tool_ids() copies it into the parsed tool_call
-     * before tool_memory_remember(), so the next tool_result can continue from
-     * the live KV state instead of re-rendering canonical JSON. */
-    const char *tool_id = anthropic_tool_stream_id(s, ts, ts->index);
-    bool ok = anthropic_sse_open_tool_block(fd, st, tool_id, name) &&
-              anthropic_tool_emit_args_fragment(fd, st, "{", 1);
-    free(name);
-    if (!ok) return false;
-
-    ts->emitted_any = true;
-    ts->args_open = true;
-    ts->first_param = true;
-    ts->parse_pos = (size_t)(tag_end - raw) + 1;
-    ts->state = DSML_TOOL_BETWEEN_PARAMS;
-    return true;
-}
-
-static bool anthropic_tool_start_param(int fd, const request *r,
-                                       anthropic_stream *st,
-                                       const char *raw, size_t raw_len) {
-    anthropic_tool_stream *ts = &st->tool;
-    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
-    if (!tag_end) return true;
-    const char *name_start = raw + ts->parse_pos + strlen(ts->syn->param_start);
-    const char *name_end = tag_end;
-    trim_const_span(&name_start, &name_end);
-    if (name_end <= name_start) return anthropic_tool_stream_fail(ts);
-    char *name = xstrndup(name_start, (size_t)(name_end - name_start));
-    bool string_value = qwen_param_declared_string(&r->tool_orders,
-                                                   ts->tool_name, name);
-    bool ok = anthropic_tool_emit_param_prefix(fd, st, name, string_value);
-    free(name);
-    if (!ok) return false;
-
-    ts->param_is_string = string_value;
-    ts->parse_pos = (size_t)(tag_end - raw) + 1;
-    ts->state = DSML_TOOL_PARAM_VALUE;
-    return true;
-}
-
-static bool anthropic_tool_finish_param(int fd, anthropic_stream *st,
-                                        const char *raw, size_t value_end) {
-    anthropic_tool_stream *ts = &st->tool;
-    const size_t close_pos = value_end;
-    while (value_end > ts->parse_pos &&
-           (raw[value_end - 1] == '\n' || raw[value_end - 1] == '\r')) value_end--;
-    if (value_end > ts->parse_pos) {
-        bool ok = ts->param_is_string ?
-            anthropic_tool_emit_string_value(fd, st, raw + ts->parse_pos,
-                                             value_end - ts->parse_pos) :
-            anthropic_tool_emit_args_fragment(fd, st, raw + ts->parse_pos,
-                                              value_end - ts->parse_pos);
-        if (!ok) return false;
-    }
-    if (ts->param_is_string &&
-        !anthropic_tool_emit_args_fragment(fd, st, "\"", 1)) return false;
-    ts->parse_pos = close_pos + strlen(ts->syn->param_end);
-    ts->state = DSML_TOOL_BETWEEN_PARAMS;
-    return true;
-}
-
-static bool anthropic_tool_stream_update(int fd, server *s, const request *r,
-                                         const char *id, anthropic_stream *st,
-                                         const char *raw, size_t raw_len) {
-    anthropic_tool_stream *ts = &st->tool;
-    while (ts->active && ts->parse_pos < raw_len) {
-        if (ts->state == DSML_TOOL_BETWEEN_INVOKES) {
-            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
-            if (ts->parse_pos >= raw_len) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->tool_calls_end)) {
-                ts->parse_pos += strlen(ts->syn->tool_calls_end);
-                ts->active = false;
-                ts->state = DSML_TOOL_DONE;
-                return true;
-            }
-            if (raw_partial_any(raw, raw_len, ts->parse_pos,
-                                ts->syn->tool_calls_end, ts->syn->invoke_start)) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->invoke_start)) {
-                size_t before_pos = ts->parse_pos;
-                dsml_tool_stream_state before_state = ts->state;
-                if (!anthropic_tool_start_invoke(fd, s, st, raw, raw_len)) return false;
-                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
-                continue;
-            }
-            return anthropic_tool_stream_fail(ts);
-        }
-
-        if (ts->state == DSML_TOOL_BETWEEN_PARAMS) {
-            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
-            if (ts->parse_pos >= raw_len) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->invoke_end)) {
-                if (ts->args_open &&
-                    !anthropic_tool_emit_args_fragment(fd, st, "}", 1)) return false;
-                ts->args_open = false;
-                if (!anthropic_sse_close_block_live(fd, id, st)) return false;
-                ts->parse_pos += strlen(ts->syn->invoke_end);
-                ts->index++;
-                ts->state = DSML_TOOL_BETWEEN_INVOKES;
-                continue;
-            }
-            if (raw_partial_any(raw, raw_len, ts->parse_pos,
-                                ts->syn->invoke_end, ts->syn->param_start)) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->param_start)) {
-                size_t before_pos = ts->parse_pos;
-                dsml_tool_stream_state before_state = ts->state;
-                if (!anthropic_tool_start_param(fd, r, st, raw, raw_len)) return false;
-                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
-                continue;
-            }
-            return anthropic_tool_stream_fail(ts);
-        }
-
-        if (ts->state == DSML_TOOL_PARAM_VALUE) {
-            if (ts->parse_pos < raw_len && raw[ts->parse_pos] == '\n') ts->parse_pos++;
-            const char *end = find_lit_bounded(raw + ts->parse_pos,
-                                               raw_len - ts->parse_pos,
-                                               ts->syn->param_end);
-            if (end) {
-                if (!anthropic_tool_finish_param(fd, st, raw,
-                                                 (size_t)(end - raw))) return false;
-                continue;
-            }
-            size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
-                                                            raw_len,
-                                                            ts->syn->param_end,
-                                                            ts->param_is_string);
-            if (limit > ts->parse_pos) {
-                bool ok = ts->param_is_string ?
-                    anthropic_tool_emit_string_value(fd, st, raw + ts->parse_pos,
-                                                     limit - ts->parse_pos) :
-                    anthropic_tool_emit_args_fragment(fd, st, raw + ts->parse_pos,
-                                                      limit - ts->parse_pos);
-                if (!ok) return false;
-                ts->parse_pos = limit;
-            }
-            return true;
-        }
-
-        return true;
-    }
-    return true;
 }
 
 static size_t text_stream_safe_limit(const char *raw, size_t start,
@@ -8743,8 +8527,8 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
              * live tool_use projection as soon as the DSML block starts.  On
              * final catch-up from plain text, leave the block for the existing
              * final emitter so old non-incremental behavior stays unchanged. */
-            if (!final &&
-                anthropic_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
+            if (!final) {
+                live_tool_calls_start(&st->tool, st->emit_pos);
                 st->mode = ANTH_STREAM_TOOL;
             } else {
                 st->mode = ANTH_STREAM_SUPPRESS;
@@ -8756,8 +8540,22 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
     }
 
     if (st->mode == ANTH_STREAM_TOOL) {
-        if (!anthropic_tool_stream_update(fd, s, r, id, st, raw, raw_len)) return false;
-        if (!st->tool.active) st->mode = ANTH_STREAM_SUPPRESS;
+        tool_calls calls = {0};
+        bool ok = true;
+        if (live_tool_calls_next(&st->tool, raw, raw_len, &r->tool_orders, &calls)) {
+            for (int i = 0; ok && i < calls.len; i++, st->tool.index++) {
+                buf args = {0};
+                append_json_object_or_empty(&args, calls.v[i].arguments);
+                ok = anthropic_sse_open_tool_block(fd, st,
+                         anthropic_tool_stream_id(s, &st->tool, st->tool.index),
+                         calls.v[i].name) &&
+                     anthropic_sse_tool_delta_live(fd, st, args.ptr, args.len) &&
+                     anthropic_sse_close_block_live(fd, id, st);
+                buf_free(&args);
+            }
+        }
+        tool_calls_free(&calls);
+        if (!ok) return false;
     }
     return true;
 }
@@ -8769,11 +8567,10 @@ static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char 
     if (!calls) return true;
 
     buf b = {0};
-    /* Tool calls completed by anthropic_tool_stream_update() have already
-     * produced start/delta/stop events.  Only emit the tail calls that were not
-     * seen by the live projection, for example if the first DSML bytes only
-     * become available during final flush. */
-    int already_streamed = st->tool.emitted_any ? st->tool.index : 0;
+    /* Calls the live projection sent whole already have their blocks; emit
+     * the rest, for example when the first tool bytes arrive at the final
+     * flush. */
+    int already_streamed = st->tool.index;
     if (already_streamed > calls->len) already_streamed = calls->len;
     for (int i = already_streamed; i < calls->len; i++, st->next_index++) {
         const tool_call *tc = &calls->v[i];
@@ -8810,12 +8607,14 @@ static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char 
     return true;
 }
 
-static bool anthropic_sse_stop_live(int fd, const char *finish,
+static bool anthropic_sse_stop_live(int fd, const request *r, const char *finish,
                                     int completion_tokens) {
     buf b = {0};
     buf_puts(&b, "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":");
-    json_escape(&b, anthropic_stop_reason(finish));
-    buf_puts(&b, ",\"stop_sequence\":null},\"usage\":{\"output_tokens\":");
+    json_escape(&b, anthropic_stop_reason(r, finish));
+    buf_puts(&b, ",\"stop_sequence\":");
+    append_anthropic_stop_sequence(&b, r, finish);
+    buf_puts(&b, "},\"usage\":{\"output_tokens\":");
     buf_printf(&b, "%d}}", completion_tokens);
     bool ok = sse_event(fd, "message_delta", b.ptr);
     buf_free(&b);
@@ -8831,11 +8630,14 @@ static bool anthropic_sse_finish_live(int fd, server *s, const request *r, const
 
     if (st->sent_thinking && !st->sent_text && (!calls || calls->len == 0)) {
         if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
+        if (st->late_content &&
+            !anthropic_sse_delta_live(fd, st, ANTH_BLOCK_TEXT, st->late_content,
+                                      strlen(st->late_content))) return false;
         if (!anthropic_sse_close_block_live(fd, id, st)) return false;
     }
 
     if (!anthropic_sse_tool_blocks_live(fd, r, id, st, calls)) return false;
-    return anthropic_sse_stop_live(fd, finish, completion_tokens);
+    return anthropic_sse_stop_live(fd, r, finish, completion_tokens);
 }
 
 static double now_sec(void) {
@@ -8978,6 +8780,9 @@ typedef struct {
      * result for these ids is a direct protocol continuation and should not
      * trigger prompt-prefix matching or checkpoint canonicalization. */
     stop_list call_ids;
+    /* full_input_key of the request that generated this frontier; NULL when
+     * that request was results-only and proved no full-history parent. */
+    char *parent_key;
 } live_tool_state;
 
 typedef struct {
@@ -9437,6 +9242,8 @@ static void live_tool_state_clear_locked(live_tool_state *st) {
     free(st->visible_text);
     st->visible_text = NULL;
     st->visible_len = 0;
+    free(st->parent_key);
+    st->parent_key = NULL;
     memset(&st->images, 0, sizeof(st->images));
     st->valid = false;
     st->live_tokens = 0;
@@ -9509,6 +9316,8 @@ static void responses_live_remember(server *s, server_slot *slot,
     char *key = visible_key_text(s, req, visible_text, visible_trusted, &images);
     pthread_mutex_lock(&s->tool_mu);
     live_tool_state_clear_locked(&slot->responses_live);
+    slot->responses_live.parent_key =
+        req && req->full_input_key ? xstrdup(req->full_input_key) : NULL;
     slot->responses_live.visible_text = key;
     slot->responses_live.visible_len = key ? strlen(key) : 0;
     slot->responses_live.images = images;
@@ -9523,10 +9332,12 @@ static void responses_live_remember(server *s, server_slot *slot,
 }
 
 static void anthropic_live_remember(server *s, server_slot *slot,
-                                    const tool_calls *calls) {
+                                    const tool_calls *calls, const request *req) {
     if (!s || !slot || !calls || calls->len == 0) return;
     pthread_mutex_lock(&s->tool_mu);
     live_tool_state_clear_locked(&slot->anthropic_live);
+    slot->anthropic_live.parent_key =
+        req && req->full_input_key ? xstrdup(req->full_input_key) : NULL;
     for (int i = 0; i < calls->len; i++) {
         id_list_push_unique(&slot->anthropic_live.call_ids, calls->v[i].id);
     }
@@ -9614,6 +9425,18 @@ static bool anthropic_live_matches_request_locked(server_slot *slot,
         ok = id_list_contains(&slot->anthropic_live.call_ids, ids->v[i]);
     }
     return ok;
+}
+
+/* The tool-ID tier reuses a frontier by call id alone, so a full replay must
+ * reproduce the input that frontier was generated from.  A results-only
+ * request has no parent to compare; a frontier made from one remembers none,
+ * so a later full replay cannot borrow that exemption. */
+static bool live_tool_parent_matches(const live_tool_state *live,
+                                     const request *req) {
+    if (!live || !req) return false;
+    if (req->tool_delta_only) return true;
+    return live->parent_key && req->tool_parent_key &&
+           !strcmp(live->parent_key, req->tool_parent_key);
 }
 
 static bool tool_memory_has_id(server *s, const char *id) {
@@ -10161,9 +9984,11 @@ static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
 
 static int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
                                     const ds4_tokens *prompt,
+                                    int prefix_token_id,
                                     int user_token_id,
                                     int assistant_token_id) {
-    return ds4_kvstore_chat_anchor_pos(kc, prompt, user_token_id, assistant_token_id);
+    return ds4_kvstore_chat_anchor_pos(kc, prompt, prefix_token_id,
+                                       user_token_id, assistant_token_id);
 }
 
 
@@ -10569,11 +10394,29 @@ typedef struct {
     int matched_ids;    /* tool-output tiers: number of bound call ids */
 } slot_reuse;
 
+/* True for Responses/Anthropic requests that carry only tool outputs and can
+ * be served solely from the slot's live tool state. */
+static bool request_requires_live_tool_state(const request *req) {
+    if (!req) return false;
+    if (req->api == API_ANTHROPIC) return req->anthropic_requires_live_tool_state;
+    if (req->api == API_RESPONSES) return req->responses_requires_live_tool_state;
+    return false;
+}
+
 static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
                                           const request *req) {
     slot_reuse pr = { REUSE_NONE, 0, 0, 0 };
     if (!s || !slot || !slot->session || !req) return pr;
     if (!ds4_session_checkpoint_valid(slot->session)) return pr;
+    /* A Qwen rewind without a matching snapshot resets the recurrent graph
+     * while the token checkpoint stays valid: the next sync would rebuild the
+     * whole prefix while the server reports a hit.  Treat it as a miss so the
+     * disk cache can serve it.  A tool-output-only continuation has no other
+     * source (a miss is a 409); its sync replays the full checkpoint tokens,
+     * which is correct, only slower. */
+    if (!ds4_session_prefix_reusable(slot->session) &&
+        !request_requires_live_tool_state(req))
+        return pr;
     const ds4_tokens *live = ds4_session_tokens(slot->session);
     if (!live || live->len <= 0) return pr;
     const int live_pos = live->len;
@@ -10630,6 +10473,7 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
 
     if (req->api == API_RESPONSES && req->responses_live_suffix_text &&
         req->responses_live_call_ids.len > 0 &&
+        live_tool_parent_matches(&slot->responses_live, req) &&
         responses_live_matches_request_locked(slot,
                                               &req->responses_live_call_ids,
                                               live_pos))
@@ -10642,6 +10486,7 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
 
     if (req->api == API_ANTHROPIC && req->anthropic_live_suffix_text &&
         req->anthropic_live_call_ids.len > 0 &&
+        live_tool_parent_matches(&slot->anthropic_live, req) &&
         anthropic_live_matches_request_locked(slot,
                                               &req->anthropic_live_call_ids,
                                               live_pos))
@@ -10728,9 +10573,7 @@ static slot_reuse slot_probe_reuse(server *s, server_slot *slot,
  * context-free prompt built from the tool outputs alone. */
 static bool live_continuation_unavailable(const request *req, bool materialized) {
     if (!req || materialized) return false;
-    if (req->api == API_ANTHROPIC) return req->anthropic_requires_live_tool_state;
-    if (req->api == API_RESPONSES) return req->responses_requires_live_tool_state;
-    return false;
+    return request_requires_live_tool_state(req);
 }
 
 /* Refresh the cached rendered text of the slot's checkpoint.  Called by the
@@ -10775,6 +10618,7 @@ static void slot_refresh_live_text(server *s, server_slot *slot) {
 
 typedef struct {
     bool valid;
+    bool backend_stale;
     int old_pos;
     int prompt_len;
     int common;
@@ -10821,6 +10665,7 @@ static void trace_cache_capture(
 static const char *trace_cache_miss_reason(const trace_cache_diag *d) {
     if (!d || !d->valid) return "unknown";
     if (d->old_pos == 0) return "no-live-checkpoint";
+    if (d->backend_stale) return "backend-state-reset";
     if (d->rewind_to >= 0) return "live-prefix-rewind";
     if (d->common != d->old_pos) return "token-mismatch";
     if (d->prompt_len < d->old_pos) return "incoming-prompt-shorter-than-live-checkpoint";
@@ -10831,8 +10676,12 @@ static bool server_tracing(server *s) {
     return s && s->trace != NULL;
 }
 
+static ds4_engine *server_engine(const server *s) {
+    return s ? s->engine : NULL;
+}
+
 static bool trace_cache_memory_reusable(const trace_cache_diag *d) {
-    return d && d->valid &&
+    return d && d->valid && !d->backend_stale &&
            (d->rewind_to >= 0 ||
             (d->old_pos > 0 && d->common == d->old_pos &&
              d->prompt_len >= d->old_pos));
@@ -11096,6 +10945,11 @@ typedef struct {
     double t0;
     double last_t;
     int last_current;
+    int last_display_current;
+    /* Latched on the first chunk below the cached frontier: the backend is
+     * rebuilding the prefix, so every later chunk is shown against the full
+     * prompt. */
+    bool rebuilt;
     bool seen;
     /* SSE keepalive during long prefill: send HTTP/SSE headers ahead of
      * generation and emit a `:` comment line every few seconds so HTTP/TCP
@@ -11568,6 +11422,30 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
     buf_free(&names);
 }
 
+/* Map engine progress (absolute prompt positions) onto the range shown in the
+ * prefill log.  A chunk below `cached_tokens` means the backend is rebuilding
+ * a prefix the server counted as cached (a Qwen graph reset by a rewind):
+ * show that replay, and every later chunk, against the whole prompt instead
+ * of clamping it to 0 or collapsing to the cached suffix. */
+static void prefill_progress_display(server_prefill_progress *p,
+                                     int current, int total,
+                                     int *display_current,
+                                     int *display_total) {
+    int start = p->cached_tokens;
+    if (start < 0 || start > p->prompt_tokens) start = 0;
+    int span = p->prompt_tokens - start;
+    if (current < start) p->rebuilt = true;
+    if (p->rebuilt || span <= 0) {
+        start = 0;
+        span = p->prompt_tokens > total ? p->prompt_tokens : total;
+    }
+    int shown = current - start;
+    if (shown < 0) shown = 0;
+    if (shown > span) shown = span;
+    *display_current = shown;
+    *display_total = span;
+}
+
 static void server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = ud;
     if (!p || !event || job_cancelled(p->request_job)) return;
@@ -11604,22 +11482,15 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     }
     if (is_display) return;
     double elapsed = now - p->t0;
-    if (p->seen && current == p->last_current) {
+    int display_current = 0;
+    int display_total = 0;
+    prefill_progress_display(p, current, total, &display_current, &display_total);
+    if (p->seen && display_current == p->last_display_current) {
         if (p->srv && p->slot && current > p->cached_tokens) {
             kv_cache_maybe_store_continued(p->srv, p->slot);
         }
         return;
     }
-    int display_start = p->cached_tokens;
-    if (display_start < 0 || display_start > p->prompt_tokens) display_start = 0;
-    int display_total = p->prompt_tokens - display_start;
-    if (display_total <= 0) {
-        display_start = 0;
-        display_total = p->prompt_tokens > total ? p->prompt_tokens : total;
-    }
-    int display_current = current - display_start;
-    if (display_current < 0) display_current = 0;
-    if (display_current > display_total) display_current = display_total;
     double pct = display_total > 0 ? 100.0 * (double)display_current / (double)display_total : 100.0;
     double avg_tps = elapsed > 0.0 ? (double)display_current / elapsed : 0.0;
     int interval_tokens = p->seen ? current - p->last_current : 0;
@@ -11627,6 +11498,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     double interval_s = p->seen ? now - p->last_t : 0.0;
     double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
     p->last_current = current;
+    p->last_display_current = display_current;
     p->last_t = now;
     p->seen = true;
     char flags[64];
@@ -11771,9 +11643,10 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
 }
 
 /* Match clients that omit reasoning, while keeping the exact sampled KV.
- * Tool decoding stops at </tool_call>, but generate_job_inner() then evaluates
- * the turn's <|im_end|>, so the key includes it and the next suffix does not
- * evaluate a second one. */
+ * A tool turn ends after its last </tool_call> (at the sampled end token, which
+ * is not evaluated), and generate_job_inner() then evaluates the turn's
+ * <|im_end|>, so the key includes it and the next suffix does not evaluate a
+ * second one. */
 static char *build_qwen_tool_turn_visible_text(const request *r,
                                                const char *finish,
                                                bool inside_thinking,
@@ -11803,8 +11676,8 @@ static char *build_qwen_tool_turn_visible_text(const request *r,
 
 /* True when the turn that just finished is replayed by the client as a closed
  * assistant message, so its <|im_end|> belongs in the live KV.  A tool-call
- * turn stops at </tool_call> and never samples it; a stop-token turn sampled
- * it but never fed it back.  A client stop sequence, another stop token or an
+ * turn stops after its last </tool_call> without feeding an end token back; a
+ * stop-token turn sampled it but never fed it back.  A client stop sequence, another stop token or an
  * output/context limit closes nothing the client can replay. */
 static bool live_kv_turn_needs_end_token(const char *finish, int stop_token,
                                          int end_token) {
@@ -12299,6 +12172,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, ds4_session_tokens(slot->session),
                         &j->req.prompt, old_pos, common);
+    cache_diag.backend_stale = ds4_session_checkpoint_valid(slot->session) &&
+                               !ds4_session_prefix_reusable(slot->session);
     ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
     const bool responses_protocol = j->req.api == API_RESPONSES;
@@ -12608,9 +12483,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         s->kv.opt.cold_max_tokens > 0 &&
         prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
     {
+        int prefix, user, assistant;
+        ds4_chat_role_markers(s->engine, &prefix, &user, &assistant);
         const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
-                                                    ds4_token_user(s->engine),
-                                                    ds4_token_assistant(s->engine));
+                                                    prefix, user, assistant);
         cold_store_len = anchor >= s->kv.opt.min_tokens ?
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
     }
@@ -12814,6 +12690,7 @@ decode_again:
     bool saw_tool_end = false;
     bool saw_orphan_tool_end = false;
     bool client_stop = false;
+    j->req.stop_sequence = NULL;
     size_t tool_scan_from = 0;
     int next_tool_progress = 128;
     int next_decode_log = 50;
@@ -13117,7 +12994,13 @@ decode_again:
             }
 
             if (hit_stop) {
-                (void)stop_len;
+                for (int i = 0; i < j->req.stops.len; i++) {
+                    if (strlen(j->req.stops.v[i]) == stop_len &&
+                        !memcmp(text.ptr + stop_pos, j->req.stops.v[i], stop_len)) {
+                        j->req.stop_sequence = j->req.stops.v[i];
+                        break;
+                    }
+                }
                 finish = "stop";
                 stop_detail = "client stop sequence";
                 client_stop = true;
@@ -13166,13 +13049,32 @@ decode_again:
     }
     server_generation_leave(s);
 
+    /* Each Qwen call has its own wrapper, so decoding ran on past the last
+     * closed call.  Keep the closed calls and drop what followed (a cut-off
+     * call or text); the live KV holds those tokens, so the turn then gets no
+     * end token and no closed-turn key. */
+    bool calls_cut = false;
+    if (j->req.kind == REQ_CHAT && j->req.has_tools && dsml_tracker.calls_end &&
+        dsml_tracker.calls_end <= text.len && strcmp(finish, "error") != 0)
+    {
+        calls_cut = text.len > dsml_tracker.calls_end;
+        if (calls_cut)
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: chat ctx=%s %zu bytes after the last closed tool call dropped; no live frontier for this turn (finish=%s)",
+                       ctx_span, text.len - dsml_tracker.calls_end, finish);
+        text.len = dsml_tracker.calls_end;
+        text.ptr[text.len] = '\0';
+        saw_tool_end = true;
+        if (!client_stop) finish = "tool_calls";
+    }
+
     /* The client replays this turn closed by <|im_end|>.  Without that token in
      * the live KV the next request's exact token prefix diverges at the turn
      * boundary, and a visible key would have it skip the end token.  Evaluate
      * it now (one decode step); the keys below are published only after it
      * succeeded. */
     bool turn_end_committed = false;
-    if (j->req.kind == REQ_CHAT && !g_stop_requested && !job_cancelled(j) &&
+    if (j->req.kind == REQ_CHAT && !g_stop_requested && !job_cancelled(j) && !calls_cut &&
         live_kv_turn_needs_end_token(finish, stop_token, ds4_token_eos(s->engine)))
     {
         char end_err[160] = {0};
@@ -13250,9 +13152,17 @@ decode_again:
             snprintf(err, sizeof(err), "invalid tool call recovery failed: %s",
                      recovery_err[0] ? recovery_err : "unknown error");
         } else {
-            finish = "error";
-            snprintf(err, sizeof(err), "unterminated tool call (%s; token=%d, generated=%d, limit=%d)",
-                     stop_detail, stop_token, completion, max_tokens);
+            /* An opened, never-closed call is model output, not a server
+             * fault: leave finish alone so the parse-failure recovery below
+             * returns the raw text, as it does for any call it cannot run. */
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: chat ctx=%s%s%s unterminated tool call; deferring to parse-failure recovery (%s; token=%d, generated=%d, limit=%d)",
+                       ctx_span,
+                       req_flags[0] ? " " : "",
+                       req_flags,
+                       stop_detail, stop_token, completion, max_tokens);
+            trace_event(s, trace_id,
+                        "unterminated tool call; deferring to parse-failure recovery");
         }
     }
 
@@ -13307,6 +13217,16 @@ decode_again:
             &parsed_calls,
             &recovered_tool_parse_failure,
             &j->req.tool_orders);
+        if (parsed_ok &&
+            promote_unterminated_reasoning(text.ptr, ds4_think_mode_enabled(j->req.think_mode),
+                                           !client_stop && stop_token >= 0, &parsed_calls,
+                                           &parsed_content, &parsed_reasoning))
+        {
+            /* the live streams sent it as reasoning: their finish adds it */
+            openai_live.late_content = parsed_content;
+            responses_live.late_content = parsed_content;
+            anthropic_live.late_content = parsed_content;
+        }
         if (!parsed_ok && recovered_tool_parse_failure && j->req.has_tools && saw_tool_start) {
             /* parse_generated_message failed even though DSML was present.
              * Semantic repair is intentionally avoided: if the parser cannot
@@ -13463,7 +13383,7 @@ decode_again:
         if (frontier_ready && parsed_calls.len && strcmp(final_finish, "error") &&
             strcmp(final_finish, "length"))
         {
-            anthropic_live_remember(s, slot, &parsed_calls);
+            anthropic_live_remember(s, slot, &parsed_calls, &j->req);
         } else {
             anthropic_live_clear(s, slot);
         }
@@ -15222,8 +15142,8 @@ static void test_slot_probe_live_state_tiers(void) {
         request_free(&j.req);
     }
 
-    /* 2. responses-tool-output: the call-id frontier binds the request even
-     *    with no visible prefix at all. */
+    /* 2. responses-tool-output: a results-only continuation binds by call id
+     *    even with no visible prefix at all; replays: test_slot_probe_tool_parent_guard. */
     {
         server_slot slot = {0};
         slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
@@ -15232,6 +15152,7 @@ static void test_slot_probe_live_state_tiers(void) {
         id_list_push_unique(&slot.responses_live.call_ids, "call-abc");
         job j = {0};
         j.req.api = API_RESPONSES;
+        j.req.tool_delta_only = true;
         j.req.responses_live_suffix_text = xstrdup(" tool-out");
         id_list_push_unique(&j.req.responses_live_call_ids, "call-abc");
         ds4_tokens_push(&j.req.prompt, 999);
@@ -15252,7 +15173,7 @@ static void test_slot_probe_live_state_tiers(void) {
         request_free(&j.req);
     }
 
-    /* 3. anthropic-tool-output: same binding via tool_use_id. */
+    /* 3. anthropic-tool-output: same results-only binding via tool_use_id. */
     {
         server_slot slot = {0};
         slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
@@ -15261,6 +15182,7 @@ static void test_slot_probe_live_state_tiers(void) {
         id_list_push_unique(&slot.anthropic_live.call_ids, "toolu-1");
         job j = {0};
         j.req.api = API_ANTHROPIC;
+        j.req.tool_delta_only = true;
         j.req.anthropic_live_suffix_text = xstrdup(" result");
         id_list_push_unique(&j.req.anthropic_live_call_ids, "toolu-1");
         ds4_tokens_push(&j.req.prompt, 999);
@@ -16079,29 +16001,27 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
+    /* the call is sent whole once closed: the half-written arguments of the
+     * first update never reach the wire */
     const char *text = strstr(out, "\"text\":\"Before.\"");
     const char *tool = strstr(out, "\"type\":\"tool_use\"");
-    const char *key = strstr(out, "\\\"command\\\":\\\"");
-    const char *partial = strstr(out, "\"partial_json\":\"echo partial\"");
-    const char *rest = strstr(out, "\"partial_json\":\" done\"");
+    const char *input = strstr(out, "\"partial_json\":\"{\\\"command\\\":\\\"echo partial done\\\"}\"");
     const char *stop = strstr(out, "event: message_stop");
-    int tool_use_count = 0;
+    int tool_use_count = 0, partial_count = 0;
     for (const char *p = out; (p = strstr(p, "\"type\":\"tool_use\"")) != NULL; p++) {
         tool_use_count++;
     }
+    for (const char *p = out; (p = strstr(p, "echo partial")) != NULL; p++) partial_count++;
     TEST_ASSERT(text != NULL);
     TEST_ASSERT(tool != NULL);
-    TEST_ASSERT(key != NULL);
-    TEST_ASSERT(partial != NULL);
-    TEST_ASSERT(rest != NULL);
+    TEST_ASSERT(input != NULL);
     TEST_ASSERT(stop != NULL);
     TEST_ASSERT(strstr(out, calls.v[0].id) != NULL);
     TEST_ASSERT(text < tool);
-    TEST_ASSERT(tool < key);
-    TEST_ASSERT(key < partial);
-    TEST_ASSERT(partial < rest);
-    TEST_ASSERT(rest < stop);
+    TEST_ASSERT(tool < input);
+    TEST_ASSERT(input < stop);
     TEST_ASSERT(tool_use_count == 1);
+    TEST_ASSERT(partial_count == 1);
     TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
     TEST_ASSERT(strstr(out, "<parameter=") == NULL);
 
@@ -16113,6 +16033,69 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
+}
+
+/* #1161: a matched client stop sequence is reported, not end_turn. */
+static void test_anthropic_reports_client_stop_sequence(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.think_mode = DS4_THINK_NONE;
+    r.stop_sequence = "5";
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(anthropic_final_response(sv[0], false, &r, "msg_stop", "1, 2, 3, 4, ",
+                                         NULL, NULL, "stop", 10, 13));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"stop_reason\":\"stop_sequence\",\"stop_sequence\":\"5\"") != NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    anthropic_stream st;
+    const char *raw = "1, 2, 3, 4, ";
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_stop_stream", 10, &st));
+    TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_stop_stream", &st,
+                                          raw, strlen(raw), NULL, "stop", 13));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"delta\":{\"stop_reason\":\"stop_sequence\",\"stop_sequence\":\"5\"}") != NULL);
+    free(out);
+    anthropic_stream_free(&st);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* a stop matched after a tool call: tool_use, no stop_sequence */
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.id = xstrdup("toolu_1");
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{}");
+    tool_calls_push(&calls, tc);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(anthropic_final_response(sv[0], false, &r, "msg_tool", "",
+                                         NULL, &calls, "tool_calls", 10, 3));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"stop_reason\":\"tool_use\",\"stop_sequence\":null") != NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+    tool_calls_free(&calls);
+
+    r.stop_sequence = NULL;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(anthropic_final_response(sv[0], false, &r, "msg_end", "OK",
+                                         NULL, NULL, "stop", 10, 1));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"stop_reason\":\"end_turn\",\"stop_sequence\":null") != NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+    request_free(&r);
 }
 
 static void test_anthropic_usage_reports_cache_details(void) {
@@ -16332,6 +16315,39 @@ static void test_qwen_stream_split_reasoning_close(void) {
     }
 }
 
+/* #1162: a max_output_tokens cut names that field as the incomplete reason. */
+static void test_responses_incomplete_reports_max_output_tokens(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(responses_final_response(sv[0], false, &r, "resp_cut", "1, 2", NULL, NULL,
+                                         "length", 10, 3));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"status\":\"incomplete\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"incomplete_details\":{\"reason\":\"max_output_tokens\"}") != NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    responses_stream st;
+    responses_stream_init(&r, &st);
+    TEST_ASSERT(responses_sse_completed(sv[0], &r, &st, NULL, NULL,
+                                        "length", 10, 3, 1234));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"type\":\"response.incomplete\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"incomplete_details\":{\"reason\":\"max_output_tokens\"}") != NULL);
+    free(out);
+    responses_stream_free(&st);
+    close(sv[0]);
+    close(sv[1]);
+    request_free(&r);
+}
+
 static void test_responses_usage_reports_cache_details(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -16444,7 +16460,7 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     close(sv[1]);
 }
 
-static void test_openai_tool_stream_sends_partial_arguments(void) {
+static void test_openai_tool_stream_sends_closed_call_whole(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) return;
@@ -16491,21 +16507,20 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
 
     const char *text = strstr(out, "\"content\":\"Before.\"");
     const char *tool = strstr(out, "\"tool_calls\"");
-    const char *key = strstr(out, "\\\"command\\\":\\\"");
-    const char *partial = strstr(out, "\"arguments\":\"echo partial\"");
-    const char *rest = strstr(out, "\"arguments\":\" done\"");
-    int tool_id_count = 0;
+    /* the call is sent whole once closed: the half-written arguments of the
+     * first update never reach the wire */
+    const char *args = strstr(out, "\"arguments\":\"{\\\"command\\\":\\\"echo partial done\\\"}\"");
+    int tool_id_count = 0, partial_count = 0;
     for (const char *p = out; (p = strstr(p, "\"id\":\"call_")) != NULL; p++) tool_id_count++;
+    for (const char *p = out; (p = strstr(p, "echo partial")) != NULL; p++) partial_count++;
     TEST_ASSERT(text != NULL);
     TEST_ASSERT(tool != NULL);
-    TEST_ASSERT(key != NULL);
-    TEST_ASSERT(partial != NULL);
-    TEST_ASSERT(rest != NULL);
+    TEST_ASSERT(args != NULL);
     TEST_ASSERT(strstr(out, calls.v[0].id) != NULL);
     TEST_ASSERT(text < tool);
-    TEST_ASSERT(tool < partial);
-    TEST_ASSERT(partial < rest);
+    TEST_ASSERT(tool < args);
     TEST_ASSERT(tool_id_count == 1);
+    TEST_ASSERT(partial_count == 1);
     TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
     TEST_ASSERT(strstr(out, "<parameter=") == NULL);
 
@@ -16517,6 +16532,110 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
+}
+
+/* Concatenate the still-escaped "arguments" fragments of tool call `index`. */
+static char *test_sse_tool_args(const char *out, int index) {
+    buf args = {0};
+    char tag[64];
+    snprintf(tag, sizeof(tag), "\"tool_calls\":[{\"index\":%d,", index);
+    for (const char *p = out; (p = strstr(p, tag)) != NULL; p++) {
+        const char *a = strstr(p, "\"arguments\":\"");
+        const char *eol = strchr(p, '\n');
+        if (!a || (eol && a > eol)) continue;
+        for (a += 13; *a && *a != '"'; a++) {
+            if (*a == '\\' && a[1]) buf_putc(&args, *a++);
+            buf_putc(&args, *a);
+        }
+    }
+    return buf_take(&args);
+}
+
+/* #1140 + #1251, both live streams, byte by byte: each wrapped call is sent
+ * whole once closed (an interior newline intact, an untyped value quoted as
+ * the final parser does); a second call cut mid-way (max_tokens, a stop
+ * token) never reaches the wire, and the finish resends nothing. */
+static void test_qwen_tool_stream_two_calls(void) {
+    const char *raw =
+        "<tool_call>\n<function=bash>\n<parameter=command>\necho a\nb\n</parameter>\n"
+        "</function>\n</tool_call>\n<tool_call>\n<function=set>\n"
+        "<parameter=mode>\nauto\n</parameter>\n<parameter=count>\n3\n</parameter>\n"
+        "</function>\n</tool_call>";
+    const size_t first_end = strstr(raw, "</tool_call>") - raw + strlen("</tool_call>");
+    const size_t cut_at = strstr(raw, "auto") - raw + 2;
+    for (int anthropic = 0; anthropic < 2; anthropic++) {
+        for (int cut = 0; cut < 2; cut++) {
+            int sv[2];
+            TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+            int bufsz = 1 << 20;
+            setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
+            setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz));
+            request r;
+            request_init(&r, REQ_CHAT, 128);
+            r.api = anthropic ? API_ANTHROPIC : API_OPENAI;
+            r.stream = true;
+            r.think_mode = DS4_THINK_NONE;
+            r.has_tools = true;
+            r.tool_orders = make_bash_order();
+            tool_schema_orders_add_json(&r.tool_orders,
+                "{\"name\":\"set\",\"input_schema\":{\"type\":\"object\",\"properties\":{"
+                "\"mode\":{\"enum\":[\"auto\",\"off\"]},\"count\":{\"type\":\"integer\"}}}}");
+            openai_stream ost;
+            anthropic_stream ast;
+            openai_stream_start(&r, &ost);
+            if (anthropic) TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_two", 10, &ast));
+            const size_t len = cut ? cut_at : strlen(raw);
+            for (size_t n = 1; n <= len; n++) {
+                char *prefix = xstrndup(raw, n);   /* the decode buffer is NUL-terminated */
+                TEST_ASSERT(anthropic ?
+                    anthropic_sse_stream_update(sv[0], NULL, &r, "msg_two", &ast, prefix, n, false) :
+                    openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_two", &ost, prefix, n, false));
+                free(prefix);
+            }
+            /* generate_job_inner() cuts the text after the last closed call */
+            char *text = xstrndup(raw, cut ? first_end : len);
+            tool_calls calls = {0};
+            char *content = NULL, *reasoning = NULL;
+            TEST_ASSERT(parse_generated_message_ex(text, false, &content, &reasoning, &calls));
+            TEST_ASSERT(calls.len == (cut ? 1 : 2));
+            if (anthropic) {
+                apply_anthropic_stream_tool_ids(&calls, &ast);
+                TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_two", &ast, text,
+                                                      strlen(text), &calls, "tool_calls", 4));
+            } else {
+                apply_openai_stream_tool_ids(&calls, &ost);
+                TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_two", &ost, text,
+                                                   strlen(text), &calls, "tool_calls", 10, 4));
+            }
+            shutdown(sv[0], SHUT_WR);
+            char *out = read_socket_text(sv[1]);
+            int blocks = 0;
+            const char *tag = anthropic ? "\"type\":\"tool_use\"" : "\"id\":\"call_";
+            for (const char *p = out; (p = strstr(p, tag)) != NULL; p++) blocks++;
+            TEST_ASSERT(blocks == calls.len);
+            TEST_ASSERT(strstr(out, "echo a\\\\nb") != NULL);
+            TEST_ASSERT((strstr(out, "\\\"mode\\\":\\\"auto\\\"") != NULL) == !cut);
+            TEST_ASSERT(cut ? !strstr(out, "\\\"mode") : true);
+            if (!anthropic) {
+                char *a0 = test_sse_tool_args(out, 0);
+                char *a1 = test_sse_tool_args(out, 1);
+                TEST_ASSERT(!strcmp(a0, "{\\\"command\\\":\\\"echo a\\\\nb\\\"}"));
+                TEST_ASSERT(!strcmp(a1, cut ? "" : "{\\\"mode\\\":\\\"auto\\\",\\\"count\\\":3}"));
+                free(a0);
+                free(a1);
+            }
+            free(out);
+            free(text);
+            free(content);
+            free(reasoning);
+            tool_calls_free(&calls);
+            openai_stream_free(&ost);
+            if (anthropic) anthropic_stream_free(&ast);
+            request_free(&r);
+            close(sv[0]);
+            close(sv[1]);
+        }
+    }
 }
 
 static void test_streaming_holds_partial_utf8(void) {
@@ -16637,6 +16756,40 @@ static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(server_model_alias_known("qwen3.8-flash-next"));
     TEST_ASSERT(server_model_alias_known("qwen/qwen3.8-flash-next-chat"));
     TEST_ASSERT(!server_model_alias_known("other-model"));
+}
+
+/* #1131: integer seeds are read exactly, not through a double. */
+static void test_api_seed_parse(void) {
+    const struct {
+        const char *json;
+        uint64_t seed;
+    } cases[] = {
+        {"42", 42},
+        {" 7,", 7},
+        {"9007199254740993", UINT64_C(9007199254740993)},
+        {"9007199254740992", UINT64_C(9007199254740992)},
+        {"18446744073709551615", UINT64_MAX},
+        {"18446744073709551616", UINT64_MAX},
+        {"1e20", UINT64_MAX},
+        {"42.0", 42},
+        {"4.2e1", 42},
+        {"0", 0},
+        {"0.5", 0},
+        {"-1", 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *p = cases[i].json;
+        uint64_t seed = 1;
+        TEST_ASSERT(json_seed(&p, &seed));
+        TEST_ASSERT(seed == cases[i].seed);
+        TEST_ASSERT(*p == '\0' || *p == ',');
+    }
+    const char *invalid[] = {"\"42\"", "true", ""};
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        const char *p = invalid[i];
+        uint64_t seed = 1;
+        TEST_ASSERT(!json_seed(&p, &seed));
+    }
 }
 
 static void test_api_thinking_controls_parse(void) {
@@ -16928,6 +17081,57 @@ static void test_render_qwen_chat_prompt_text(void) {
         "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     free(prompt);
     tool_schema_orders_free(&orders);
+    chat_msgs_free(&msgs);
+}
+
+/* #1134: a client that sends a system note with every turn only appends
+ * messages, so the rendered prompt only appends text; leading system
+ * messages and the Anthropic top-level system prompt render as before. */
+static void test_render_mid_conversation_system_appends_only(void) {
+    for (int thinking = 0; thinking < 2; thinking++) {
+        const ds4_think_mode mode = thinking ? DS4_THINK_HIGH : DS4_THINK_NONE;
+        chat_msgs msgs = {0};
+        chat_msg_push_text(&msgs, "system", "You are terse.", NULL);
+        chat_msg_push_text(&msgs, "user", "Hello", NULL);
+        chat_msg_push_text(&msgs, "system", "Style reminder.", NULL);
+        char *first = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, mode);
+        chat_msg_push_text(&msgs, "assistant", "Hi.", NULL);
+        chat_msg_push_text(&msgs, "user", "Again", NULL);
+        chat_msg_push_text(&msgs, "system", "Style reminder.", NULL);
+        char *second = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, mode);
+        const char *gen = "<|im_start|>assistant\n";
+        const size_t stem = strlen(first) - strlen(strstr(first, gen));
+        TEST_ASSERT(!strncmp(first, second, stem));
+        if (!thinking) {
+            TEST_ASSERT(!strcmp(first,
+                "<|im_start|>system\nYou are terse.<|im_end|>\n"
+                "<|im_start|>user\nHello<|im_end|>\n"
+                "<|im_start|>system\nStyle reminder.<|im_end|>\n"
+                "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        }
+        free(first);
+        free(second);
+        chat_msgs_free(&msgs);
+    }
+
+    chat_msgs msgs = {0};
+    chat_msg_push_text(&msgs, "system", "Be terse.", NULL);
+    chat_msg_push_text(&msgs, "user", "Hello", NULL);
+    chat_msg_push_text(&msgs, "assistant", "Hi.", "greet");
+    chat_msg_push_text(&msgs, "user", "Again", NULL);
+    chat_msg top = {0};
+    top.role = xstrdup("system");
+    top.content = xstrdup("Answer in English.");
+    anthropic_place_system_prompt(&msgs, top);
+    char *prompt = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL,
+                                                      DS4_THINK_NONE);
+    TEST_ASSERT(prompt && !strcmp(prompt,
+        "<|im_start|>system\nBe terse.\n\nAnswer in English.<|im_end|>\n"
+        "<|im_start|>user\nHello<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\ngreet\n</think>\n\nHi.<|im_end|>\n"
+        "<|im_start|>user\nAgain<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    free(prompt);
     chat_msgs_free(&msgs);
 }
 
@@ -17582,6 +17786,87 @@ static void test_qwen_tool_checkpoint_round_trip(void) {
     tool_calls_free(&calls);
 }
 
+/* #1088: a thinking turn the model ended with its stop token before </think>
+ * keeps its text as content; a length cut, a client stop sequence and a closed
+ * think with an empty answer do not.  The live streams send the promoted text
+ * as a final content delta, so streamed and non-streamed answers agree. */
+static void test_unterminated_reasoning_content_on_stop(void) {
+    static const struct {
+        const char *text;
+        bool model_ended;   /* false: length cut or client stop sequence */
+        const char *content;
+    } cases[] = {
+        {"Step 1: 670 alarms.\nResult: 890", true, "Step 1: 670 alarms.\nResult: 890"},
+        {"still computing, step 7 of 12", false, ""},
+        {"Plan.\n</think>\n\n", true, ""},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *finish = "stop";
+        char *content = NULL, *reasoning = NULL;
+        char err[128] = {0};
+        tool_calls calls = {0};
+        bool recovered = false;
+        TEST_ASSERT(parse_generated_message_for_response_for_syntax(
+            SERVER_MODEL_SYNTAX_QWEN, cases[i].text, false, false, true, &finish,
+            err, sizeof(err), &content, &reasoning, &calls, &recovered, NULL));
+        promote_unterminated_reasoning(cases[i].text, true, cases[i].model_ended, &calls,
+                                       &content, &reasoning);
+        TEST_ASSERT(content && !strcmp(content, cases[i].content));
+        TEST_ASSERT(reasoning && reasoning[0]);
+        free(content);
+        free(reasoning);
+        tool_calls_free(&calls);
+    }
+
+    /* each live stream ends with the answer as content */
+    static const char raw[] = "Result: 890";
+    for (int api = 0; api < 3; api++) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = api == 0 ? API_OPENAI : api == 1 ? API_RESPONSES : API_ANTHROPIC;
+        r.stream = true;
+        r.think_mode = DS4_THINK_HIGH;
+        bool ok = false;
+        if (api == 0) {
+            openai_stream st;
+            openai_stream_start(&r, &st);
+            st.late_content = raw;
+            ok = openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_late", &st, raw,
+                                        strlen(raw), NULL, "stop", 3, 4);
+            openai_stream_free(&st);
+        } else if (api == 1) {
+            responses_stream st;
+            responses_stream_init(&r, &st);
+            st.late_content = raw;
+            ok = responses_sse_finish_live(sv[0], &r, &st, raw, strlen(raw), NULL, NULL,
+                                           "stop", 3, 4, 1234);
+            responses_stream_free(&st);
+        } else {
+            anthropic_stream st;
+            TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_late", 3, &st));
+            TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_late", &st,
+                                                    raw, strlen(raw), false));
+            st.late_content = raw;
+            ok = anthropic_sse_finish_live(sv[0], NULL, &r, "msg_late", &st, raw,
+                                           strlen(raw), NULL, "stop", 4);
+            anthropic_stream_free(&st);
+        }
+        TEST_ASSERT(ok);
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        const char *want = api == 0 ? "\"content\":\"Result: 890\"" :
+                           api == 1 ? "\"delta\":\"Result: 890\"" :
+                                      "\"text_delta\",\"text\":\"Result: 890\"";
+        TEST_ASSERT(out && strstr(out, want));
+        free(out);
+        request_free(&r);
+        close(sv[0]);
+        close(sv[1]);
+    }
+}
+
 static void test_qwen_sampled_tool_text_after_think_renders_exactly(void) {
     /* the model's own whitespace between </think> and its tool call is
      * replayed once, not stacked on the template separator */
@@ -17731,6 +18016,30 @@ static void test_tool_recovery_output_budget(void) {
     TEST_ASSERT(find_any_tool_start("<tool_call>") != NULL);
     TEST_ASSERT(find_any_tool_start("<tool_call") == NULL);
     TEST_ASSERT(find_any_tool_start("") == NULL);
+}
+
+/* #1163: generation no longer marks an unterminated call "error", so the
+ * parser's recovery returns the raw text with finish "stop"; a preset
+ * "error" (a real fault) still blocks it. */
+static void test_unterminated_tool_call_recovers_unless_error(void) {
+    static const char raw[] =
+        "<tool_call>\n<function=write>\n<parameter=content>\nunfinished";
+    for (int fault = 0; fault < 2; fault++) {
+        const char *finish = fault ? "error" : "stop";
+        char *content = NULL, *reasoning = NULL;
+        char err[128] = {0};
+        tool_calls calls = {0};
+        bool recovered = false;
+        TEST_ASSERT(!parse_generated_message_for_response_for_syntax(
+            SERVER_MODEL_SYNTAX_QWEN, raw, true, true, false, &finish,
+            err, sizeof(err), &content, &reasoning, &calls, &recovered, NULL));
+        TEST_ASSERT(recovered == !fault && calls.len == 0);
+        TEST_ASSERT(!strcmp(finish, fault ? "error" : "stop"));
+        TEST_ASSERT(content && !strcmp(content, raw));
+        free(content);
+        free(reasoning);
+        tool_calls_free(&calls);
+    }
 }
 
 static void test_invalid_qwen_tool_error_suffix(void) {
@@ -17893,6 +18202,8 @@ static void test_tool_checkpoint_minifies_json_parameters(void) {
     tool_schema_orders_free(&orders);
 }
 
+/* The live tail holds only the new turns, in Qwen's form, starting at the
+ * newline after the committed <|im_end|>; never the replayed tool call. */
 static void test_anthropic_live_tail_renders_tool_results_only(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -17911,28 +18222,24 @@ static void test_anthropic_live_tail_renders_tool_results_only(void) {
 
     chat_msg user = {0};
     user.role = xstrdup("user");
-    user.content = xstrdup("<tool_result>/tmp</tool_result>");
+    user.content = xstrdup("/tmp");
     chat_msg_add_tool_call_id(&user, "toolu_live");
     chat_msgs_push(&msgs, user);
 
-    /* Anthropic system text is parsed separately and appended to chat_msgs for
-     * rendering.  The live-tail finder must ignore it when locating the final
-     * tool_result run. */
+    /* a system note after the results (sent while the tool ran) is new tail,
+     * rendered where it occurs (#1134) */
     chat_msg system = {0};
     system.role = xstrdup("system");
-    system.content = xstrdup("You are terse.");
+    system.content = xstrdup("The user is waiting.");
     chat_msgs_push(&msgs, system);
 
-    anthropic_prepare_live_continuation(NULL, &r, &msgs);
+    anthropic_prepare_live_continuation(NULL, &r, &msgs, NULL);
     TEST_ASSERT(r.anthropic_live_call_ids.len == 1);
     TEST_ASSERT(!strcmp(r.anthropic_live_call_ids.v[0], "toolu_live"));
-    TEST_ASSERT(r.anthropic_live_suffix_text != NULL);
-    TEST_ASSERT(!strncmp(r.anthropic_live_suffix_text,
-                         "<｜end▁of▁sentence｜><｜User｜><tool_result>",
-                         strlen("<｜end▁of▁sentence｜><｜User｜><tool_result>")));
-    TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "/tmp</tool_result>") != NULL);
-    TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "<｜Assistant｜><think>") != NULL);
-    TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "Bash") == NULL);
+    TEST_ASSERT(r.anthropic_live_suffix_text && !strcmp(r.anthropic_live_suffix_text,
+        "\n<|im_start|>user\n<tool_response>\n/tmp\n</tool_response><|im_end|>\n"
+        "<|im_start|>system\nThe user is waiting.<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n"));
 
     chat_msgs_free(&msgs);
     request_free(&r);
@@ -18100,16 +18407,12 @@ static void test_responses_live_tail_renders_tool_outputs_only(void) {
     tool.content = xstrdup("/tmp");
     chat_msgs_push(&msgs, tool);
 
-    responses_prepare_live_continuation(NULL, &r, &msgs);
+    responses_prepare_live_continuation(NULL, &r, &msgs, NULL);
     TEST_ASSERT(r.responses_live_call_ids.len == 1);
     TEST_ASSERT(!strcmp(r.responses_live_call_ids.v[0], "call_live"));
-    TEST_ASSERT(r.responses_live_suffix_text != NULL);
-    TEST_ASSERT(!strncmp(r.responses_live_suffix_text,
-                         "<｜end▁of▁sentence｜><｜User｜><tool_result>",
-                         strlen("<｜end▁of▁sentence｜><｜User｜><tool_result>")));
-    TEST_ASSERT(strstr(r.responses_live_suffix_text, "/tmp</tool_result>") != NULL);
-    TEST_ASSERT(strstr(r.responses_live_suffix_text, "<｜Assistant｜><think>") != NULL);
-    TEST_ASSERT(strstr(r.responses_live_suffix_text, "exec_command") == NULL);
+    TEST_ASSERT(r.responses_live_suffix_text && !strcmp(r.responses_live_suffix_text,
+        "\n<|im_start|>user\n<tool_response>\n/tmp\n</tool_response><|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n"));
 
     chat_msgs_free(&msgs);
     request_free(&r);
@@ -18307,24 +18610,31 @@ static void test_decode_tracker_split_parameter_close(void) {
 }
 
 static void test_qwen_decode_tracker_markers(void) {
-    const char *raw = "<tool_call>\n<function=write>\n<parameter=content>\n"
-                      "literal </tool_call> </think> <think>\n"
-                      "</parameter>\n</function>\n</tool_call>";
+    /* each call has its own wrapper: text other than another call ends them */
+    const char *call1 = "<tool_call>\n<function=write>\n<parameter=content>\n"
+                        "literal </tool_call> </think> <think>\n"
+                        "</parameter>\n</function>\n</tool_call>";
+    const char *call2 = "\n<tool_call>\n<function=read>\n<parameter=path>\na\n"
+                        "</parameter>\n</function>\n</tool_call>";
+    char raw[512];
+    snprintf(raw, sizeof(raw), "%s%s\nok", call1, call2);
+    const size_t len1 = strlen(call1), len2 = len1 + strlen(call2), len = strlen(raw);
     dsml_decode_tracker tracker;
     dsml_decode_tracker_init(&tracker);
     tracker.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
     bool start = false, end = false, orphan = false;
-    size_t len = strlen(raw);
     for (size_t n = 1; n <= len; n++) {
         dsml_decode_tracker_update(&tracker, raw, n);
         char *prefix = xstrndup(raw, n);
         observe_tool_markers(&tracker, prefix, &start, &end, &orphan);
         free(prefix);
-        TEST_ASSERT(!end || n == len);
+        TEST_ASSERT(!end || n > len2 + 1);   /* the first non-space byte after the calls */
         TEST_ASSERT(!orphan);
+        if (n == len1 || n == len2)
+            TEST_ASSERT(tracker.mode == DSML_TRACK_BETWEEN && tracker.calls_end == n);
     }
     TEST_ASSERT(start && end);
-    TEST_ASSERT(tracker.mode == DSML_TRACK_DONE);
+    TEST_ASSERT(tracker.mode == DSML_TRACK_DONE && tracker.calls_end == len2);
 }
 
 static void test_stop_list_parses_all_sequences(void) {
@@ -18570,6 +18880,56 @@ static void test_json_string_handles_surrogates(void) {
     free(s);
 }
 
+/* #1226: ill-formed UTF-8 becomes U+FFFD in every JSON escaper. */
+static void test_json_escape_replaces_invalid_utf8(void) {
+#define RP "\xef\xbf\xbd"
+    static const struct { const char *in, *want; } cases[] = {
+        {"caff\xc3\xa8 \xe2\x82\xac \xf0\x9f\x9a\xa9", /* valid: unchanged */
+         "\"caff\xc3\xa8 \xe2\x82\xac \xf0\x9f\x9a\xa9\""},
+        {"cut \xe2\x80", "\"cut " RP "\""},         /* max_tokens mid-char */
+        {"a\xe2(b", "\"a" RP "(b\""},               /* lead, no continuation */
+        {"\x80\xbf", "\"" RP RP "\""},              /* stray continuations */
+        {"\xc0\xaf", "\"" RP RP "\""},              /* overlong */
+        {"\xed\xa0\x80", "\"" RP RP RP "\""},       /* UTF-16 surrogate */
+        {"\xf4\x90\x80\x80", "\"" RP RP RP RP "\""}, /* above U+10FFFF */
+        {"\xf0\x9f\x9a", "\"" RP "\""},             /* truncated 4-byte */
+    };
+#undef RP
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        buf b = {0};
+        json_escape(&b, cases[i].in);
+        TEST_ASSERT(b.ptr && !strcmp(b.ptr, cases[i].want));
+        buf_free(&b);
+    }
+}
+
+/* #1226: a length cut that splits a character still yields a valid UTF-8
+ * body: the partial character becomes one U+FFFD at the end of the content. */
+static void test_length_cut_multibyte_response_is_valid_utf8(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    tool_calls calls = {0};
+    /* "Prezzo: 5 \u20ac" cut after the first two bytes of the euro sign */
+    TEST_ASSERT(final_response(sv[0], false, &r, "chatcmpl_cut", "Prezzo: 5 \xe2\x82",
+                               NULL, &calls, "length", 3, 4));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(out && strstr(out, "\"content\":\"Prezzo: 5 \xef\xbf\xbd\""));
+    TEST_ASSERT(out && strstr(out, "\"finish_reason\":\"length\""));
+    bool valid = true;
+    for (size_t i = 0, n = out ? strlen(out) : 0; valid && i < n;) {
+        i += utf8_scan_char((const unsigned char *)out + i, n - i, &valid);
+    }
+    TEST_ASSERT(valid);
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_json_int_handles_non_finite_values(void) {
     const char *p = "NaN";
     int value = -1;
@@ -18755,6 +19115,97 @@ static void test_cancelled_progress_callback_is_inert(void) {
     test_cancel_job_destroy(&j);
 }
 
+/* #1155: a live hit shows the cached suffix; a backend rebuild (a chunk below
+ * the cached frontier) latches the full-prompt range. */
+static void test_prefill_progress_display_ranges(void) {
+    int cur = 0, tot = 0;
+    server_prefill_progress hit = { .prompt_tokens = 100, .cached_tokens = 90 };
+    prefill_progress_display(&hit, 95, 100, &cur, &tot);
+    TEST_ASSERT(cur == 5 && tot == 10 && !hit.rebuilt);
+    prefill_progress_display(&hit, 100, 100, &cur, &tot);
+    TEST_ASSERT(cur == 10 && tot == 10);
+
+    server_prefill_progress cold = { .prompt_tokens = 100, .cached_tokens = 0 };
+    prefill_progress_display(&cold, 30, 100, &cur, &tot);
+    TEST_ASSERT(cur == 30 && tot == 100);
+
+    server_prefill_progress full = { .prompt_tokens = 100, .cached_tokens = 100 };
+    prefill_progress_display(&full, 0, 100, &cur, &tot);
+    TEST_ASSERT(cur == 0 && tot == 100);
+
+    /* issue #1114 shape: 132806 counted cached, the engine replays 132822 */
+    server_prefill_progress p = { .prompt_tokens = 132822, .cached_tokens = 132806 };
+    prefill_progress_display(&p, 8192, 132822, &cur, &tot);
+    TEST_ASSERT(cur == 8192 && tot == 132822 && p.rebuilt);
+    prefill_progress_display(&p, 132822, 132822, &cur, &tot);
+    TEST_ASSERT(cur == 132822 && tot == 132822);
+}
+
+/* Replay chunks below the frontier each log a line; clamped states dedupe. */
+static void test_progress_callback_logs_each_replay_chunk(void) {
+    job j;
+    test_cancel_job_init(&j);
+    server_prefill_progress replay = {
+        .request_job = &j, .t0 = now_sec(), .prompt_tokens = 100, .cached_tokens = 90,
+    };
+    server_progress_cb(&replay, "prefill_chunk", 8, 100);
+    TEST_ASSERT(replay.seen && replay.last_display_current == 8);
+    server_progress_cb(&replay, "prefill_chunk", 16, 100);
+    TEST_ASSERT(replay.last_display_current == 16);
+
+    server_prefill_progress clamp = {
+        .request_job = &j, .t0 = now_sec(), .prompt_tokens = 100, .cached_tokens = 90,
+    };
+    server_progress_cb(&clamp, "prefill_chunk", 95, 100);
+    TEST_ASSERT(clamp.last_display_current == 5);
+    server_progress_cb(&clamp, "prefill_chunk", 105, 100);
+    TEST_ASSERT(clamp.last_display_current == 10);
+    const double logged_t = clamp.last_t;
+    server_progress_cb(&clamp, "prefill_chunk", 115, 100);
+    TEST_ASSERT(clamp.last_t == logged_t && clamp.last_current == 105);
+    test_cancel_job_destroy(&j);
+}
+
+/* #1155: a reset backend turns a token-prefix hit into a miss, except for a
+ * tool-output-only continuation, which has no other source. */
+static void test_slot_probe_backend_stale(void) {
+    server s = {0};
+    int ckpt_tok[10];
+    for (int i = 0; i < 10; i++) ckpt_tok[i] = i + 1;
+    {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        request req = {0};
+        for (int i = 0; i < 10; i++) ds4_tokens_push(&req.prompt, ckpt_tok[i]);
+        ds4_tokens_push(&req.prompt, 11);
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &req).kind == REUSE_MEMORY_TOKEN);
+        ds4_session_set_test_backend_stale(slot.session, true);
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &req).kind == REUSE_NONE);
+        ds4_tokens_free(&req.prompt);
+        ds4_session_free_test_checkpoint(slot.session);
+    }
+    {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        ds4_session_set_test_backend_stale(slot.session, true);
+        slot.anthropic_live.valid = true;
+        slot.anthropic_live.live_tokens = 10;
+        id_list_push_unique(&slot.anthropic_live.call_ids, "toolu-1");
+        job j = {0};
+        j.req.api = API_ANTHROPIC;
+        j.req.anthropic_requires_live_tool_state = true;
+        j.req.tool_delta_only = true;
+        j.req.anthropic_live_suffix_text = xstrdup(" result");
+        id_list_push_unique(&j.req.anthropic_live_call_ids, "toolu-1");
+        ds4_tokens_push(&j.req.prompt, 999);
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == REUSE_ANTHROPIC_TOOL_OUTPUT && pr.reuse_tokens == 10);
+        live_tool_state_free(&slot.anthropic_live);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+}
+
 static void test_cancel_server_init(server *s) {
     memset(s, 0, sizeof(*s));
     pthread_mutex_init(&s->mu, NULL);
@@ -18770,6 +19221,158 @@ static void test_cancel_server_destroy(server *s) {
     pthread_mutex_destroy(&s->model_mu);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
+}
+
+/* #1175 fixtures: requests built by the real input parsers and key helpers;
+ * the token frontier diverges at the first token, so only the tool-ID tier
+ * can bind them. */
+static const char test_tool_flow_schemas[] =
+    "{\"name\":\"bash\",\"description\":\"Run a shell command\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{"
+    "\"command\":{\"type\":\"string\"}}}}";
+
+static void test_tool_flow_request(request *r, bool anthropic, const char *json) {
+    request_init(r, REQ_CHAT, 128);
+    r->api = anthropic ? API_ANTHROPIC : API_RESPONSES;
+    r->think_mode = DS4_THINK_HIGH;
+    tool_schema_orders_add_json(&r->tool_orders, test_tool_flow_schemas);
+    const char *p = json;
+    chat_msgs msgs = {0};
+    buf loaded = {0};
+    bool ok = anthropic ? parse_anthropic_messages(&p, &msgs)
+                        : parse_responses_input(&p, &msgs, &loaded, &r->tool_orders);
+    TEST_ASSERT(ok && msgs.len > 0);
+    if (anthropic) {
+        chat_msg sys = {0};
+        sys.role = xstrdup("system");
+        sys.content = xstrdup("You are pi.");
+        anthropic_place_system_prompt(&msgs, sys);
+        anthropic_prepare_live_continuation(NULL, r, &msgs, test_tool_flow_schemas);
+    } else {
+        responses_prepare_live_continuation(NULL, r, &msgs, test_tool_flow_schemas);
+    }
+    ds4_tokens_push(&r->prompt, 999);
+    buf_free(&loaded);
+    chat_msgs_free(&msgs);
+}
+
+static void test_tool_flow_publish(server *s, server_slot *slot, const request *req,
+                                   bool anthropic, const char *id) {
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.id = xstrdup(id);
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"ls\"}");
+    tool_calls_push(&calls, tc);
+    if (anthropic) anthropic_live_remember(s, slot, &calls, req);
+    else responses_live_remember(s, slot, "qwen visible frontier", NULL, &calls, req);
+    slot->responses_live.live_tokens = slot->anthropic_live.live_tokens = 10;
+    tool_calls_free(&calls);
+}
+
+/* #1175: the tool-ID tier reuses the live frontier only for a replay of the
+ * input that produced it; a results-only continuation keeps its fast path, and
+ * Responses follow-up user messages are new suffix. */
+static void test_slot_probe_tool_parent_guard(void) {
+    server s;
+    test_cancel_server_init(&s);
+    int ckpt_tok[10];
+    for (int i = 0; i < 10; i++) ckpt_tok[i] = i + 1;
+    static const char sys[] = "{\"role\":\"system\",\"content\":\"You are pi.\"}";
+    static const char sys_other[] = "{\"role\":\"system\",\"content\":\"You are terse.\"}";
+    static const char user[] = "{\"role\":\"user\",\"content\":\"List the files.\"}";
+    static const char call[] =
+        "{\"type\":\"function_call\",\"call_id\":\"call_live\",\"name\":\"bash\","
+        "\"arguments\":\"{\\\"command\\\": \\\"ls\\\"}\"}";
+    static const char result[] =
+        "{\"type\":\"function_call_output\",\"call_id\":\"call_live\",\"output\":\"a.c b.c\"}";
+    static const char note[] = "{\"role\":\"user\",\"content\":\"Background check finished.\"}";
+    char in[1024];
+
+    server_slot slot = {0};
+    slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+    request frontier, r;
+    snprintf(in, sizeof(in), "[%s,%s]", sys, user);
+    test_tool_flow_request(&frontier, false, in);
+    TEST_ASSERT(frontier.full_input_key != NULL);
+    test_tool_flow_publish(&s, &slot, &frontier, false, "call_live");
+
+    snprintf(in, sizeof(in), "[%s,%s,%s,%s]", sys, user, call, result);
+    test_tool_flow_request(&r, false, in);
+    TEST_ASSERT(!r.tool_delta_only && r.tool_parent_key &&
+                !strcmp(r.tool_parent_key, frontier.full_input_key));
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &r).kind == REUSE_RESPONSES_TOOL_OUTPUT);
+    request_free(&r);
+
+    snprintf(in, sizeof(in), "[%s,%s,%s,%s,%s]", sys, user, call, result, note);
+    test_tool_flow_request(&r, false, in);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &r).kind == REUSE_RESPONSES_TOOL_OUTPUT);
+    const char *tail = r.responses_live_suffix_text ? r.responses_live_suffix_text : "";
+    const char *res = strstr(tail, "<tool_response>\na.c b.c\n</tool_response>");
+    const char *bg = strstr(tail, "Background check finished.");
+    TEST_ASSERT(res && bg && res < bg && strstr(bg, "<|im_start|>assistant\n"));
+    request_free(&r);
+
+    snprintf(in, sizeof(in), "[%s,%s,%s,%s]", sys_other, user, call, result);
+    test_tool_flow_request(&r, false, in);
+    TEST_ASSERT(r.responses_live_call_ids.len == 1);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &r).kind == REUSE_NONE);
+    request_free(&r);
+
+    /* results only: binds by id, but its frontier proves no parent */
+    request delta;
+    snprintf(in, sizeof(in), "[%s]", result);
+    test_tool_flow_request(&delta, false, in);
+    TEST_ASSERT(delta.tool_delta_only && !delta.full_input_key && !delta.tool_parent_key);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &delta).kind == REUSE_RESPONSES_TOOL_OUTPUT);
+    test_tool_flow_publish(&s, &slot, &delta, false, "call_live");
+    TEST_ASSERT(slot.responses_live.parent_key == NULL);
+    snprintf(in, sizeof(in), "[%s,%s,%s,%s]", sys, user, call, result);
+    test_tool_flow_request(&r, false, in);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &r).kind == REUSE_NONE);
+    request_free(&r);
+    request_free(&delta);
+    /* results only after the instructions (a system message in front) */
+    snprintf(in, sizeof(in), "[%s,%s]", sys, result);
+    test_tool_flow_request(&delta, false, in);
+    TEST_ASSERT(delta.tool_delta_only && delta.responses_live_call_ids.len == 1);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &delta).kind == REUSE_RESPONSES_TOOL_OUTPUT);
+    request_free(&delta);
+    request_free(&frontier);
+
+    /* Anthropic: the top-level system sits in front in every request. */
+    static const char a_user[] = "{\"role\":\"user\",\"content\":\"List the files.\"}";
+    static const char a_user_edit[] = "{\"role\":\"user\",\"content\":\"List all files.\"}";
+    static const char a_call[] =
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_live\","
+        "\"name\":\"bash\",\"input\":{\"command\":\"ls\"}}]}";
+    static const char a_result[] =
+        "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\","
+        "\"tool_use_id\":\"toolu_live\",\"content\":\"a.c b.c\"}]}";
+    snprintf(in, sizeof(in), "[%s]", a_user);
+    test_tool_flow_request(&frontier, true, in);
+    test_tool_flow_publish(&s, &slot, &frontier, true, "toolu_live");
+    snprintf(in, sizeof(in), "[%s,%s,%s]", a_user, a_call, a_result);
+    test_tool_flow_request(&r, true, in);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &r).kind == REUSE_ANTHROPIC_TOOL_OUTPUT);
+    request_free(&r);
+    snprintf(in, sizeof(in), "[%s,%s,%s]", a_user_edit, a_call, a_result);
+    test_tool_flow_request(&r, true, in);
+    TEST_ASSERT(r.anthropic_live_call_ids.len == 1);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &r).kind == REUSE_NONE);
+    request_free(&r);
+    /* results only, with the system prompt in front */
+    snprintf(in, sizeof(in), "[%s]", a_result);
+    test_tool_flow_request(&r, true, in);
+    TEST_ASSERT(r.tool_delta_only && r.anthropic_live_call_ids.len == 1);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &r).kind == REUSE_ANTHROPIC_TOOL_OUTPUT);
+    request_free(&r);
+    request_free(&frontier);
+
+    live_tool_state_free(&slot.responses_live);
+    live_tool_state_free(&slot.anthropic_live);
+    ds4_session_free_test_checkpoint(slot.session);
+    test_cancel_server_destroy(&s);
 }
 
 typedef struct {
@@ -19044,7 +19647,7 @@ static void test_kv_cache_chat_anchor_uses_last_user_before_assistant(void) {
     ds4_tokens_push(&codex, user);  /* actual task starts here */
     ds4_tokens_push(&codex, 5);
     ds4_tokens_push(&codex, assistant);
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &codex, user, assistant) == 5);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &codex, -1, user, assistant) == 5);
 
     ds4_tokens claude = {0};
     ds4_tokens_push(&claude, 1);
@@ -19054,7 +19657,7 @@ static void test_kv_cache_chat_anchor_uses_last_user_before_assistant(void) {
     ds4_tokens_push(&claude, user); /* system reminder and task share a turn */
     ds4_tokens_push(&claude, 5);
     ds4_tokens_push(&claude, assistant);
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &claude, user, assistant) == 4);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &claude, -1, user, assistant) == 4);
 
     ds4_tokens_free(&codex);
     ds4_tokens_free(&claude);
@@ -19077,12 +19680,43 @@ static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     ds4_tokens_push(&prompt, user);      /* later turn: not a cold anchor */
     ds4_tokens_push(&prompt, 5);
     ds4_tokens_push(&prompt, assistant);
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == 2);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, -1, user, assistant) == 2);
 
     kc.opt.min_tokens = 3;
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, assistant) == -1);
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, -1, assistant) == -1);
-    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, user, -1) == -1);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, -1, user, assistant) == -1);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, -1, -1, assistant) == -1);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, -1, user, -1) == -1);
+
+    ds4_tokens_free(&prompt);
+}
+
+/* #1157: in ChatML a turn marker is <|im_start|> plus the role-name token. */
+static void test_kv_cache_chat_anchor_chatml_role_names(void) {
+    const int im_start = 9000;
+    const int user = 9001;
+    const int assistant = 9002;
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    kc.opt.min_tokens = 2;
+
+    ds4_tokens prompt = {0};
+    ds4_tokens_push(&prompt, im_start);
+    ds4_tokens_push(&prompt, 1);         /* "system" */
+    ds4_tokens_push(&prompt, 2);
+    ds4_tokens_push(&prompt, user);      /* the word "user" in plain text */
+    ds4_tokens_push(&prompt, im_start);  /* the task starts here */
+    ds4_tokens_push(&prompt, user);
+    ds4_tokens_push(&prompt, assistant); /* the word "assistant" in the task */
+    ds4_tokens_push(&prompt, 3);
+    ds4_tokens_push(&prompt, im_start);
+    ds4_tokens_push(&prompt, assistant); /* stop scanning here */
+    ds4_tokens_push(&prompt, 4);
+    ds4_tokens_push(&prompt, im_start);  /* later turn: not a cold anchor */
+    ds4_tokens_push(&prompt, user);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, im_start, user, assistant) == 4);
+
+    kc.opt.min_tokens = 5;
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &prompt, im_start, user, assistant) == -1);
 
     ds4_tokens_free(&prompt);
 }
@@ -20344,6 +20978,7 @@ static void ds4_server_unit_tests_run(void) {
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();
     test_api_thinking_controls_parse();
+    test_api_seed_parse();
     test_render_qwen_chat_prompt_text();
     test_render_qwen_reasoning_parity();
     test_render_qwen_tool_schema_escapes();
@@ -20356,6 +20991,7 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_literal_tool_end_in_argument();
     test_qwen_string_arguments_follow_schema();
     test_qwen_tool_checkpoint_round_trip();
+    test_unterminated_reasoning_content_on_stop();
     test_qwen_sampled_tool_text_after_think_renders_exactly();
     test_qwen_parallel_tool_calls_parse_and_replay();
     test_qwen_plain_answer_keeps_trailing_whitespace();
@@ -20363,6 +20999,7 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_thinking_visible_text_matches_render();
     test_qwen_visible_keys_prefix_next_render();
     test_live_kv_turn_end_token();
+    test_render_mid_conversation_system_appends_only();
     test_qwen_reasoning_effort_levels();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
@@ -20380,17 +21017,23 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_sse_headers();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
+    test_anthropic_reports_client_stop_sequence();
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_qwen_tool_stream_sends_answer_before_finish();
     test_qwen_stream_split_reasoning_close();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
+    test_responses_incomplete_reports_max_output_tokens();
     test_openai_chat_stream_splits_reasoning_without_tools();
-    test_openai_tool_stream_sends_partial_arguments();
+    test_openai_tool_stream_sends_closed_call_whole();
+    test_qwen_tool_stream_two_calls();
     test_streaming_holds_partial_utf8();
     /* sf-ablate(glm): legacy DSML/GLM protocol tests removed; Qwen tool syntax remains below. */
     test_tool_recovery_output_budget();
+    test_anthropic_live_tail_renders_tool_results_only();
+    test_responses_live_tail_renders_tool_outputs_only();
+    test_unterminated_tool_call_recovers_unless_error();
     test_invalid_qwen_tool_error_suffix();
     test_responses_tool_output_id_validation();
     test_responses_stateless_tool_replay_requires_reasoning();
@@ -20406,6 +21049,8 @@ static void ds4_server_unit_tests_run(void) {
     test_request_parsers_reject_malformed_duplicate_owned_fields();
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();
+    test_json_escape_replaces_invalid_utf8();
+    test_length_cut_multibyte_response_is_valid_utf8();
     test_json_int_handles_non_finite_values();
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
@@ -20414,6 +21059,10 @@ static void ds4_server_unit_tests_run(void) {
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
     test_cancelled_progress_callback_is_inert();
+    test_prefill_progress_display_ranges();
+    test_progress_callback_logs_each_replay_chunk();
+    test_slot_probe_backend_stale();
+    test_slot_probe_tool_parent_guard();
     test_waiting_job_cancels_on_client_close();
     test_cancel_unlinks_queued_jobs();
     test_cancel_detaches_assigned_job();
@@ -20425,6 +21074,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
+    test_kv_cache_chat_anchor_chatml_role_names();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
