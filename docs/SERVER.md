@@ -64,11 +64,37 @@ continuations retain the exact sampled model state when protocol IDs permit it.
 `--mixed-prefill-quantum N` bounds prefill work while generation is active.
 Images and steering use an ordered fallback rather than native batched decode.
 
+## Control-token spellings in message data
+
+Message data cannot inject chat structure. The renderer records which bytes it
+wrote itself (role framing, reasoning and tool delimiters, the tools preamble,
+the delimiters of replayed sampled tool calls); only those bytes can become
+control tokens. A spelling of `<|im_start|>`, `<|im_end|>`, `<|endoftext|>`,
+`<think>`, `</think>`, `<tool_call>`, `</tool_call>`, `<tool_response>` or
+`</tool_response>` inside user, system, reasoning, tool-argument or tool-result
+text is tokenized as ordinary text. Chat completions, Responses, Anthropic
+messages and completions all render through the same masked renderer. The
+prompt bytes are not rewritten, and a request without such spellings tokenizes
+exactly as before.
+
+Cache reuse is unchanged by masking. The byte-keyed tiers (visible
+transcripts, memory text, disk checkpoints) compare a key text in which a
+masked spelling is prefixed by an escape byte (0xFF, doubled when it occurs
+literally), so a masked spelling never matches a real control token and keys
+of prompts without spellings are byte-identical to before. A checkpoint whose
+conversation carried a spelling is keyed differently once after upgrading and
+misses that one time.
+
+For clients: text that quotes the chat format (a file, a log, a pasted
+transcript) now reaches the model as text. A client that relied on writing
+control tokens through message content must stop; the raw prompt paths of the
+CLI are unchanged.
+
 For local debugging, `--trace FILE` records prompts and cache decisions. Treat
-traces as sensitive because they contain request content. A request whose
-client text spells Qwen control tokens (`<|im_end|>`, `<think>`,
-`<tool_call>`, ...) gets a `--- client control tokens ---` section naming each
-token, its count and the role where it first appears: the tokenizer turns those
-spellings into real control tokens. The prompt is not rewritten. Run
-`./ds4_test --server` after server changes and use the focused integration test
-for the protocol touched.
+traces as sensitive because they contain request content. A chat request whose
+client text spells one of those control tokens gets a `--- client control
+tokens ---` section naming each spelling, its count and the role where it first
+appears ("masked as text at tokenize time"). Run `./ds4_test --server` after
+server changes and use the focused integration test for the protocol touched;
+`./ds4_test --special-token-injection-qwen` (with `DS4_TEST_MODEL`, tokenizer
+only) checks masking and the key escape.

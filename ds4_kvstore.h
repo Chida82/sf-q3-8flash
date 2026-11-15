@@ -130,6 +130,12 @@ void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         const ds4_tokens *exact_prefix,
         const char *suffix_text,
         ds4_tokens *out);
+void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix_masked(
+        ds4_engine *engine,
+        const ds4_tokens *exact_prefix,
+        const char *suffix_text,
+        const unsigned char *suffix_trusted,
+        ds4_tokens *out);
 
 int ds4_kvstore_store_len(const ds4_kvstore *kc, int tokens);
 int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
@@ -190,6 +196,8 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_engine *engine,
                               ds4_session *session,
                               const char *prompt_text,
+                              const unsigned char *prompt_trusted,
+                              const char *prompt_key,
                               ds4_tokens *effective_prompt,
                               ds4_kvstore_load_result *result,
                               const ds4_kvstore_trailer_hooks *hooks,

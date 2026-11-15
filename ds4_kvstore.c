@@ -655,18 +655,12 @@ void ds4_kvstore_close(ds4_kvstore *kc) {
     memset(kc, 0, sizeof(*kc));
 }
 
+/* Token keys use ds4_tokens_key_text: control spellings that are text in
+ * the token stream carry the same escape as the renderer's masked spellings. */
 char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
                                      const ds4_tokens *tokens,
                                      size_t *out_len) {
-    kv_buf b = {0};
-    for (int i = 0; i < tokens->len; i++) {
-        size_t len = 0;
-        char *piece = ds4_token_text(engine, tokens->v[i], &len);
-        kv_buf_append(&b, piece, len);
-        free(piece);
-    }
-    if (out_len) *out_len = b.len;
-    return kv_buf_take(&b);
+    return ds4_tokens_key_text(engine, tokens, out_len);
 }
 
 bool ds4_kvstore_byte_prefix_match(const char *text, size_t text_len,
@@ -687,19 +681,31 @@ static void tokens_append(ds4_tokens *dst, const ds4_tokens *src) {
     for (int i = 0; i < src->len; i++) ds4_tokens_push(dst, src->v[i]);
 }
 
-void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix_masked(
         ds4_engine *engine,
         const ds4_tokens *exact_prefix,
         const char *suffix_text,
+        const unsigned char *suffix_trusted,
         ds4_tokens *out) {
     ds4_tokens_copy(out, exact_prefix);
 
     ds4_tokens suffix = {0};
     /* The suffix may start with DS4 chat markers such as <｜User｜> or
-     * </think>, so use the rendered-chat tokenizer, not plain text BPE. */
-    ds4_tokenize_rendered_chat(engine, suffix_text ? suffix_text : "", &suffix);
+     * </think>, so use the rendered-chat tokenizer, not plain text BPE.
+     * Only the markers the renderer inserted are trusted. */
+    ds4_tokenize_rendered_chat_masked(engine, suffix_text ? suffix_text : "",
+                                      suffix_trusted, &suffix);
     tokens_append(out, &suffix);
     ds4_tokens_free(&suffix);
+}
+
+void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+        ds4_engine *engine,
+        const ds4_tokens *exact_prefix,
+        const char *suffix_text,
+        ds4_tokens *out) {
+    ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix_masked(
+        engine, exact_prefix, suffix_text, NULL, out);
 }
 
 int ds4_kvstore_store_len(const ds4_kvstore *kc, int tokens) {
@@ -1221,6 +1227,8 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_engine *engine,
                               ds4_session *session,
                               const char *prompt_text,
+                              const unsigned char *prompt_trusted,
+                              const char *prompt_key,
                               ds4_tokens *effective_prompt,
                               ds4_kvstore_load_result *result,
                               const ds4_kvstore_trailer_hooks *hooks,
@@ -1228,6 +1236,9 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     if (result) memset(result, 0, sizeof(*result));
     if (effective_prompt) effective_prompt->len = 0;
     if (!kc->enabled || !prompt_text) return 0;
+    /* Look up by key text (ds4_chat_key_text); tokenize the raw suffix. */
+    const char *raw_text = prompt_text;
+    if (prompt_key) prompt_text = prompt_key;
     const int quant_bits = ds4_engine_routed_quant_bits(engine);
     if (!ds4_kvstore_quant_bits_supported(quant_bits)) return 0;
     const int model_id = ds4_engine_model_id(engine);
@@ -1289,8 +1300,11 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                  * the exact token history stored in the payload.  Build the
                  * prompt from that exact history and tokenize only the text
                  * suffix after the byte prefix. */
-                ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
-                    engine, loaded_tokens, prompt_text + text_bytes,
+                const size_t raw_off = prompt_key ?
+                    ds4_chat_key_raw_offset(prompt_key, text_bytes) : text_bytes;
+                ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix_masked(
+                    engine, loaded_tokens, raw_text + raw_off,
+                    prompt_trusted ? prompt_trusted + raw_off : NULL,
                     effective_prompt);
             }
             if (hooks && hooks->load && (hdr.ext_flags & hooks->ext_flag)) {

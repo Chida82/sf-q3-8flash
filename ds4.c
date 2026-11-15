@@ -30009,8 +30009,23 @@ static void tokenize_span(const ds4_vocab *vocab, const char *p, size_t n, token
     free(tmp);
 }
 
-static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
-                                         token_vec *out) {
+/* `trusted`, when non-NULL, is a byte mask over `text`: only literals that the
+ * chat renderer itself inserted may become control tokens. User, tool, and
+ * model text is encoded by BPE even if it spells a control token, so content
+ * cannot inject chat syntax. */
+static bool special_token_trusted_at(const ds4_vocab *vocab, const char *p,
+                                     const unsigned char *trusted,
+                                     int *token, size_t *len) {
+    if (!special_token_at(vocab, p, token, len)) return false;
+    if (trusted)
+        for (size_t k = 0; k < *len; k++)
+            if (!trusted[k]) return false;
+    return true;
+}
+
+static void tokenize_rendered_chat_vocab_masked(const ds4_vocab *vocab, const char *text,
+                                                const unsigned char *trusted,
+                                                token_vec *out) {
     if (!text) text = "";
 
     const char *span = text;
@@ -30018,7 +30033,8 @@ static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *tex
     while (*p) {
         int token = -1;
         size_t len = 0;
-        if (special_token_at(vocab, p, &token, &len)) {
+        if (special_token_trusted_at(vocab, p, trusted ? trusted + (p - text) : NULL,
+                                     &token, &len)) {
             tokenize_span(vocab, span, (size_t)(p - span), out);
             token_vec_push(out, token);
             p += len;
@@ -30030,8 +30046,127 @@ static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *tex
     tokenize_span(vocab, span, (size_t)(p - span), out);
 }
 
+static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
+                                         token_vec *out) {
+    tokenize_rendered_chat_vocab_masked(vocab, text, NULL, out);
+}
+
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
-    tokenize_rendered_chat_vocab(&e->vocab, text, out);
+    tokenize_rendered_chat_vocab_masked(&e->vocab, text, NULL, out);
+}
+
+void ds4_tokenize_rendered_chat_masked(ds4_engine *e, const char *text,
+                                       const unsigned char *trusted, ds4_tokens *out) {
+    tokenize_rendered_chat_vocab_masked(&e->vocab, text, trusted, out);
+}
+
+/* sf-keep(server): cache keys carry the trusted mask instead of #1284's
+ * session_ambiguous, which turned every byte-keyed reuse tier off.  A key is
+ * the rendered text with each control spelling that tokenizes as TEXT
+ * prefixed by DS4_CHAT_KEY_ESC and each literal DS4_CHAT_KEY_ESC doubled, so
+ * equal keys mean equal control/text structure.  Renderer bytes plus mask and
+ * the tokens they produce give the same key; text with neither case is its
+ * own key, so those keys and their disk checkpoints are unchanged. */
+typedef struct {
+    char *v;
+    size_t len, cap;
+} chat_key_buf;
+
+static void chat_key_put(chat_key_buf *b, const char *p, size_t n) {
+    if (b->len + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap : 256;
+        while (cap < b->len + n + 1) cap *= 2;
+        b->v = xrealloc(b->v, cap);
+        b->cap = cap;
+    }
+    memcpy(b->v + b->len, p, n);
+    b->len += n;
+    b->v[b->len] = '\0';
+}
+
+/* One run of text bytes between two control tokens.  `p` must be readable up
+ * to a NUL at or after p[n]; matches are bounded to the run. */
+static void chat_key_text_run(const ds4_vocab *vocab, const char *p, size_t n,
+                              chat_key_buf *b) {
+    static const char esc = DS4_CHAT_KEY_ESC;
+    size_t i = 0, span = 0;
+    while (i < n) {
+        int token = -1;
+        size_t len = 0;
+        if (p[i] == esc) {
+            chat_key_put(b, p + span, i + 1 - span);
+            chat_key_put(b, &esc, 1);
+            span = ++i;
+        } else if (special_token_at(vocab, p + i, &token, &len) && len <= n - i) {
+            chat_key_put(b, p + span, i - span);
+            chat_key_put(b, &esc, 1);
+            chat_key_put(b, p + i, len);
+            span = i += len;
+        } else {
+            i++;
+        }
+    }
+    chat_key_put(b, p + span, n - span);
+}
+
+char *ds4_chat_key_text(ds4_engine *e, const char *text, const unsigned char *trusted) {
+    if (!e || !text) return NULL;
+    const ds4_vocab *vocab = &e->vocab;
+    chat_key_buf b = {0};
+    const char *span = text, *p = text;
+    while (*p) {
+        int token = -1;
+        size_t len = 0;
+        if (special_token_trusted_at(vocab, p, trusted ? trusted + (p - text) : NULL,
+                                     &token, &len)) {
+            chat_key_text_run(vocab, span, (size_t)(p - span), &b);
+            chat_key_put(&b, p, len);
+            p += len;
+            span = p;
+            continue;
+        }
+        p++;
+    }
+    chat_key_text_run(vocab, span, (size_t)(p - span), &b);
+    /* Escapes only add bytes: an equal length means the key is the text. */
+    if (b.len == (size_t)(p - text)) {
+        free(b.v);
+        return NULL;
+    }
+    return b.v;
+}
+
+char *ds4_tokens_key_text(ds4_engine *e, const ds4_tokens *tokens, size_t *out_len) {
+    chat_key_buf b = {0}, run = {0};
+    chat_key_put(&b, "", 0);
+    chat_key_put(&run, "", 0);
+    for (int i = 0; tokens && i < tokens->len; i++) {
+        size_t len = 0;
+        char *piece = ds4_token_text(e, tokens->v[i], &len);
+        int token = -1;
+        size_t special_len = 0;
+        if (special_token_at(&e->vocab, piece, &token, &special_len) &&
+            token == tokens->v[i] && special_len == len) {
+            chat_key_text_run(&e->vocab, run.v, run.len, &b);
+            run.len = 0;
+            run.v[0] = '\0';
+            chat_key_put(&b, piece, len);
+        } else {
+            chat_key_put(&run, piece, len);
+        }
+        free(piece);
+    }
+    chat_key_text_run(&e->vocab, run.v, run.len, &b);
+    free(run.v);
+    if (out_len) *out_len = b.len;
+    return b.v;
+}
+
+size_t ds4_chat_key_raw_offset(const char *key, size_t key_off) {
+    size_t raw = 0;
+    for (size_t i = 0; i < key_off; i++, raw++)
+        if (key[i] == DS4_CHAT_KEY_ESC) i++;
+    return raw;
 }
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
@@ -39713,6 +39848,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #endif
     if (ds4_model_is_qwen4()) {
         if (opt->inspect_only) {
+            /* Tokenizer-only tests can use an inspect-only engine; no weights
+             * are read. */
+            vocab_load(&e->vocab, &e->model);
             *out = e;
             return 0;
         }

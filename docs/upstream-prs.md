@@ -100,8 +100,8 @@ activation quantization, and any route that changes greedy output, is `drop`.
 | #1325 | server: evaluate Qwen's `<\|im_end\|>` after a thinking answer | open | `46374b0` | 1 | 2026-11-06 | 2026-11-13 | correctness (Qwen live-KV continuation); planned in `130-server-protocol-batch` |
 | #1140 | Let Qwen and GLM make several tool calls per turn | open | `480f2ae` | 1 | 2026-10-03 | 2026-11-13 | correctness (Qwen tool calls); planned in `130-server-protocol-batch` with #1251 |
 | #1251 | server: stream Qwen tool-call arguments over OpenAI SSE | open | `c98b444` | 1 | 2026-10-22 | 2026-11-13 | protocol (Qwen tool calls); planned in `130-server-protocol-batch` |
-| #1284 | Server: do not let chat content inject control tokens | open | `138cb39` | 2 | 2026-10-26 | 2026-11-13 | base of #1288; its own renderer part is DeepSeek V4.1 |
-| #1288 | Server: mask GLM and Qwen chat renderers | open | `0252371` | 6 | 2026-11-06 | 2026-11-13 | security (Qwen prompt injection), stacked on #1284; supersedes #197, #1159 and #1327; planned in `130-server-protocol-batch` |
+| #1284 | Server: do not let chat content inject control tokens | open | `138cb39` | 2 | 2026-10-26 | 2026-11-13 | base of #1288; its own renderer part is DeepSeek V4.1; ported by `131-trusted-marker-masking` |
+| #1288 | Server: mask GLM and Qwen chat renderers | open | `0252371` | 6 | 2026-11-06 | 2026-11-13 | security (Qwen prompt injection), stacked on #1284; supersedes #197, #1159 and #1327; Qwen parts ported by `131-trusted-marker-masking` |
 | #1134 | Keep mid-conversation system messages in place | open | `1074193` | 1 | 2026-09-27 | 2026-11-13 | correctness and KV reuse (Qwen renderer); planned in `130-server-protocol-batch` |
 | #1088 | server: recover unterminated reasoning as content when the turn completed | open | `00df8df` | 1 | 2026-10-31 | 2026-11-13 | correctness; planned in `130-server-protocol-batch` |
 | #1163 | Unterminated tool call: defer to the parse-failure recovery | open | `115ec43` | 1 | 2026-10-01 | 2026-11-13 | correctness (protocol); planned in `130-server-protocol-batch` |
@@ -407,12 +407,12 @@ and from `ds4_gpu_routed_moe_one_tensor`.
 
 | Commit | Subject | Verdict | Reason |
 |---|---|---|---|
-| `def0f60` | Server: do not let chat content inject control tokens | next sync | not in `upstream/main`; planned in `130-server-protocol-batch`. #1284 base: tracked trusted-byte mask, `ds4.c` and kvstore plumbing. Its renderer part is DeepSeek V4.1 (deleted in the child) |
-| `138cb39` | Server: keep buf_printf output untrusted in the tracked mask | next sync | #1284; planned in `130-server-protocol-batch` |
-| `e66797e` | Server: generalize raw tool replay and inspect-only vocab | next sync | needed by the Qwen mask; planned in `130-server-protocol-batch` |
-| `aa982ec` | Server: mask GLM renderer syntax | not reachable from Qwen | GLM renderer removed |
-| `6ee4a73` | Server: mask Qwen renderer syntax and test GLM/Qwen injection | next sync | Qwen prompt-injection fix (`<\|im_end\|>` and other markers in message data); planned in `130-server-protocol-batch`. Supersedes closed #1327 and open #197 (DeepSeek only) |
-| `0252371` | Server: test vision-token spellings and image-marker counts | next sync | tests; planned in `130-server-protocol-batch` |
+| `def0f60` | Server: do not let chat content inject control tokens | adopt -> `131-trusted-marker-masking` | not in `upstream/main`. Taken: tracked trusted-byte mask, masked tokenizer entry, masked live tool tails and kvstore suffix. Dropped: the DeepSeek V4.1 renderer part (deleted in the child) and `prompt_ambiguous`/`session_ambiguous`, which turn every byte-keyed tier and the disk cache off for a session with a masked spelling; the child keys those tiers with an escaped key text instead (`sf-keep(server)` in `ds4.c`) |
+| `138cb39` | Server: keep buf_printf output untrusted in the tracked mask | adopt -> `131-trusted-marker-masking` | #1284, with its test |
+| `e66797e` | Server: generalize raw tool replay and inspect-only vocab | adopt -> `131-trusted-marker-masking` | Qwen half (raw tool replay trusts only the delimiters; inspect-only engines load the vocab); GLM half dropped |
+| `aa982ec` | Server: mask GLM renderer syntax | drop | GLM renderer removed; not reachable from Qwen |
+| `6ee4a73` | Server: mask Qwen renderer syntax and test GLM/Qwen injection | adopt -> `131-trusted-marker-masking` | Qwen renderer specials, adapted to `92`'s renderer, and the Qwen injection test (`--special-token-injection-qwen`, extended with the key checks); GLM test dropped. Supersedes closed #1327 and open #197 (DeepSeek only) |
+| `0252371` | Server: test vision-token spellings and image-marker counts | drop | Qwen's vision spellings are not in `special_token_at`, so masking cannot change them; the DeepSeek41 embedding test has no target in the child |
 
 ### #1155 (head `8f61ece`)
 

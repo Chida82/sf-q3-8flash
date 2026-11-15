@@ -322,6 +322,17 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix);
 
 void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out);
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out);
+/* `trusted` is a byte mask over `text`; only positions it marks may turn into
+ * control tokens. NULL keeps the historical scan-everything behavior. */
+void ds4_tokenize_rendered_chat_masked(ds4_engine *e, const char *text,
+                                       const unsigned char *trusted, ds4_tokens *out);
+/* Cache key text: control spellings that tokenize as text are prefixed by
+ * DS4_CHAT_KEY_ESC (0xff, never in UTF-8), which is itself doubled.  The
+ * renderer form returns NULL when the key equals `text`. */
+#define DS4_CHAT_KEY_ESC '\xff'
+char *ds4_chat_key_text(ds4_engine *e, const char *text, const unsigned char *trusted);
+char *ds4_tokens_key_text(ds4_engine *e, const ds4_tokens *tokens, size_t *out_len);
+size_t ds4_chat_key_raw_offset(const char *key, size_t key_off);
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens);
 void ds4_encode_chat_prompt(
         ds4_engine *e,
