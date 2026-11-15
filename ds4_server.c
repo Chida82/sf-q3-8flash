@@ -2930,6 +2930,22 @@ static void append_trimmed_text(buf *out, const char *text) {
     buf_append(out, (const char *)start, (size_t)(end - start));
 }
 
+/* The one rule for a Qwen assistant answer body, shared by the renderer and
+ * the reuse-key builders so a stored key stays a prefix of the next prompt:
+ * leading whitespace goes; a plain answer (no tool calls) keeps its trailing
+ * whitespace so the echoed turn re-tokenizes to the sampled tokens.  Returns
+ * whether the body is non-empty. */
+static bool append_qwen_answer_body(buf *out, const char *content, bool has_calls) {
+    const unsigned char *start = (const unsigned char *)(content ? content : "");
+    while (*start && isspace(*start)) start++;
+    const unsigned char *end = start + strlen((const char *)start);
+    if (has_calls) {
+        while (end > start && isspace(end[-1])) end--;
+    }
+    buf_append(out, (const char *)start, (size_t)(end - start));
+    return end > start;
+}
+
 typedef struct {
     const chat_msg *msg;
     size_t order, position;
@@ -3056,15 +3072,7 @@ static void append_qwen_assistant_message(buf *out, const chat_msg *m,
     const char *reasoning = text.reasoning;
     const bool has_calls = m && m->calls.len > 0;
     buf body = {0};
-    append_trimmed_text(&body, content);
-    const bool has_content = body.len > 0;
-    if (has_content && !has_calls) {
-        /* keep a plain answer's trailing whitespace so the echoed turn
-         * re-tokenizes to the sampled tokens */
-        const char *end = content + strlen(content);
-        while (end > content && isspace((unsigned char)end[-1])) end--;
-        buf_append(&body, end, strlen(end));
-    }
+    const bool has_content = append_qwen_answer_body(&body, content, has_calls);
     buf_puts_special(out, "<|im_start|>assistant\n");
     if (keep_reasoning && !text_starts_with_think_tag(content)) {
         /* an empty reasoning block is exactly the no-thinking generation prompt */
@@ -11656,11 +11664,8 @@ static char *build_qwen_assistant_suffix(const request *r, const char *content,
         if (with_reasoning) append_trimmed_text(&suffix, reasoning);
         buf_puts_special(&suffix, "\n</think>\n\n");
     }
-    buf body = {0};
-    append_trimmed_text(&body, content);
-    buf_puts(&suffix, body.ptr ? body.ptr : "");
-    append_qwen_tool_calls_text(&suffix, calls, body.len > 0, r ? &r->tool_orders : NULL);
-    buf_free(&body);
+    const bool has_content = append_qwen_answer_body(&suffix, content, calls && calls->len > 0);
+    append_qwen_tool_calls_text(&suffix, calls, has_content, r ? &r->tool_orders : NULL);
     buf_puts_special(&suffix, "<|im_end|>");
     return buf_take_masked(&suffix, trusted_out);
 }
@@ -11702,7 +11707,7 @@ static char *build_thinking_visible_text(const request *r,
 
     size_t pt_len = strlen(r->prompt_text);
     /* the next request renders this turn as an empty think block plus the
-     * trimmed content, closed by <|im_end|> */
+     * answer body, closed by <|im_end|> */
     const char *gen = "<|im_start|>assistant\n<think>\n";
     const size_t gen_len = strlen(gen);
     if (pt_len < gen_len || memcmp(r->prompt_text + pt_len - gen_len, gen, gen_len) != 0) return NULL;
@@ -11710,7 +11715,8 @@ static char *build_thinking_visible_text(const request *r,
     buf_track_trusted(&visible);
     buf_append_masked(&visible, r->prompt_text, pt_len, r->prompt_trusted);
     buf_puts_special(&visible, "\n</think>\n\n");
-    append_trimmed_text(&visible, content ? content : "");
+    /* only plain answers reach this key: tool turns have their own */
+    append_qwen_answer_body(&visible, content, false);
     buf_puts_special(&visible, "<|im_end|>\n");
     return buf_take_masked(&visible, trusted_out);
 }
@@ -17196,7 +17202,7 @@ static void test_qwen_thinking_visible_text_matches_render(void) {
         chat_msgs_push(&history, h_user1);
         chat_msg h_asst = {0};
         h_asst.role = xstrdup("assistant");
-        h_asst.content = xstrdup("The answer is 4.");
+        h_asst.content = xstrdup("The answer is 4.\n");
         chat_msgs_push(&history, h_asst);
         chat_msg h_user2 = {0};
         h_user2.role = xstrdup("user");
@@ -17221,7 +17227,7 @@ static void test_qwen_thinking_visible_text_matches_render(void) {
         TEST_ASSERT(strncmp(future, visible, strlen(visible)) != 0);
         free(future);
         free(history.v[1].content);
-        history.v[1].content = xstrdup("The answer is 4.");
+        history.v[1].content = xstrdup("The answer is 4.\n");
         future = render_qwen_chat_prompt_text(&history, "{\"name\":\"different_tool\"}", NULL, DS4_THINK_HIGH, true, NULL);
         TEST_ASSERT(strncmp(future, visible, strlen(visible)) != 0);
         free(future);
@@ -17231,6 +17237,110 @@ static void test_qwen_thinking_visible_text_matches_render(void) {
         chat_msgs_free(&history);
         chat_msgs_free(&msgs);
     }
+}
+
+static void test_answer_key_calls(tool_calls *calls, bool raw) {
+    tool_call tc = {0};
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"ls\"}");
+    tool_calls_push(calls, tc);
+    if (raw) calls->raw_tool_text = xstrdup(
+        "\n\n<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>");
+}
+
+/* Every visible key a Qwen turn stores is a prefix of the prompt the next
+ * request renders when the client echoes the turn as it received it.  131's
+ * key space is a function of bytes and trusted mask, so a byte-and-mask prefix
+ * is a key-space prefix. */
+static void test_qwen_visible_keys_prefix_next_render(void) {
+    static const char *const endings[] = {"\n", "\n\n", "  ", ""};
+    int checked = 0;
+    for (size_t e = 0; e < sizeof(endings) / sizeof(endings[0]); e++)
+    for (int calls_on = 0; calls_on < 2; calls_on++)
+    for (int think_on = 0; think_on < 2; think_on++)
+    /* 0: chat, client omits reasoning (thinking or tool-turn visible key);
+     * 1: chat, client echoes reasoning (tool checkpoint); 2: Responses */
+    for (int api = 0; api < 3; api++) {
+        if (api == 1 && !calls_on) continue;
+        const ds4_think_mode mode = think_on ? DS4_THINK_HIGH : DS4_THINK_NONE;
+        char content[32];
+        snprintf(content, sizeof(content), "Answer.%s", endings[e]);
+        const char *reasoning = think_on ? "Thinking." : "";
+        chat_msgs msgs = {0};
+        chat_msg user = {0};
+        user.role = xstrdup("user");
+        user.content = xstrdup("Question?");
+        chat_msgs_push(&msgs, user);
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+        r.think_mode = mode;
+        if (api == 2) r.api = API_RESPONSES;
+        r.reasoning_summary_emit = true;
+        r.prompt_text = render_qwen_chat_prompt_text(&msgs, NULL, NULL, mode, true,
+                                                     &r.prompt_trusted);
+        tool_calls calls = {0};
+        if (calls_on) test_answer_key_calls(&calls, api == 0);
+        bool echo_reasoning = false;
+        unsigned char *key_trusted = NULL;
+        char *key = NULL;
+        if (api == 0 && !calls_on) {
+            key = build_thinking_visible_text(&r, content, &key_trusted);
+            if (!think_on) TEST_ASSERT(key == NULL);
+        } else if (api == 0) {
+            key = build_qwen_tool_turn_visible_text(&r, "tool_calls", false, content,
+                                                    &calls, &key_trusted);
+        } else {
+            unsigned char *suffix_trusted = NULL;
+            char *suffix = api == 1
+                ? build_tool_checkpoint_suffix(&r, content, reasoning, &calls, &suffix_trusted)
+                : build_responses_visible_assistant_suffix(&r, content, reasoning,
+                                                           calls_on ? &calls : NULL,
+                                                           &suffix_trusted);
+            /* the reasoning these keys carry, which the client then sends back */
+            echo_reasoning = api == 1 || calls_on;
+            buf b = {0};
+            buf_track_trusted(&b);
+            buf_append_masked(&b, r.prompt_text, strlen(r.prompt_text), r.prompt_trusted);
+            buf_append_masked(&b, suffix, strlen(suffix), suffix_trusted);
+            key = buf_take_masked(&b, &key_trusted);
+            free(suffix);
+            free(suffix_trusted);
+        }
+        if (key) {
+            chat_msg asst = {0};
+            asst.role = xstrdup("assistant");
+            asst.content = xstrdup(content);
+            asst.reasoning = xstrdup(echo_reasoning ? reasoning : "");
+            if (calls_on) test_answer_key_calls(&asst.calls, api == 0);
+            chat_msgs_push(&msgs, asst);
+            chat_msg next = {0};
+            next.role = xstrdup(calls_on ? "tool" : "user");
+            next.content = xstrdup(calls_on ? "a.txt" : "Next?");
+            chat_msgs_push(&msgs, next);
+            unsigned char *next_trusted = NULL;
+            char *rendered = render_qwen_chat_prompt_text(&msgs, NULL, NULL, mode, true,
+                                                          &next_trusted);
+            const size_t n = strlen(key);
+            const bool prefix = strlen(rendered) > n && !memcmp(rendered, key, n) &&
+                                !memcmp(next_trusted, key_trusted, n);
+            if (!prefix) {
+                fprintf(stderr, "visible key not a prefix: ending=%zu calls=%d think=%d api=%d\n",
+                        e, calls_on, think_on, api);
+            }
+            TEST_ASSERT(prefix);
+            checked++;
+            free(rendered);
+            free(next_trusted);
+        }
+        free(key);
+        free(key_trusted);
+        tool_calls_free(&calls);
+        request_free(&r);
+        chat_msgs_free(&msgs);
+    }
+    /* per ending: 5 keys with thinking, 4 without (no thinking key) */
+    TEST_ASSERT(checked == 36);
 }
 
 static void test_qwen_checkpoint_suffix_matches_render(void) {
@@ -19877,6 +19987,7 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_plain_answer_keeps_trailing_whitespace();
     test_qwen_checkpoint_suffix_matches_render();
     test_qwen_thinking_visible_text_matches_render();
+    test_qwen_visible_keys_prefix_next_render();
     test_qwen_reasoning_effort_levels();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();

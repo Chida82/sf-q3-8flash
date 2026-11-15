@@ -58,6 +58,15 @@ The cache validates model and quantization identity. Use
 `--kv-cache-reject-different-quant` for strict quantization isolation. Tool-call
 continuations retain the exact sampled model state when protocol IDs permit it.
 
+At the end of a turn the server also stores visible keys: the transcript as
+the next request renders it when the client echoes the turn without hidden
+state (the Responses-visible checkpoint, the key for chat clients that omit
+reasoning, tool checkpoints). Keys and renderer write an answer with one rule:
+leading whitespace is dropped; a plain answer (no tool calls) keeps its
+trailing whitespace, which the model sampled; an answer with tool calls is
+trimmed at both ends. Echo answers as received: a client that strips a plain
+answer's trailing newline renders a different prompt and misses that key.
+
 ## Concurrency
 
 `--batched-session N` keeps N resident sessions and batches decode-ready work.
