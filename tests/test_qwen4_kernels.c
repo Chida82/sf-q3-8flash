@@ -1910,6 +1910,36 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     const char *dname = dtype == 10u ? "q2_K" : dtype == 39u ? "mxfp4" : q8 ? "q8_0" : "f32";
     snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: reduce+combine", dname, E, F, slots, T);
     check_tensor(name, gR, R_ref, (uint64_t)T * 4 * E, 2e-5);
+    if (dtype == 10u && T <= 3u) {
+        /* The folded Q2_K down + reduce serves decode and the MTP verify rows
+         * (97): it must reproduce the verify dispatch, down then reduce, byte
+         * for byte, output and residual. */
+        const uint64_t no = (uint64_t)T * E, nr = (uint64_t)T * 4 * E;
+        ds4_gpu_tensor *rR = upload(R0, nr), *fR = upload(R0, nr);
+        ds4_gpu_tensor *rout = upload(NULL, no), *fout = upload(NULL, no);
+        float *ro = malloc(no * sizeof(float)), *fo = malloc(no * sizeof(float));
+        float *rr = malloc(nr * sizeof(float)), *fr = malloc(nr * sizeof(float));
+        require_ok(rR && fR && rout && fout && ro && fo && rr && fr, "folded down allocation");
+        ds4_gpu_qwen4_set_verify_rows_exact(T > 1u);
+        require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off, dtype, NE, T, slots,
+                                                 F, E, sd_off, shared_type) &&
+                   ds4_gpu_qwen4_moe_reduce_tensor(rout, gpart, gw, gsg, NULL, rR, ginj, T, slots, n_out, E, 4),
+                   "verify down + reduce");
+        require_ok(ds4_gpu_qwen4_moe_down_reduce_tensor(fout, gmid, gsel, gw, gsg, fR, ginj, a->base, a->size, down_off,
+                                                        dtype, NE, T, slots, F, E, sd_off, shared_type, 4),
+                   "folded down + reduce");
+        ds4_gpu_qwen4_set_verify_rows_exact(false);
+        require_ok(ds4_gpu_tensor_read(rout, 0, ro, no * sizeof(float)) &&
+                   ds4_gpu_tensor_read(fout, 0, fo, no * sizeof(float)) &&
+                   ds4_gpu_tensor_read(rR, 0, rr, nr * sizeof(float)) &&
+                   ds4_gpu_tensor_read(fR, 0, fr, nr * sizeof(float)), "folded down read");
+        check_exact_f32("folded Q2_K down+reduce output vs down + reduce", fo, ro, no);
+        check_exact_f32("folded Q2_K down+reduce residual vs down + reduce", fr, rr, nr);
+        printf("  moe q2_K E=%u F=%u slots=%u T=%u: folded down+reduce byte-exact vs down + reduce (output, residual)\n",
+               E, F, slots, T);
+        free(ro); free(fo); free(rr); free(fr);
+        ds4_gpu_tensor_free(rR); ds4_gpu_tensor_free(fR); ds4_gpu_tensor_free(rout); ds4_gpu_tensor_free(fout);
+    }
     ds4_gpu_tensor_free(ginj); ds4_gpu_tensor_free(gR); free(R_ref); free(injv); free(R0);
     snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: mid (+shared)", tier_name, E, F, slots, T);
     check_tensor(name, gmid, mid, (uint64_t)T * n_out * F, 2e-5);
@@ -4566,6 +4596,8 @@ int main(void) {
     test_moe(&arena, 16, 10, 2560, 640, 2, 12u);
     test_moe_types(&arena, 16, 10, 2560, 640, 2, 12u, 39u);
     test_moe_types(&arena, 16, 10, 2560, 640, 1, 16u, 10u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 2, 16u, 10u);   /* MTP verify rows (97) */
+    test_moe_types(&arena, 16, 10, 2560, 640, 3, 16u, 10u);
     test_moe_types(&arena, 16, 10, 2560, 640, 37, 16u, 10u);
     test_moe_types(&arena, 8, 6, 256, 256, 9, 16u, 10u);
     test_moe(&arena, 16, 10, 2560, 640, 37, 12u);

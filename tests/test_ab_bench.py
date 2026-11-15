@@ -172,6 +172,30 @@ class SectionsTest(unittest.TestCase):
         self.assertAlmostEqual(t["ratio"], 0.98)
         self.assertEqual(t["n"], 2)
 
+    def test_mtp_verify_shapes_per_size(self):
+        err = (chunk_line(0, 2048, 50.0) + decode_line(1300.0, tokens=2) + decode_line(1500.0, tokens=3)
+               + decode_line(1100.0, tokens=2) + decode_line(700.0))
+        s = ab.parse_sections(err, "mtp-code")
+        self.assertEqual(list(s), ["prefill 2048", "verify T=2", "verify T=3"])  # T=1 is no verify pass
+        self.assertAlmostEqual(s["verify T=2"]["moe_down"], 1200.0)
+        with self.assertRaises(ab.Stop) as cm:
+            ab.parse_sections(chunk_line(0, 2048, 50.0) + decode_line(700.0), "mtp-code")
+        self.assertIn("verify", str(cm.exception))
+        cmd = ab.bench_cmd(Path("/t"), "mtp-code", "/m.gguf", "/c.csv", sections=True)
+        self.assertEqual(cmd[cmd.index("-n") + 1], str(ab.SECTIONS_MTP_GEN))
+        self.assertEqual(ab.bench_cmd(Path("/t"), "mtp-code", "/m.gguf", "/c.csv")[7:9], ["-n", "128"])
+
+    def test_verify_size_judged_on_the_pairs_that_have_it(self):
+        runs = section_quads(((1.0, 1.0), (1.0, 1.0)))
+        for r in runs:
+            r["sections"]["verify T=3"] = dict(r["sections"]["decode"])
+            if r["build"] == "B":
+                r["sections"]["verify T=3"]["moe_down"] *= 0.98
+        del runs[-1]["sections"]["verify T=3"]  # the second pair's A did not reach 50 passes of T=3
+        t = next(x for x in ab.section_table(runs, ["plain"], ["moe_down"]) if x["shape"] == "verify T=3")
+        self.assertEqual(t["n"], 1)
+        self.assertAlmostEqual(t["ratio"], 0.98)
+
     def test_missing_chunk_is_a_run_failure(self):
         for err, named in ((PLAIN_SECTIONS.replace("pos=8192 T=512", "pos=8192 T=511"), "prefill +512"),
                            (PLAIN_SECTIONS.replace("T=2048 ok=1", "T=2048 ok=0"), "ok=0")):

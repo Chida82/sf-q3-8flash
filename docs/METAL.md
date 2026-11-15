@@ -28,8 +28,12 @@ gate/up and down kernels. On the tiled prefill path they hold the routed
 experts only, and the router, the shared expert and the reduce stay in
 `moe`; on single-token decode and MTP verify (T <= 8) they also include the
 shared expert, which runs as an extra slot; decode batches of 9 to 64 rows on
-the grouped path are not split. The waits slow the run, but its output is
-unchanged.
+the grouped path are not split. With Q2_K down experts (the Q2 pack),
+single-token decode and the 2- and 3-row MTP verify fold the down rows and the
+weighted reduce into one kernel (`kernel_qwen4_moe_down_reduce`, each row with
+its single-token arithmetic), so their down time is reported under `moe` and
+`moe_down` reads 0; judge such a step on `moe,moe_down` together. The waits
+slow the run, but its output is unchanged.
 
 Use `make test-qwen4-kernels` after Metal or kernel changes and run model-backed
 parity before landing performance work.

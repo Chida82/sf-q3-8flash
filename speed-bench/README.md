@@ -86,7 +86,10 @@ lean: in `60-q4-expert-prefill` a step that changed no kernel read prefill 8192
 and correctness gate with `DS4_QWEN4_TIMING=2` set for both builds, and judges
 GPU time instead of throughput. Kinds default to `plain`. For every prefill
 chunk a kind times, and for plain also a `decode` shape (the mean of the
-profiler's single-token lines, each the µs per pass over 50 passes), a run's
+profiler's single-token lines, each the µs per pass over 50 passes), and for an
+MTP kind a `verify T=<n>` shape for each verify size that reached 50 passes
+(under `--sections` the MTP kinds generate 640 tokens instead of 128 so that
+they do; prose has few 3-row cycles and may report `verify T=2` only), a run's
 ratio is the GPU time of the named stage groups over the time of the other
 groups of the same chunk or pass. The other groups run at
 the same clock, so the ratio cancels the drift between runs. The summary gives,

@@ -5,8 +5,8 @@ Runs the benchmark of build A (baseline) and build B (candidate) on one GGUF,
 one process at a time, in A B B A quads, and reports the median B/A ratio per
 metric. The verdict is gated on identical tokens and, with --bitwise, on
 identical logit bits. With --sections it runs the same schedule under the GPU
-section profiler and judges GPU time per prefill chunk and decode pass instead of
-throughput.
+section profiler and judges GPU time per prefill chunk and decode or MTP verify
+pass instead of throughput.
 See "A/B harness" in speed-bench/README.md.
 """
 
@@ -55,8 +55,11 @@ MTP = re.compile(r'^ds4-bench: mtp\[ctx=(\d+)\] cycles=(\d+) tokens=(\d+)'
 # DS4_QWEN4_TIMING=2 stage groups (ds4.c qwen4_prof_names) and their per-chunk prefill line
 GROUPS = ('ple', 'hc_attn', 'gdn', 'attn', 'hc_ffn', 'moe', 'moe_mid', 'moe_down', 'head')
 CHUNK = re.compile(r'^ds4: Qwen3\.8 prefill stage GPU ms/chunk \(pos=(\d+) T=(\d+) ok=(\d)\):(.*)$', re.M)
-# single-token decode: the mean GPU us per pass of each group, printed every 50 passes
-DECODE = re.compile(r'^ds4: Qwen3\.8 T=1 GPU us/pass over 50 passes:(.*)$', re.M)
+# decode (T=1) and MTP verify (T=2, 3) passes: the mean GPU us per pass of each group,
+# printed every 50 passes of one T
+PASS = re.compile(r'^ds4: Qwen3\.8 T=(\d+) GPU us/pass over 50 passes:(.*)$', re.M)
+# under --sections the MTP kinds generate this many tokens, so their verify sizes reach 50 passes
+SECTIONS_MTP_GEN = 640
 
 
 class Stop(Exception):
@@ -199,10 +202,11 @@ class Monitor:
 
 # --- one run ----------------------------------------------------------------
 
-def bench_cmd(tree, kind, model, csv_path, logits_dir=None, extra=()):
+def bench_cmd(tree, kind, model, csv_path, logits_dir=None, extra=(), sections=False):
     k = KINDS[kind]
+    gen = SECTIONS_MTP_GEN if sections and k['mtp'] else k['gen']
     cmd = [str(tree / BENCH), '-m', str(model), '--prompt-file', str(ROOT / k['prompt']),
-           '--frontiers', ','.join(map(str, k['frontiers'])), '-n', str(k['gen']),
+           '--frontiers', ','.join(map(str, k['frontiers'])), '-n', str(gen),
            '--show-output', '--csv', str(csv_path)]
     if k['mtp']:
         cmd.append('--mtp')
@@ -256,8 +260,9 @@ def parse_run(csv_text, err_text, kind):
 
 
 def section_shapes(kind):
-    """The shapes the section-time mode judges: the kind's prefill chunks, and for plain its
-    single-token decode passes."""
+    """The shapes the section-time mode requires: the kind's prefill chunks, and for plain its
+    single-token decode passes. An MTP kind adds a 'verify T=<n>' shape for every verify size
+    that reached 50 passes (parse_sections)."""
     return [name for name, _, _ in shapes(kind)] + (['decode'] if kind == 'plain' else [])
 
 
@@ -271,7 +276,8 @@ def group_times(text, where, kind):
 
 def parse_sections(err_text, kind):
     """GPU time per stage group of each shape the kind is judged on, from the profiler's lines:
-    ms per prefill chunk, and for decode the mean us per pass over the run's lines."""
+    ms per prefill chunk, and for decode and each verify size the mean us per pass over the
+    run's lines of that T."""
     chunks = {}
     for m in CHUNK.finditer(err_text):
         if m[3] != '1':
@@ -282,11 +288,19 @@ def parse_sections(err_text, kind):
         if (pos, tokens) not in chunks:
             raise Stop(1, f'{kind}: no section-time line for {name} (pos={pos} T={tokens})')
         out[name] = chunks[pos, tokens]
+    passes = {}
+    for m in PASS.finditer(err_text):
+        passes.setdefault(int(m[1]), []).append(group_times(m[2], f'T={m[1]}', kind))
+    mean = {t: {g: statistics.fmean(p[g] for p in lines) for g in GROUPS} for t, lines in passes.items()}
     if 'decode' in section_shapes(kind):
-        passes = [group_times(m[1], 'decode', kind) for m in DECODE.finditer(err_text)]
-        if not passes:
+        if 1 not in mean:
             raise Stop(1, f'{kind}: no section-time line for decode (T=1)')
-        out['decode'] = {g: statistics.fmean(p[g] for p in passes) for g in GROUPS}
+        out['decode'] = mean[1]
+    if KINDS[kind]['mtp']:
+        verify = sorted(t for t in mean if t > 1)
+        if not verify:
+            raise Stop(1, f'{kind}: no section-time line for a verify pass (T>1)')
+        out.update((f'verify T={t}', mean[t]) for t in verify)
     return out
 
 
@@ -300,7 +314,7 @@ def run_bench(n, build, tree, kind, model, env, out, phase, bitwise, sections=Fa
     logits_dir = out / 'logits' / f'{build}-{kind}' if phase == 'warm-up' and bitwise else None
     if logits_dir:
         logits_dir.mkdir(parents=True)
-    cmd = bench_cmd(tree, kind, model, f'{stem}.csv', logits_dir, extra)
+    cmd = bench_cmd(tree, kind, model, f'{stem}.csv', logits_dir, extra, sections)
     start = time.time()
     with open(f'{stem}.err', 'wb') as err:
         rc = subprocess.run(cmd, cwd=tree, env=env, stdout=subprocess.DEVNULL, stderr=err).returncode
@@ -484,9 +498,11 @@ def section_table(runs, kinds, targets):
     table = []
     for kind in kinds:
         valid = [(a, b) for a, b in pairs(timed, kind) if not a.get('flag')]
-        for name in section_shapes(kind):
+        # verify shapes exist only where a run reached 50 passes of that T
+        names = dict.fromkeys(n for r in timed if r['kind'] == kind for n in r['sections'])
+        for name in names:
             split = [(section_split(a['sections'][name], targets), section_split(b['sections'][name], targets))
-                     for a, b in valid]
+                     for a, b in valid if name in a['sections'] and name in b['sections']]
             split = [(x, y) for x, y in split if x[0] > 0 and x[1] > 0 and y[1] > 0]
             ratios = [(bt / bu) / (at / au) for (at, au), (bt, bu) in split]
             lo, hi = bootstrap_ci(ratios)
@@ -522,7 +538,7 @@ def record_row(step, date, commit, model, valid_pairs, correctness, table):
 
 def section_lines(ctx, sections):
     lines = [f'sections  target {"+".join(ctx["sections"])}; B/A of (target / untouched) GPU time per '
-             'prefill chunk (ms) or decode pass (us), per valid pair',
+             'prefill chunk (ms) or decode/verify pass (us), per valid pair',
              f'{"kind":<10} {"shape":<14} {"A target":>9} {"B target":>9} {"A other":>9} {"B other":>9} '
              f'{"B/A":>7}  {"95% CI":<17} {"whole":>7} n']
     for t in sections:
@@ -642,7 +658,7 @@ def parse_args(argv):
                    help='seconds of load before the timed rounds (at most half the budget); '
                         'the M5 Max reaches its thermal plateau about 215-240 s into a run')
     p.add_argument('--sections', metavar='GROUPS',
-                   help='judge GPU time per prefill chunk and decode pass: comma list of the '
+                   help='judge GPU time per prefill chunk and decode or MTP verify pass: comma list of the '
                         f'DS4_QWEN4_TIMING=2 groups the step targets ({", ".join(GROUPS)}), '
                         'normalized by the other groups')
     p.add_argument('--out', help='output directory (default $TMPDIR/sf-q3-8flash-ab/<UTC time>)')

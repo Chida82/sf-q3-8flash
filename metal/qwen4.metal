@@ -3462,23 +3462,24 @@ kernel void kernel_qwen4_moe_down(
     }
 }
 
-/* Single-token routed down rows with the weighted reduce folded in.  A
- * threadgroup holds one simdgroup per slot (the shared expert last) over the
- * same few output rows; each computes kernel_qwen4_moe_down's row dot, then
- * one thread per row combines the slots exactly as kernel_qwen4_moe_reduce
- * does and applies the hyper-connection update. */
+/* Decode and MTP verify routed down rows with the weighted reduce folded in.
+ * A threadgroup holds one simdgroup per slot (the shared expert last) over
+ * the same few output rows of one token (grid y); each computes
+ * kernel_qwen4_moe_down's row dot, then one thread per row combines the
+ * slots exactly as kernel_qwen4_moe_reduce does and applies the
+ * hyper-connection update.  Every token keeps the single-token arithmetic. */
 #define QWEN4_DOWN_REDUCE_ROWS 4
 kernel void kernel_qwen4_moe_down_reduce(
         constant ds4_metal_args_qwen4_moe & args,
         device const char    *down_base,
-        device const int32_t *selected,     /* [n_slots] */
-        device const float   *mid,          /* [n_slots+1][in_dim] */
+        device const int32_t *selected,     /* [T][n_slots] */
+        device const float   *mid,          /* [T][n_slots+1][in_dim] */
         device const char    *sh_down,
-        device const float   *weights,      /* [n_slots] */
-        device const float   *shared_gate,  /* [1] raw logit */
-        device float         *out,          /* [out_rows] */
-        device float         *R,            /* [n_hc*out_rows] */
-        device const float   *inj,          /* [n_hc*chunks][n_hc] norm partials */
+        device const float   *weights,      /* [T][n_slots] */
+        device const float   *shared_gate,  /* [T] raw logit */
+        device float         *out,          /* [T][out_rows] */
+        device float         *R,            /* [T][n_hc*out_rows] */
+        device const float   *inj,          /* [T][n_hc*chunks][n_hc] norm partials */
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tid [[thread_index_in_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]],
@@ -3486,6 +3487,15 @@ kernel void kernel_qwen4_moe_down_reduce(
     threadgroup float part[17][QWEN4_DOWN_REDUCE_ROWS];
     threadgroup float wgt[8];
     const uint n_hc = args.n_hc, ns = args.n_slots, slot = sgitg;
+    const uint tok = tgpig.y;
+    if (tok >= args.n_tokens) return;
+    selected += (uint64_t)tok * ns;
+    mid += (uint64_t)tok * (ns + 1u) * args.in_dim;
+    weights += (uint64_t)tok * ns;
+    shared_gate += tok;
+    out += (uint64_t)tok * args.out_rows;
+    R += (uint64_t)tok * n_hc * args.out_rows;
+    inj += (uint64_t)tok * n_hc * QWEN4_HC_CHUNKS * n_hc;
     if (tid < n_hc) wgt[tid] = qwen4_hc_inject_weight(inj, n_hc, tid);
     const uint dim = is_function_constant_defined(qwen4_mv_dim) ? qwen4_mv_dim : args.in_dim;
     const uint wt = is_function_constant_defined(qwen4_mv_type) ? qwen4_mv_type : args.weight_type;
