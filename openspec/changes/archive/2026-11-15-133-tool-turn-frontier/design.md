@@ -45,6 +45,9 @@ any turn on `agent_reuse.py` that ends on the model's stop with trailing
 output. Below it, the log line stays as the sentinel and the change closes
 with figures only.
 
+Outcome: on `ceccded`, Q4, Q4 `--mtp` and Q2 ran 48 turns (30 tool turns)
+with no such turn, not even a `length` one. D1 was not built.
+
 ### D3. Exactness
 
 The restored session must be byte-equal to a session that stopped at the

@@ -129,7 +129,8 @@ prompt.
 - **Tool calls.** A turn can hold several `<tool_call>` blocks; generation
   continues after each one until the end token or non-call text, which is
   dropped together with the live frontier of that turn (logged as "bytes
-  after the last closed tool call dropped"). A streamed call (OpenAI
+  after the last closed tool call dropped"; on `speed-bench/agent_reuse.py`
+  no turn does this, so the frontier is not restored). A streamed call (OpenAI
   `tool_calls` delta, Anthropic `tool_use` block) is sent whole as soon as
   its `</tool_call>` arrives, with the arguments the final message carries;
   arguments are not streamed piece by piece, so a call that a token limit or

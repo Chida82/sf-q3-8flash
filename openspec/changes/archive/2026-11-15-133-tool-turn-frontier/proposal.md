@@ -33,6 +33,10 @@ already cut by `max_tokens`, which loses the frontier anyway.
    exact again. The reply is unchanged: the server already drops that text.
 3. Keep the dropped bytes in the log line, and add the rewind cost.
 
+Outcome: step 1 found no such turn (0 in 48 turns on Q4, Q4 `--mtp` and Q2;
+30 tool turns). Steps 2 and 3 were not built; the log line stays as the
+sentinel.
+
 Non-goals:
 - no constraint on what the model may sample after a call (it would change
   output);
