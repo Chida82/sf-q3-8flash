@@ -26587,6 +26587,9 @@ typedef struct ds4_qwen4_gpu_graph {
     ds4_gpu_tensor *layer_block_key[DS4_MAX_LAYER];
     /* A separate injection buffer keeps combined normalization race-free. */
     ds4_gpu_tensor *inj_alt;
+    /* Deferred HC write: blk/inj hold an unwritten R += wgt * blk residual
+     * combine that the next stream norm applies in place */
+    bool hc_pending;
     /* MTP: the next-token ids of a predictor pass, its staged input and
      * residual, and the recurrent-state snapshot that verify rollback
      * restores */
@@ -27061,11 +27064,14 @@ static bool qwen4_graph_apply_steering_ffn(ds4_qwen4_gpu_graph *g, uint32_t il, 
                g->R, g->steer_dirs, il, DS4_N_EMBD, T * DS4_N_HC, g->steer_ffn_scale) != 0;
 }
 
+static bool qwen4_hc_flush_write(ds4_qwen4_gpu_graph *g, uint32_t T);
+
 /* Last prompt token, HC-mean of residual R. Filename uses pos0 so
  * dir-steering/tools/build_direction.py can reuse the DeepSeek dump layout. */
 static void qwen4_graph_dump_last_ffn(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t T) {
     const char *prefix = metal_graph_debug_prefix_for("ffn_out", il, 0);
     if (!g || !g->R || T == 0 || !prefix) return;
+    if (!qwen4_hc_flush_write(g, T)) return;   /* the dump reads the residual */
     if (ds4_gpu_synchronize() == 0) return;
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC;
     float *hc_row = xmalloc((size_t)hc * E * sizeof(hc_row[0]));
@@ -27291,14 +27297,37 @@ static int qwen4_idx_select(ds4_gpu_tensor *sel, const ds4_gpu_tensor *score, co
                      : ds4_gpu_qwen4_idx_select_tensor(sel, score, tile_max, n_blocks, n_tokens, top_k);
 }
 
+/* Apply a pending HC residual write eagerly (kernel_qwen4_hc_combine). */
+static bool qwen4_hc_flush_write(ds4_qwen4_gpu_graph *g, uint32_t T) {
+    if (!g->hc_pending) return true;
+    g->hc_pending = false;
+    return ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0;
+}
+
 /* grouped norm -> low-rank gate -> mixed; inject may be NULL (final mixer) */
 static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                const ds4_tensor *norm, const ds4_tensor *down,
                                const ds4_tensor *up, const ds4_tensor *inject, uint32_t T) {
-    bool ok = ds4_gpu_qwen4_hc_norm_tensor(g->xn, g->inj, g->R, m->map, m->size, norm->abs_offset,
-                                           inject ? inject->abs_offset : 0, inject ? inject->type : DS4_TENSOR_F32,
-                                           T, DS4_N_EMBD, DS4_N_HC, inject ? DS4_N_HC : 0u, DS4_RMS_EPS) &&
-              qwen4_gemv(g->lo, m, down, g->xn, T);
+    bool ok = false;
+    if (g->hc_pending && inject) {
+        /* Apply the pending residual write inside this norm pass; the inject
+         * partials go to the buffer the write's weight was not read from. */
+        ok = ds4_gpu_qwen4_hc_combine_norm_rows_tensor(
+                 g->R, g->xn, g->inj_alt, g->blk, g->inj, m->map, m->size,
+                 norm->abs_offset, inject->abs_offset, inject->type,
+                 T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC, DS4_RMS_EPS) != 0;
+        if (ok) {
+            g->hc_pending = false;
+            ds4_gpu_tensor *swap = g->inj; g->inj = g->inj_alt; g->inj_alt = swap;
+        }
+    }
+    if (!ok) {
+        if (!qwen4_hc_flush_write(g, T)) return false;
+        ok = ds4_gpu_qwen4_hc_norm_tensor(g->xn, g->inj, g->R, m->map, m->size, norm->abs_offset,
+                                          inject ? inject->abs_offset : 0, inject ? inject->type : DS4_TENSOR_F32,
+                                          T, DS4_N_EMBD, DS4_N_HC, inject ? DS4_N_HC : 0u, DS4_RMS_EPS);
+    }
+    ok = ok && qwen4_gemv(g->lo, m, down, g->xn, T);
     if (T > 8u &&
         up->type != DS4_TENSOR_Q8_0) {
         /* prefill: the up projection as a GEMM over the activated low-rank rows */
@@ -27565,8 +27594,9 @@ static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elaps
     return qwen4_graph_begin_commands_if_needed();
 }
 
+/* defer_hc leaves the reduce's residual write pending for the next stream norm */
 static bool qwen4_graph_moe_impl(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
-                                uint32_t il, uint32_t T, bool last_only) {
+                                uint32_t il, uint32_t T, bool last_only, bool defer_hc) {
 #ifndef DS4_HAS_QWEN4_METAL
     (void)il;
 #endif
@@ -27675,8 +27705,8 @@ static bool qwen4_graph_moe_impl(ds4_qwen4_gpu_graph *g, const ds4_model *m, con
             qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->sh_mid, T);
         ok = ok && ds4_gpu_qwen4_moe_reduce_tensor(
             g->blk, g->part, g->weights, g->sh_gate_logit, shared_dense ? g->sh_out : NULL,
-            g->R, g->inj, T, DS4_N_EXPERT_USED, DS4_N_EXPERT_USED + (shared_dense ? 0u : 1u),
-            DS4_N_EMBD, DS4_N_HC) != 0;
+            defer_hc ? NULL : g->R, defer_hc ? NULL : g->inj, T, DS4_N_EXPERT_USED,
+            DS4_N_EXPERT_USED + (shared_dense ? 0u : 1u), DS4_N_EMBD, DS4_N_HC) != 0;
         goto done;
     }
 #endif
@@ -27709,7 +27739,8 @@ static bool qwen4_graph_moe_impl(ds4_qwen4_gpu_graph *g, const ds4_model *m, con
                  qwen4_moe_profile_boundary(profile, &last, &elapsed[5]);
         }
         if (ok) {
-            ok = ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit, g->sh_out, g->R, g->inj,
+            ok = ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit, g->sh_out,
+                                                 defer_hc ? NULL : g->R, defer_hc ? NULL : g->inj,
                                                  T, DS4_N_EXPERT_USED, DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_HC) != 0 &&
                  qwen4_moe_profile_boundary(profile, &last, &elapsed[6]);
         }
@@ -27781,7 +27812,8 @@ static bool qwen4_graph_moe_impl(ds4_qwen4_gpu_graph *g, const ds4_model *m, con
     }
     if (ok) {
         ok = ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit,
-                                             shared_dense ? g->sh_out : NULL, g->R, g->inj, T, DS4_N_EXPERT_USED,
+                                             shared_dense ? g->sh_out : NULL,
+                                             defer_hc ? NULL : g->R, defer_hc ? NULL : g->inj, T, DS4_N_EXPERT_USED,
                                              DS4_N_EXPERT_USED + (shared_dense ? 0u : 1u), DS4_N_EMBD, DS4_N_HC) != 0;
     }
 done:
@@ -27796,12 +27828,12 @@ done:
 
 static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                            uint32_t il, uint32_t T) {
-    return qwen4_graph_moe_impl(g, m, l, il, T, false);
+    return qwen4_graph_moe_impl(g, m, l, il, T, false, false);
 }
 
 static bool qwen4_graph_moe_last(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                 uint32_t il, uint32_t T) {
-    return T >= 1u && T <= 3u && qwen4_graph_moe_impl(g, m, l, il, T, true);
+    return T >= 1u && T <= 3u && qwen4_graph_moe_impl(g, m, l, il, T, true, false);
 }
 
 /* Prompt rows prime the predictor, whose input for row t is the embedding
@@ -27992,6 +28024,14 @@ static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g,
     const bool prof_on = timing == 2;
     if (prof_on) ds4_gpu_take_gpu_seconds();   /* drop earlier buffers */
     g->prof = prof_on ? prof : NULL;
+    /* Deferred HC writes: a branch's R += wgt * blk combine is applied in
+     * place by the next stream norm instead of its own pass over R.  Verify
+     * and decode rows (T <= 3) keep the eager writes, as do the layers
+     * before a PLE layer (the PLE gate and conv read R) and the last trunk
+     * layer (the head mixer and the predictor's priming read R after the
+     * loop); the FFN steering projection and the ffn_out dump read R too. */
+    const bool hc_defer = T > 3u;
+    g->hc_pending = false;
     for (uint32_t il = 0; il < n_trunk && ok; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (ds4_qwen4_layer_is_ple(il)) {
@@ -28040,11 +28080,17 @@ static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g,
                         l->hc_ffn_up->abs_offset, l->hc_ffn_up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
             }
         } else {
-            if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0;
+            if (ok && hc_defer) g->hc_pending = true;   /* applied by the ffn stream norm below */
+            else if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0;
             if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
         }
         if (ok) ok = qwen4_prof_cut(g, QWEN4_PROF_HC_FFN);
-        if (ok) ok = qwen4_graph_moe(g, m, l, il, T);   /* the reduce folds the combine in */
+        /* The reduce folds the combine in unless it is deferred into the
+         * next layer's attention stream norm. */
+        const bool defer_moe = hc_defer && il + 1u < n_trunk && !ds4_qwen4_layer_is_ple(il + 1u) &&
+            !(g->steer_dirs && g->steer_ffn_scale != 0.0f);
+        if (ok) ok = qwen4_graph_moe_impl(g, m, l, il, T, false, defer_moe);
+        if (ok && defer_moe) g->hc_pending = true;
         if (ok && g->prompt_rows)
             metal_graph_debug_dump_tensor("qwen_router", g->router,
                                            (uint64_t)T * DS4_N_EXPERT, il, pos0);
@@ -28059,6 +28105,9 @@ static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g,
         if (ok && flush_layer && (il + 1u == flush_layer || (ple_overlap && il + 1u == 2u * flush_layer)))
             ok = ds4_gpu_flush_commands() != 0;
     }
+    /* The last trunk layer writes eagerly, so only a failed layer can leave
+     * a write pending; drop it, the caller discards this pass. */
+    g->hc_pending = false;
     if (ok && logits_out && all_rows) {
         ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down, w->output_hc_up, NULL, T) &&
              qwen4_gemv(g->logits, m, w->output, g->mixed, T);

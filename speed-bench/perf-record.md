@@ -54,6 +54,7 @@ written by `30-mtp-cycle`.
 | fix/82-mtp-greedy-divergence | 2026-09-28 | this row's commit | Qwen3.8-Flash-Next-Q2.gguf | 16 | PASS | 47.9 (+8.9%) | 1238.3 (+2.6%) | 894.8 (+20.0%) | 1005.7 (+5.7%) | 65.2 (+10.0%) | 1.91 (+4.5%) | 1241.1 (+9.1%) |  |  |  |
 | sync/b3f5018 | 2026-11-14 | f65a331 | Qwen3.8-Flash-Next-Q4.gguf | 14 | PASS | 57.6 (+6.1%) | 1489.3 (+1.5%) | 1029.7 (+2.3%) | 1348.4 (+2.7%) | 87.6 (+22.3%) | 2.46 (+34.6%) | 1428.2 (+1.5%) |  |  |  |
 | perf/95-mtp-last-row | 2026-11-14 | this row's commit | Qwen3.8-Flash-Next-Q4.gguf | 20 | PASS | 57.7 (+6.1%) | 1482.1 (+2.2%) | 1017.6 (+1.9%) | 1344.3 (+2.4%) | 90.1 (+26.0%) | 2.46 (+34.6%) | 1416.5 (+1.6%) |  |  |  |
+| perf/140-deferred-hc-residual | 2026-11-15 | this row's commit | Qwen3.8-Flash-Next-Q4.gguf | 24 | PASS | 57.7 (+6.0%) | 1500.3 (+3.0%) | 1035.2 (+3.2%) | 1379.9 (+5.4%) | 90.4 (+26.0%) | 2.46 (+34.6%) | 1465.1 (+4.5%) | 66.5 (+8.2%) | 1.49 (-1.2%) | 1457.7 (+4.5%) |
 
 The `fix/82-mtp-greedy-divergence`, `sync/b3f5018` and `perf/95-mtp-last-row` rows leave MTP prose empty. The start
 commit's MTP output on the prose prompt is not its plain greedy output (the
