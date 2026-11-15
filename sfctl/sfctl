@@ -12,6 +12,7 @@ LOGS="$HOME/Library/Logs/sf"
 CMD_LINK="$HOME/.local/bin/sfctl"
 DOMAIN="gui/$(id -u)"
 FANBOOST=/usr/local/bin/fanboost
+SF_VARIANTS= MODEL= VARIANT=
 
 # The directory holding this script, through the ~/.local/bin link.
 self=$0
@@ -26,23 +27,27 @@ SFDIR=$(cd "$(dirname "$self")" && pwd -P)
 
 usage() {
     cat >&2 <<'EOF'
-usage: sfctl <command> [<model>]
+usage: sfctl <command> [<service>]
 
-  install [<model>]   run from a child checkout: serve worktree at main, build,
-                      model links, launchd agent, ~/.local/bin/sfctl
-  update <model>      sync serve to local main and rebuild; a running service
-                      is restarted, a stopped one stays stopped
-  start <model>       start the service (it never starts on its own)
-  stop <model>        stop the service
-  restart <model>     stop, then start
-  status [<model>]    state, pid, port and serve commit; every installed model
-                      when no model is named
-  logs <model> [N]    last N lines of the service log (default 80)
-  follow <model>      follow the service log
-  plist <model>       print the launchd agent definition, write nothing
-  uninstall <model>   remove the agent and serve; keep KV, logs and models
+  install [<model>]     run from a child checkout: serve worktree at main, build,
+                        model links, launchd agent, ~/.local/bin/sfctl
+  update <service>      sync serve to local main and rebuild; a running service
+                        is restarted, a stopped one stays stopped
+  start <service>       start the service (it never starts on its own); a model
+                        with variants needs <model>-<variant>
+  stop <service>        stop the service
+  restart <service>     stop, then start; <model>-<variant> switches variant,
+                        <model> restarts the last one started
+  status [<service>]    state, variant, pid, port and serve commit; every
+                        installed model when no service is named
+  logs <service> [N]    last N lines of the service log (default 80)
+  follow <service>      follow the service log
+  plist <service>       print the launchd agent definition, write nothing
+  uninstall <service>   remove the agent and serve; keep KV, logs and models
 
 <model> is the child's name without "sf-"; its service is sfctl/sf-<model>.conf.
+A config that lists SF_VARIANTS (one set of weights each) also names the
+service <model>-<variant>; commands other than start accept either name.
 EOF
     exit 2
 }
@@ -57,6 +62,7 @@ target() { echo "$DOMAIN/$(label "$1")"; }
 plist_path() { echo "$LA/$(label "$1").plist"; }
 home_dir() { echo "$HOME/.sf/$1"; }
 serve_dir() { echo "$HOME/.sf/$1/serve"; }
+svc() { echo "$1${2:+-$2}"; }
 
 installed_models() {
     for f in "$LA"/com.starforge.sf-*.plist; do
@@ -94,17 +100,59 @@ need_installed() {
         die "$1 is not installed (run sfctl install from the sf-$1 checkout)"
 }
 
+# Variant helpers; load_conf first.
+is_variant() {
+    [ -n "$1" ] || return 1
+    case " $SF_VARIANTS " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+variant_model() { eval "echo \"\${SF_MODEL_$1:-}\""; }
+variant_names() {
+    n=
+    for x in $SF_VARIANTS; do n="$n $1-$x"; done
+    echo "${n# }"
+}
+need_variant() {
+    echo "sfctl: $1 $2 needs a variant: $(variant_names "$2")" >&2
+    usage
+}
+# The variant last started, as recorded by start; empty when none is.
+recorded_variant() { cat "$(home_dir "$1")/variant" 2>/dev/null || true; }
+# The variant an agent is written for when none is named: the recorded one,
+# else the first listed. Empty for a config without variants.
+current_variant() {
+    r=$(recorded_variant "$1")
+    if is_variant "$r"; then echo "$r"; return; fi
+    # shellcheck disable=SC2086
+    set -- $SF_VARIANTS
+    echo "${1:-}"
+}
+
 # Sources sf-<model>.conf from <dir>/sfctl.
 load_conf() {
     conf="$2/sfctl/sf-$1.conf"
     [ -f "$conf" ] || die "no config for $1: $conf"
-    SF_PORT= SF_SERVER= SF_COMPONENTS= SF_ARGS=
+    # cv, not v: callers keep their variant in v across this call.
+    for cv in $SF_VARIANTS; do unset "SF_MODEL_$cv"; done
+    SF_PORT= SF_SERVER= SF_COMPONENTS= SF_ARGS= SF_VARIANTS=
     . "$conf"
     [ -n "$SF_PORT" ] && [ -n "$SF_SERVER" ] && [ -n "$SF_ARGS" ] ||
         die "$conf must set SF_PORT, SF_SERVER and SF_ARGS"
     case "$SF_ARGS" in
         *[\<\>\&]*) die "$conf: SF_ARGS must not contain <, > or &" ;;
+        *@VARIANT@*) [ -n "$SF_VARIANTS" ] || die "$conf: @VARIANT@ needs SF_VARIANTS" ;;
     esac
+    for cv in $SF_VARIANTS; do
+        case $cv in
+            *[!A-Za-z0-9_]*) die "$conf: variant names use letters, digits and _ only: $cv" ;;
+        esac
+        cs=$(variant_model "$cv")
+        case $cs in *[\<\>\&\ ]*) cs= ;; esac
+        case $cs in
+            ?*:?*) ;;
+            *) die "$conf: SF_MODEL_$cv must be component:path, without spaces, <, > or &" ;;
+        esac
+    done
 }
 
 # The config of an installed model comes from serve; before install, from
@@ -113,14 +161,34 @@ conf_dir() {
     if [ -d "$(serve_dir "$1")" ]; then serve_dir "$1"; else dirname "$SFDIR"; fi
 }
 
+has_conf() { [ -f "$(conf_dir "$1")/sfctl/sf-$1.conf" ]; }
+
+# Splits a service name into MODEL and VARIANT and loads that model's config
+# when there is one: <model>, or <model>-<variant> with <variant> in the
+# config's SF_VARIANTS. Model names may contain "-", variant names may not.
+resolve() {
+    MODEL=$1 VARIANT=
+    if has_conf "$1"; then
+        load_conf "$1" "$(conf_dir "$1")"
+        return
+    fi
+    case $1 in *-*) ;; *) return 0 ;; esac
+    has_conf "${1%-*}" || return 0
+    MODEL=${1%-*}
+    load_conf "$MODEL" "$(conf_dir "$MODEL")"
+    is_variant "${1##*-}" ||
+        die "$MODEL has no variant ${1##*-}${SF_VARIANTS:+; its services: $(variant_names "$MODEL")}"
+    VARIANT=${1##*-}
+}
+
 plist_text() {
-    m=$1
+    m=$1 v=${2:-}
     serve=$(serve_dir "$m")
     load_conf "$m" "$(conf_dir "$m")"
     cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Written by sfctl from sfctl/sf-$m.conf: edit that file and run sfctl update $m. -->
+<!-- Written by sfctl from sfctl/sf-$m.conf${v:+ for $m-$v}: edit that file and run sfctl update $m. -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
@@ -131,7 +199,15 @@ plist_text() {
     <string>--port</string>
     <string>$SF_PORT</string>
 EOF
+    if [ -n "$v" ]; then
+        spec=$(variant_model "$v")
+        echo "    <string>-m</string>"
+        echo "    <string>${spec#*:}</string>"
+    fi
     for a in $SF_ARGS; do
+        case $a in
+            *@VARIANT@*) a="${a%%@VARIANT@*}$v${a#*@VARIANT@}" ;;
+        esac
         case $a in
             *@HOME@*) a="$(home_dir "$m")${a#*@HOME@}" ;;
         esac
@@ -154,20 +230,31 @@ EOF
 EOF
 }
 
+# $1 model, $2 variant (empty without variants). The server creates its KV dir.
 write_plist() {
-    mkdir -p "$LA" "$LOGS" "$(home_dir "$1")/kv"
-    plist_text "$1" >"$(plist_path "$1").tmp"
+    mkdir -p "$LA" "$LOGS" "$(home_dir "$1")"
+    plist_text "$1" "${2:-}" >"$(plist_path "$1").tmp"
     plutil -lint -s "$(plist_path "$1").tmp" || die "generated agent for $1 is not a valid plist"
     mv "$(plist_path "$1").tmp" "$(plist_path "$1")"
 }
 
-# Links each component whose path is missing in serve (load_conf first).
+# Links each component, and each variant's model, whose path is missing in
+# serve (load_conf first).
 link_components() {
     serve=$1
-    for c in $SF_COMPONENTS; do
+    for c in $SF_COMPONENTS $(for lv in $SF_VARIANTS; do variant_model "$lv"; done); do
         [ -e "$serve/${c#*:}" ] && continue
         (cd "$serve" && ./download.sh "${c%%:*}") || die "./download.sh ${c%%:*} failed in $serve"
     done
+}
+
+# start never links or downloads: install and update do (load_conf first).
+model_check() {
+    [ -n "$2" ] || return 0
+    spec=$(variant_model "$2")
+    serve=$(serve_dir "$1")
+    [ ! -e "$serve/${spec#*:}" ] || return 0
+    die "$1-$2 needs $serve/${spec#*:}, which is missing; link it with: sfctl update $1"
 }
 
 build() {
@@ -208,20 +295,32 @@ boost_check() {
     esac
 }
 
+# $1 model, $2 variant (required when the config lists variants).
 cmd_start() {
     need_installed "$1"
+    load_conf "$1" "$(serve_dir "$1")"
     p=$(pid "$1")
     if [ -n "$p" ]; then
-        echo "$1 already running (pid $p)"
+        cur=$(recorded_variant "$1")
+        if [ -n "$SF_VARIANTS" ] && [ "$cur" != "$2" ]; then
+            die "$1 is running${cur:+ $1-$cur} (pid $p); to switch run: sfctl restart $1-$2"
+        fi
+        echo "$(svc "$1" "$2") already running (pid $p)"
         return
     fi
-    load_conf "$1" "$(serve_dir "$1")"
+    model_check "$1" "$2"
     exclusion_check "$1"
     boost_check "$1"
+    if [ -n "$2" ]; then
+        # The agent carries the variant's arguments: reload it with this one.
+        ! loaded "$1" || launchctl bootout "$(target "$1")"
+        write_plist "$1" "$2"
+        echo "$2" >"$(home_dir "$1")/variant"
+    fi
     mkdir -p "$LOGS"
     loaded "$1" || launchctl bootstrap "$DOMAIN" "$(plist_path "$1")"
     launchctl kickstart -k "$(target "$1")"
-    echo "$1 starting on 127.0.0.1:$SF_PORT; watch the load with: sfctl follow $1"
+    echo "$(svc "$1" "$2") starting on 127.0.0.1:$SF_PORT; watch the load with: sfctl follow $1"
 }
 
 cmd_stop() {
@@ -246,7 +345,15 @@ status_line() {
         echo "$m $state, serve missing ($serve)"
         return
     fi
-    port=$( (load_conf "$m" "$serve" && echo "$SF_PORT") 2>/dev/null || echo "?")
+    info=$( (load_conf "$m" "$serve" && echo "$SF_PORT $SF_VARIANTS") 2>/dev/null || echo "?")
+    port=${info%% *}
+    r=
+    case $info in *" "?*) r=$(recorded_variant "$m") ;; esac
+    if [ -n "$r" ] && [ -n "$p" ]; then
+        state="running $r pid $p"
+    elif [ -n "$r" ]; then
+        state="stopped (last $r)"
+    fi
     cur=$(git -C "$serve" rev-parse --short HEAD)
     main=$(git -C "$serve" rev-parse --short main)
     if [ "$cur" = "$main" ]; then
@@ -291,7 +398,8 @@ cmd_install() {
     load_conf "$m" "$serve"
     build "$serve"
     link_components "$serve"
-    write_plist "$m"
+    v=$(current_variant "$m")
+    write_plist "$m" "$v"
     mkdir -p "$(dirname "$CMD_LINK")"
     if [ ! -e "$CMD_LINK" ] && [ ! -L "$CMD_LINK" ]; then
         ln -s "$serve/sfctl/sfctl" "$CMD_LINK"
@@ -303,7 +411,7 @@ cmd_install() {
     else
         echo "sfctl: $CMD_LINK is not a link; left alone" >&2
     fi
-    echo "$m installed at $(git -C "$serve" rev-parse --short HEAD); start it with: sfctl start $m"
+    echo "$m installed at $(git -C "$serve" rev-parse --short HEAD); start it with: sfctl start $(svc "$m" "$v")"
 }
 
 cmd_update() {
@@ -322,12 +430,23 @@ $dirty"
         echo "$m stopped for the update"
     fi
     git -C "$serve" checkout --quiet --detach main
+    # The rest is main's to do: this script may be older than main's.
+    exec "$serve/sfctl/sfctl" _update-finish "$m" "$old" "$was"
+}
+
+# Internal: the second half of update, run by the script serve just checked
+# out. Keep the name and arguments stable: the previous script execs it.
+cmd_update_finish() {
+    m=$1 old=$2 was=$3
+    serve=$(serve_dir "$m")
     load_conf "$m" "$serve"
     build "$serve"
     link_components "$serve"
+    # A running agent written before variants existed ran the first variant.
+    uv=$(current_variant "$m")
     ! loaded "$m" || launchctl bootout "$(target "$m")"
-    write_plist "$m"
-    [ -z "$was" ] || cmd_start "$m"
+    write_plist "$m" "$uv"
+    [ -z "$was" ] || cmd_start "$m" "$uv"
     new=$(git -C "$serve" rev-parse --short HEAD)
     echo "$m serve $old..$new"
     git -C "$serve" log --oneline "$old..$new"
@@ -355,25 +474,47 @@ cmd_uninstall() {
                 ;;
         esac
     fi
-    echo "$m uninstalled; kept $(home_dir "$m")/kv, $LOGS and the model cache"
+    echo "$m uninstalled; kept $(home_dir "$m") (KV, history), $LOGS and the model cache"
 }
 
 [ $# -ge 1 ] || usage
 cmd=$1
 shift
-model=${1:-}
+name=${1:-}
 case $cmd in
-    install) cmd_install "$model" ;;
-    status) cmd_status "$model" ;;
+    install) cmd_install "$name" ;;
+    _update-finish)
+        [ $# -eq 3 ] || usage
+        cmd_update_finish "$@"
+        ;;
+    status)
+        [ -z "$name" ] || resolve "$name"
+        cmd_status "$MODEL"
+        ;;
     update | start | stop | restart | logs | follow | plist | uninstall)
-        need_model "$cmd" "$model"
+        need_model "$cmd" "$name"
+        resolve "$name"
+        model=$MODEL
+        v=$VARIANT
+        case $cmd in
+            start | restart)
+                if [ -n "$SF_VARIANTS" ] && [ -z "$v" ]; then
+                    [ "$cmd" = start ] || v=$(recorded_variant "$model")
+                    is_variant "$v" || need_variant "$cmd" "$model"
+                fi
+                ;;
+        esac
         case $cmd in
             update) cmd_update "$model" ;;
-            start) cmd_start "$model" ;;
+            start) cmd_start "$model" "$v" ;;
             stop) cmd_stop "$model" ;;
             restart)
+                # Refuse a start that cannot succeed before stopping anything.
+                need_installed "$model"
+                load_conf "$model" "$(serve_dir "$model")"
+                model_check "$model" "$v"
                 cmd_stop "$model"
-                cmd_start "$model"
+                cmd_start "$model" "$v"
                 ;;
             logs)
                 need_installed "$model"
@@ -384,9 +525,10 @@ case $cmd in
                 tail -F "$LOGS/$model.out.log" "$LOGS/$model.err.log"
                 ;;
             plist)
-                [ -d "$(serve_dir "$model")" ] || [ -f "$SFDIR/sf-$model.conf" ] ||
+                has_conf "$model" ||
                     die "$model is not installed and $SFDIR has no sf-$model.conf"
-                plist_text "$model"
+                [ -n "$v" ] || v=$(current_variant "$model")
+                plist_text "$model" "$v"
                 ;;
             uninstall) cmd_uninstall "$model" ;;
         esac
