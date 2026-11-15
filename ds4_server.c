@@ -894,6 +894,7 @@ typedef struct {
      * keeps the shipped template's bytes. */
     bool preserve_thinking;
     bool prompt_preserves_reasoning;
+    bool client_replays_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
      * client opted in via reasoning.summary. Other APIs leave this false; the
      * field is ignored on those code paths. */
@@ -2918,6 +2919,20 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
     return false;
 }
 
+/* True when the latest assistant message came with reasoning: the sign of a
+ * client that sends reasoning back. Reasoning on older messages alone is not,
+ * because the client may have stopped sending it. */
+static bool chat_last_assistant_has_reasoning(const chat_msgs *msgs) {
+    for (int i = msgs->len - 1; i >= 0; i--) {
+        const chat_msg *m = &msgs->v[i];
+        if (strcmp(m->role, "assistant")) continue;
+        const char *p = m->reasoning;
+        while (p && isspace((unsigned char)*p)) p++;
+        return p && *p;
+    }
+    return false;
+}
+
 static bool text_starts_with_think_tag(const char *s) {
     return s && (!strncmp(s, "<think>", 7) || !strncmp(s, "</think>", 8));
 }
@@ -3337,21 +3352,22 @@ done:
  * the assistant call here would duplicate it and destroy cache alignment, so
  * this function starts at the first new item and emits only:
  *
- *   previous EOS, tool results, and the next assistant prefix.
+ *   tool results, and the next assistant prefix.
+ *
+ * The previous turn's <|im_end|> is not emitted: generate_job_inner() already
+ * evaluated it into the live KV, so the tail starts at the newline after it.
  *
  * This is intentionally independent from req.prompt's already-tokenized suffix:
  * suffix tokenization happens later after the cache decision, using the live
  * token prefix as the boundary.  That avoids BPE merges across the visible
  * replay/live-KV boundary. */
-/* Continue a live session after the model's tool-call turn: its <|im_end|>
- * was the stop token and is not in the KV yet. */
 static char *render_qwen_live_tool_tail(const chat_msgs *msgs, int start,
                                         const tool_schema_orders *tool_orders,
                                         ds4_think_mode think_mode,
                                         unsigned char **trusted_out) {
     buf out = {0};
     buf_track_trusted(&out);
-    buf_puts_special(&out, "<|im_end|>\n");
+    buf_puts(&out, "\n");
     /* A live tail only ever renders the turns after the checkpoint frontier,
      * which are inside the current tool loop, so their reasoning is kept. */
     append_qwen_conversation(&out, msgs, start, tool_orders,
@@ -3874,6 +3890,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    r->client_replays_reasoning = chat_last_assistant_has_reasoning(&msgs);
     r->prompt_text = render_chat_prompt_text_preserving(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode, r->preserve_thinking, &r->prompt_trusted);
@@ -10088,10 +10105,10 @@ static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live,
 #endif
 
 #ifdef DS4_SERVER_TEST
-static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live,
+static bool kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live,
                            uint64_t extra_bytes,
                            const ds4_kvstore_eviction_context *incoming) {
-    ds4_kvstore_evict(kc, live, extra_bytes, incoming);
+    return ds4_kvstore_evict(kc, live, extra_bytes, incoming);
 }
 #endif
 
@@ -10207,7 +10224,8 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             int store_len, const char *reason,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
-                                            const char *cache_text_key) {
+                                            const char *cache_text_key,
+                                            const char *protect_text) {
     if (!s || !slot) return false;
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
@@ -10228,6 +10246,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   cache_text_override,
                                                   cache_text_ext,
                                                   cache_text_key,
+                                                  protect_text,
                                                   &hooks, err, sizeof(err));
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
@@ -10238,11 +10257,14 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                        const ds4_tokens *tokens,
                                        int store_len, const char *reason) {
     return kv_cache_store_live_prefix_text(s, slot, tokens, store_len, reason,
-                                           NULL, 0, NULL);
+                                           NULL, 0, NULL, NULL);
 }
 
+/* protect_text is the key text about to be looked up on disk, if any: storing
+ * the outgoing checkpoint must not evict the one that request will load. */
 static void kv_cache_store_current(server *s, server_slot *slot,
-                                   const char *reason) {
+                                   const char *reason,
+                                   const char *protect_text) {
     if (!s || !slot) return;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
@@ -10278,10 +10300,12 @@ static void kv_cache_store_current(server *s, server_slot *slot,
      * tokenizes only the visible suffix that follows this key. */
     if (visible_text) {
         kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
-                                        visible_text, visible_ext, visible_key);
+                                        visible_text, visible_ext, visible_key,
+                                        protect_text);
         free(visible_text);
     } else {
-        kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
+        kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
+                                        NULL, 0, NULL, protect_text);
     }
 }
 
@@ -11707,7 +11731,9 @@ static char *build_thinking_visible_text(const request *r,
 
     size_t pt_len = strlen(r->prompt_text);
     /* the next request renders this turn as an empty think block plus the
-     * answer body, closed by <|im_end|> */
+     * answer body, closed by <|im_end|>; the key ends there because the live
+     * KV does (generate_job_inner() evaluates the end token), so the next
+     * suffix starts at the newline after it */
     const char *gen = "<|im_start|>assistant\n<think>\n";
     const size_t gen_len = strlen(gen);
     if (pt_len < gen_len || memcmp(r->prompt_text + pt_len - gen_len, gen, gen_len) != 0) return NULL;
@@ -11717,7 +11743,7 @@ static char *build_thinking_visible_text(const request *r,
     buf_puts_special(&visible, "\n</think>\n\n");
     /* only plain answers reach this key: tool turns have their own */
     append_qwen_answer_body(&visible, content, false);
-    buf_puts_special(&visible, "<|im_end|>\n");
+    buf_puts_special(&visible, "<|im_end|>");
     return buf_take_masked(&visible, trusted_out);
 }
 
@@ -11745,8 +11771,9 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
 }
 
 /* Match clients that omit reasoning, while keeping the exact sampled KV.
- * Tool decoding stops at </tool_call>, BEFORE the assistant end token. Leave
- * <|im_end|> out of the visible key so the next suffix actually evaluates it. */
+ * Tool decoding stops at </tool_call>, but generate_job_inner() then evaluates
+ * the turn's <|im_end|>, so the key includes it and the next suffix does not
+ * evaluate a second one. */
 static char *build_qwen_tool_turn_visible_text(const request *r,
                                                const char *finish,
                                                bool inside_thinking,
@@ -11768,10 +11795,22 @@ static char *build_qwen_tool_turn_visible_text(const request *r,
     buf visible = {0};
     buf_track_trusted(&visible);
     buf_append_masked(&visible, r->prompt_text, strlen(r->prompt_text), r->prompt_trusted);
-    buf_append_masked(&visible, suffix, strlen(suffix) - strlen("<|im_end|>"), suffix_trusted);
+    buf_append_masked(&visible, suffix, strlen(suffix), suffix_trusted);
     free(suffix);
     free(suffix_trusted);
     return buf_take_masked(&visible, trusted_out);
+}
+
+/* True when the turn that just finished is replayed by the client as a closed
+ * assistant message, so its <|im_end|> belongs in the live KV.  A tool-call
+ * turn stops at </tool_call> and never samples it; a stop-token turn sampled
+ * it but never fed it back.  A client stop sequence, another stop token or an
+ * output/context limit closes nothing the client can replay. */
+static bool live_kv_turn_needs_end_token(const char *finish, int stop_token,
+                                         int end_token) {
+    if (finish && !strcmp(finish, "tool_calls")) return true;
+    return finish && !strcmp(finish, "stop") && stop_token >= 0 &&
+           end_token >= 0 && stop_token == end_token;
 }
 
 static bool remember_qwen_tool_turn_visible_checkpoint(server *s, server_slot *slot,
@@ -11779,7 +11818,8 @@ static bool remember_qwen_tool_turn_visible_checkpoint(server *s, server_slot *s
                                                        const char *finish,
                                                        bool inside_thinking,
                                                        const char *content,
-                                                       const tool_calls *calls) {
+                                                       const tool_calls *calls,
+                                                       bool visible_continuation) {
     unsigned char *visible_trusted = NULL;
     char *visible = build_qwen_tool_turn_visible_text(&j->req, finish,
                                                      inside_thinking, content, calls,
@@ -11787,6 +11827,16 @@ static bool remember_qwen_tool_turn_visible_checkpoint(server *s, server_slot *s
     if (!visible) return false;
     thinking_live_remember(s, slot, visible, visible_trusted, &j->req);
     free(visible_trusted);
+    /* The visible key leaves the reasoning of this turn out. A client that
+     * sends reasoning back renders it into its next request, where that key
+     * is no longer a byte prefix: save the checkpoint under its token text
+     * instead, as remember_thinking_checkpoint() does. A first tool turn has
+     * no earlier assistant message to tell the two clients apart, and keeps
+     * the visible key. */
+    pthread_mutex_lock(&s->tool_mu);
+    slot->thinking_live.token_text_disk_key =
+        j->req.client_replays_reasoning && !visible_continuation;
+    pthread_mutex_unlock(&s->tool_mu);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: qwen tool-turn visible checkpoint remembered ctx=%s live=%d visible=%zu",
                ctx, ds4_session_pos(slot->session),
@@ -12453,7 +12503,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
-        kv_cache_store_current(s, slot, "evict");
+        kv_cache_store_current(s, slot, "evict",
+                               j->req.prompt_key ? j->req.prompt_key : j->req.prompt_text);
     }
     if (!multimodal && cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
@@ -13115,6 +13166,26 @@ decode_again:
     }
     server_generation_leave(s);
 
+    /* The client replays this turn closed by <|im_end|>.  Without that token in
+     * the live KV the next request's exact token prefix diverges at the turn
+     * boundary, and a visible key would have it skip the end token.  Evaluate
+     * it now (one decode step); the keys below are published only after it
+     * succeeded. */
+    bool turn_end_committed = false;
+    if (j->req.kind == REQ_CHAT && !g_stop_requested && !job_cancelled(j) &&
+        live_kv_turn_needs_end_token(finish, stop_token, ds4_token_eos(s->engine)))
+    {
+        char end_err[160] = {0};
+        turn_end_committed = server_eval_token(s, slot, ds4_token_eos(s->engine),
+                                               end_err, sizeof(end_err)) == 0;
+        if (!turn_end_committed)
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: turn end token not kept in live KV: %s",
+                       end_err[0] ? end_err : "decode failed");
+    }
+    const bool frontier_ready = turn_end_committed &&
+                                ds4_session_checkpoint_valid(slot->session);
+
     if (job_cancelled(j)) {
         request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
@@ -13361,7 +13432,7 @@ decode_again:
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
 
     if (j->req.api == API_RESPONSES) {
-        if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
+        if (frontier_ready && strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
             /* Store the post-turn visible transcript plus the live token
              * frontier.  The next Responses request may replay only this
              * visible surface, while the real session also contains hidden
@@ -13389,7 +13460,7 @@ decode_again:
         }
     }
     if (j->req.api == API_ANTHROPIC) {
-        if (parsed_calls.len && strcmp(final_finish, "error") &&
+        if (frontier_ready && parsed_calls.len && strcmp(final_finish, "error") &&
             strcmp(final_finish, "length"))
         {
             anthropic_live_remember(s, slot, &parsed_calls);
@@ -13398,7 +13469,11 @@ decode_again:
         }
     }
 
-    if (j->req.kind == REQ_CHAT && parsed_calls.len &&
+    /* Never publish a closed-turn key when the end-token step failed or was
+     * skipped: the live KV does not end where that key does. */
+    if (!frontier_ready) {
+        thinking_live_clear(s, slot);
+    } else if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
         should_canonicalize_tool_checkpoint(s, &parsed_calls))
     {
@@ -13416,7 +13491,9 @@ decode_again:
         if (!remember_qwen_tool_turn_visible_checkpoint(
                 s, slot, j, ctx_span, finish, thinking.inside,
                 parsed_content ? parsed_content : "",
-                &parsed_calls))
+                &parsed_calls,
+                thinking_live_continuation ||
+                (disk_cache_ext_flags & KV_EXT_THINKING_VISIBLE)))
         {
             thinking_live_clear(s, slot);
         }
@@ -14865,7 +14942,7 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting resident KV cache before shutdown slot=%d tokens=%d",
                    i, tokens->len);
-        kv_cache_store_current(&s, slot, "shutdown");
+        kv_cache_store_current(&s, slot, "shutdown", NULL);
     }
     server_close_resources(&s);
     return 0;
@@ -16910,6 +16987,70 @@ static void test_qwen_reasoning_effort_levels(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_qwen_tool_turn_disk_key(void) {
+    /* Only reasoning on the latest assistant message counts. */
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("run it");
+    chat_msgs_push(&msgs, user);
+    TEST_ASSERT(!chat_last_assistant_has_reasoning(&msgs));
+    chat_msg older = {0};
+    older.role = xstrdup("assistant");
+    older.reasoning = xstrdup("plan");
+    chat_msgs_push(&msgs, older);
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("ok");
+    chat_msgs_push(&msgs, tool);
+    TEST_ASSERT(chat_last_assistant_has_reasoning(&msgs));
+    chat_msg latest = {0};
+    latest.role = xstrdup("assistant");
+    latest.reasoning = xstrdup(" \n");
+    chat_msgs_push(&msgs, latest);
+    TEST_ASSERT(!chat_last_assistant_has_reasoning(&msgs));
+
+    /* The tool turn is saved under its token text for a client that sends
+     * reasoning back, unless this turn itself continued a visible key. */
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    int live[4] = {1, 2, 3, 4};
+    server_slot slot = {0};
+    slot.session = ds4_session_new_test_checkpoint(live, 4);
+    job j = {0};
+    j.req.kind = REQ_CHAT;
+    j.req.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    j.req.think_mode = DS4_THINK_HIGH;
+    j.req.prompt_text = render_qwen_chat_prompt_text(&msgs, NULL, NULL,
+                                                     j.req.think_mode, true,
+                                                     &j.req.prompt_trusted);
+    tool_calls calls = {0};
+    tool_call call = {0};
+    call.name = xstrdup("bash");
+    call.arguments = xstrdup("{}");
+    tool_calls_push(&calls, call);
+    calls.raw_tool_text = xstrdup(
+        "\n\n<tool_call>\n<function=bash>\n</function>\n</tool_call>");
+    for (int replays = 0; replays < 2; replays++) {
+        for (int visible = 0; visible < 2; visible++) {
+            j.req.client_replays_reasoning = replays;
+            TEST_ASSERT(remember_qwen_tool_turn_visible_checkpoint(
+                &s, &slot, &j, "test", "tool_calls", false, "Running.",
+                &calls, visible));
+            TEST_ASSERT(slot.thinking_live.valid);
+            TEST_ASSERT(slot.thinking_live.token_text_disk_key ==
+                        (replays && !visible));
+        }
+    }
+    visible_live_free(&slot.thinking_live);
+    ds4_session_free_test_checkpoint(slot.session);
+    tool_calls_free(&calls);
+    free(j.req.prompt_text);
+    free(j.req.prompt_trusted);
+    chat_msgs_free(&msgs);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
 static void test_qwen_tool_visible_checkpoint_boundary(void) {
     for (int thinking = 0; thinking < 2; thinking++) {
         for (int with_content = 0; with_content < 2; with_content++) {
@@ -16954,11 +17095,14 @@ static void test_qwen_tool_visible_checkpoint_boundary(void) {
             char *next = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode, true, NULL);
             TEST_ASSERT(visible && !strncmp(next, visible, strlen(visible)));
             if (visible && !strncmp(next, visible, strlen(visible))) {
-                /* The live frontier ends at the sampled tool block. The new
-                 * suffix must supply exactly the missing assistant boundary. */
+                /* The live frontier ends at the committed <|im_end|>, so the
+                 * key consumes it and the suffix cannot evaluate a second one. */
                 const char *tail = next + strlen(visible);
-                const char *boundary = "<|im_end|>\n<|im_start|>user\n<tool_response>";
+                const char *boundary = "\n<|im_start|>user\n<tool_response>";
                 TEST_ASSERT(!strncmp(tail, boundary, strlen(boundary)));
+                const char *end = "</tool_call><|im_end|>";
+                TEST_ASSERT(strlen(visible) >= strlen(end) &&
+                            !strcmp(visible + strlen(visible) - strlen(end), end));
             }
             if (thinking) {
                 msgs.v[1].reasoning = xstrdup("hidden reasoning");
@@ -17015,8 +17159,9 @@ static void test_render_qwen_tool_round_trip(void) {
     char *tail = render_live_tool_tail_for_syntax(
         SERVER_MODEL_SYNTAX_QWEN, &msgs, 2, &orders, DS4_THINK_NONE, NULL);
     TEST_ASSERT(tail != NULL);
+    /* The turn's <|im_end|> is the last live token: the tail starts after it. */
     TEST_ASSERT(!strcmp(tail,
-        "<|im_end|>\n<|im_start|>user\n<tool_response>\nhi\n</tool_response>\n<tool_response>\nsecond\n</tool_response><|im_end|>\n"
+        "\n<|im_start|>user\n<tool_response>\nhi\n</tool_response>\n<tool_response>\nsecond\n</tool_response><|im_end|>\n"
         "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     free(tail);
     tool_schema_orders_free(&orders);
@@ -17212,7 +17357,7 @@ static void test_qwen_thinking_visible_text_matches_render(void) {
             SERVER_MODEL_SYNTAX_QWEN, &history, schemas[i], NULL, DS4_THINK_HIGH);
         TEST_ASSERT(strlen(future) > strlen(visible));
         TEST_ASSERT(!memcmp(future, visible, strlen(visible)));
-        TEST_ASSERT(!strncmp(future + strlen(visible), "<|im_start|>user\n", 17));
+        TEST_ASSERT(!strncmp(future + strlen(visible), "\n<|im_start|>user\n", 18));
         free(future);
         /* Echoed or edited history must not match the reasoning-free alias. */
         history.v[1].reasoning = xstrdup("2 plus 2 is 4.");
@@ -17329,6 +17474,11 @@ static void test_qwen_visible_keys_prefix_next_render(void) {
                         e, calls_on, think_on, api);
             }
             TEST_ASSERT(prefix);
+            /* Each key ends at the turn's <|im_end|>, the last live token once
+             * generate_job_inner() commits it; the next suffix starts after it. */
+            const char *eos = "<|im_end|>";
+            TEST_ASSERT(n >= strlen(eos) && !strcmp(key + n - strlen(eos), eos));
+            TEST_ASSERT(prefix && rendered[n] == '\n');
             checked++;
             free(rendered);
             free(next_trusted);
@@ -17341,6 +17491,19 @@ static void test_qwen_visible_keys_prefix_next_render(void) {
     }
     /* per ending: 5 keys with thinking, 4 without (no thinking key) */
     TEST_ASSERT(checked == 36);
+}
+
+static void test_live_kv_turn_end_token(void) {
+    const int end = 248046;
+    TEST_ASSERT(live_kv_turn_needs_end_token("tool_calls", -1, end));
+    TEST_ASSERT(live_kv_turn_needs_end_token("stop", end, end));
+    /* another stop token, a client stop sequence, limits and errors do not
+     * close a turn the client replays */
+    TEST_ASSERT(!live_kv_turn_needs_end_token("stop", end - 2, end));
+    TEST_ASSERT(!live_kv_turn_needs_end_token("stop", -1, end));
+    TEST_ASSERT(!live_kv_turn_needs_end_token("length", end, end));
+    TEST_ASSERT(!live_kv_turn_needs_end_token("error", -1, end));
+    TEST_ASSERT(!live_kv_turn_needs_end_token(NULL, end, end));
 }
 
 static void test_qwen_checkpoint_suffix_matches_render(void) {
@@ -19008,10 +19171,11 @@ static void test_kv_stub_file(const char *dir, const char *sha,
     free(path);
 }
 
-static void test_kv_text_stub_file_model(const char *dir, const char *text,
-                                         uint8_t model_id, uint8_t reason,
-                                         uint32_t tokens,
-                                         uint64_t payload_bytes) {
+static void test_kv_text_stub_file_used(const char *dir, const char *text,
+                                        uint8_t model_id, uint8_t reason,
+                                        uint32_t tokens, uint32_t hits,
+                                        uint64_t created_at, uint64_t last_used,
+                                        uint64_t payload_bytes) {
     char sha[41];
     sha1_bytes_hex(text, strlen(text), sha);
     char name[44];
@@ -19025,8 +19189,8 @@ static void test_kv_text_stub_file_model(const char *dir, const char *text,
     }
 
     uint8_t h[KV_CACHE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, model_id, 2, reason, 0, tokens, 0,
-                            32768, 100, 100, payload_bytes);
+    ds4_kvstore_fill_header(h, model_id, 2, reason, 0, tokens, hits,
+                            32768, created_at, last_used, payload_bytes);
     uint8_t text_len[4];
     le_put32(text_len, (uint32_t)strlen(text));
     TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
@@ -19037,6 +19201,14 @@ static void test_kv_text_stub_file_model(const char *dir, const char *text,
     }
     TEST_ASSERT(fclose(fp) == 0);
     free(path);
+}
+
+static void test_kv_text_stub_file_model(const char *dir, const char *text,
+                                         uint8_t model_id, uint8_t reason,
+                                         uint32_t tokens,
+                                         uint64_t payload_bytes) {
+    test_kv_text_stub_file_used(dir, text, model_id, reason, tokens, 0,
+                                100, 100, payload_bytes);
 }
 
 static void test_kv_text_stub_file(const char *dir, const char *text,
@@ -19518,6 +19690,207 @@ static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
     rmdir(dir);
 }
 
+static char *test_kv_text_path(const char *dir, const char *text) {
+    char sha[41], name[44];
+    sha1_bytes_hex(text, strlen(text), sha);
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    return path_join(dir, name);
+}
+
+/* Sum of the sizes of the .kv files left in dir, measured with stat so it does
+ * not depend on the cache's own bookkeeping. */
+static uint64_t test_kv_dir_bytes(const char *dir) {
+    uint64_t total = 0;
+    DIR *d = opendir(dir);
+    TEST_ASSERT(d != NULL);
+    if (!d) return 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        size_t n = strlen(de->d_name);
+        if (n < 3 || strcmp(de->d_name + n - 3, ".kv") != 0) continue;
+        char *path = path_join(dir, de->d_name);
+        struct stat st;
+        TEST_ASSERT(stat(path, &st) == 0);
+        if (stat(path, &st) == 0) total += (uint64_t)st.st_size;
+        free(path);
+    }
+    closedir(d);
+    return total;
+}
+
+/* Session switch: the main agent's evict snapshot is fresh with no hits, an
+ * older session has decayed hits that score higher, and the subagent's
+ * outgoing snapshot needs room for one eviction.  The main agent is the
+ * request about to load. */
+static void test_kv_cache_eviction_protects_checkpoint_about_to_load(void) {
+    const char *old_text = "old session transcript";
+    const char *main_text = "main agent transcript";
+    const char *sub_text = "subagent transcript";
+    const char *next_prompt = "main agent transcript\nuser: subagent result";
+    const uint64_t now = (uint64_t)time(NULL);
+    const uint64_t hour_ago = now - 3600u;
+
+    for (int protect = 1; protect >= 0; protect--) {
+        char tmpl[] = "/tmp/ds4-kv-protect-load-test.XXXXXX";
+        char *dir = mkdtemp(tmpl);
+        TEST_ASSERT(dir != NULL);
+        if (!dir) return;
+
+        test_kv_text_stub_file_used(dir, old_text, 0, KV_REASON_COLD,
+                                    2048, 3, hour_ago, hour_ago, 2048);
+        test_kv_text_stub_file_used(dir, main_text, 0, KV_REASON_EVICT,
+                                    2048, 0, now, now, 2048);
+        char *old_path = test_kv_text_path(dir, old_text);
+        char *main_path = test_kv_text_path(dir, main_text);
+
+        kv_disk_cache kc = {0};
+        kc.enabled = true;
+        kc.dir = xstrdup(dir);
+        kc.opt = kv_cache_default_options();
+        uint64_t incoming_bytes =
+            KV_CACHE_FIXED_HEADER + 4u + strlen(sub_text) + 2048u;
+        kc.budget_bytes =
+            incoming_bytes + KV_CACHE_FIXED_HEADER + 4u + strlen(old_text) + 2048u;
+        ds4_kvstore_eviction_context incoming = {
+            .text = sub_text,
+            .text_len = strlen(sub_text),
+            .model_id = 0,
+            .quant_bits = 2,
+            .ctx_size = 32768,
+            .reject_different_quant = false,
+            .protect_text = protect ? next_prompt : NULL,
+        };
+        TEST_ASSERT(kv_cache_evict(&kc, NULL, incoming_bytes, &incoming));
+        TEST_ASSERT(test_kv_dir_bytes(dir) + incoming_bytes <= kc.budget_bytes);
+
+        if (protect) {
+            TEST_ASSERT(access(main_path, F_OK) == 0);
+            TEST_ASSERT(access(old_path, F_OK) != 0);
+        } else {
+            /* Without protection the older session's hits score higher, so
+             * the main agent's snapshot is evicted: the failure this test
+             * guards against. */
+            TEST_ASSERT(access(main_path, F_OK) != 0);
+            TEST_ASSERT(access(old_path, F_OK) == 0);
+        }
+
+        kv_cache_close(&kc);
+        unlink(old_path);
+        unlink(main_path);
+        free(old_path);
+        free(main_path);
+        rmdir(dir);
+    }
+}
+
+static void test_kv_cache_eviction_protects_after_earlier_victims(void) {
+    char tmpl[] = "/tmp/ds4-kv-protect-shift-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    /* Equal-length texts give equal file sizes.  readdir order is arbitrary,
+     * so first observe it, then make the last entry the protected one.  Both
+     * victims sit before it and are deleted first, which shifts its index. */
+    const char *texts[3] = {"transcript a", "transcript b", "transcript c"};
+    for (int i = 0; i < 3; i++)
+        test_kv_text_stub_file_used(dir, texts[i], 0, KV_REASON_COLD,
+                                    2048, 0, 100, 100, 2048);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    int last = -1;
+    for (int i = 0; i < 3; i++)
+        if (kv_cache_find_text_prefix(&kc, texts[i], 2, 32768) == 2) last = i;
+    TEST_ASSERT(last >= 0);
+    if (last < 0) last = 0;
+
+    /* The protected entry is the cheapest victim: a stale, never-hit
+     * continued checkpoint.  Rewriting in place keeps the directory order. */
+    test_kv_text_stub_file_used(dir, texts[last], 0, KV_REASON_CONTINUED,
+                                2048, 0, 100, 100, 2048);
+    char protect_text[64];
+    snprintf(protect_text, sizeof(protect_text), "%s\nuser: next", texts[last]);
+
+    const char *sub_text = "subagent transcript";
+    uint64_t incoming_bytes =
+        KV_CACHE_FIXED_HEADER + 4u + strlen(sub_text) + 2048u;
+    kc.budget_bytes =
+        incoming_bytes + KV_CACHE_FIXED_HEADER + 4u + strlen(texts[last]) + 2048u;
+    ds4_kvstore_eviction_context incoming = {
+        .text = sub_text,
+        .text_len = strlen(sub_text),
+        .model_id = 0,
+        .quant_bits = 2,
+        .ctx_size = 32768,
+        .reject_different_quant = false,
+        .protect_text = protect_text,
+    };
+    TEST_ASSERT(kv_cache_evict(&kc, NULL, incoming_bytes, &incoming));
+    TEST_ASSERT(test_kv_dir_bytes(dir) + incoming_bytes <= kc.budget_bytes);
+
+    for (int i = 0; i < 3; i++) {
+        char *path = test_kv_text_path(dir, texts[i]);
+        TEST_ASSERT((access(path, F_OK) == 0) == (i == last));
+        unlink(path);
+        free(path);
+    }
+    kv_cache_close(&kc);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_keeps_protected_checkpoint_when_full(void) {
+    char tmpl[] = "/tmp/ds4-kv-protect-full-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *small_text = "small unrelated transcript";
+    const char *main_text = "main agent transcript";
+    const char *sub_text = "subagent transcript";
+    const uint64_t now = (uint64_t)time(NULL);
+    test_kv_text_stub_file_used(dir, small_text, 0, KV_REASON_COLD,
+                                1024, 0, 100, 100, 256);
+    test_kv_text_stub_file_used(dir, main_text, 0, KV_REASON_EVICT,
+                                2048, 0, now, now, 2048);
+    char *small_path = test_kv_text_path(dir, small_text);
+    char *main_path = test_kv_text_path(dir, main_text);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    uint64_t incoming_bytes =
+        KV_CACHE_FIXED_HEADER + 4u + strlen(sub_text) + 2048u;
+    kc.budget_bytes =
+        incoming_bytes + KV_CACHE_FIXED_HEADER + 4u + strlen(main_text) + 2047u;
+    ds4_kvstore_eviction_context incoming = {
+        .text = sub_text,
+        .text_len = strlen(sub_text),
+        .model_id = 0,
+        .quant_bits = 2,
+        .ctx_size = 32768,
+        .reject_different_quant = false,
+        .protect_text = "main agent transcript\nuser: subagent result",
+    };
+    /* Even deleting every other entry cannot make room next to the
+     * protected checkpoint: report failure and delete nothing. */
+    const uint64_t bytes_before = test_kv_dir_bytes(dir);
+    TEST_ASSERT(!kv_cache_evict(&kc, NULL, incoming_bytes, &incoming));
+    TEST_ASSERT(test_kv_dir_bytes(dir) == bytes_before);
+    TEST_ASSERT(access(main_path, F_OK) == 0);
+    TEST_ASSERT(access(small_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(small_path);
+    unlink(main_path);
+    free(small_path);
+    free(main_path);
+    rmdir(dir);
+}
+
 static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     char tmpl[] = "/tmp/ds4-kv-live-prefix-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -19977,6 +20350,7 @@ static void ds4_server_unit_tests_run(void) {
     test_note_client_control_tokens();
     test_render_qwen_tool_round_trip();
     test_qwen_tool_visible_checkpoint_boundary();
+    test_qwen_tool_turn_disk_key();
     test_qwen_decode_tracker_markers();
     test_parse_qwen_tool_call_message();
     test_qwen_literal_tool_end_in_argument();
@@ -19988,6 +20362,7 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_checkpoint_suffix_matches_render();
     test_qwen_thinking_visible_text_matches_render();
     test_qwen_visible_keys_prefix_next_render();
+    test_live_kv_turn_end_token();
     test_qwen_reasoning_effort_levels();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
@@ -20066,6 +20441,9 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
+    test_kv_cache_eviction_protects_checkpoint_about_to_load();
+    test_kv_cache_eviction_protects_after_earlier_victims();
+    test_kv_cache_eviction_keeps_protected_checkpoint_when_full();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

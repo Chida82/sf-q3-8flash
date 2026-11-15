@@ -97,7 +97,7 @@ activation quantization, and any route that changes greedy output, is `drop`.
 | #1145 | Refuse duplicate tensor names and name the file of a missing tensor | open | `4fbba5d` | 1 | 2026-09-28 | 2026-11-13 | correctness at the GGUF trust boundary; planned in `120-correctness-batch` |
 | #1156 | Fix the iq1_s and iq4_nl block sizes in the GGUF type table | open | `f63ae1d` | 1 | 2026-10-01 | 2026-11-13 | correctness: wrong entries in the child (`ds4.c:2086-2087`); planned in `120-correctness-batch` |
 | #1326 | prompt prefix: close imported Qwen assistant turns once | open | `7b0e2aa` | 1 | 2026-11-06 | 2026-11-13 | correctness: `--prefix-file` imports get a second `<\|im_end\|>` after assistant turns (`ds4_prompt_prefix.h:44`); planned in `120-correctness-batch` |
-| #1325 | server: evaluate Qwen's `<\|im_end\|>` after a thinking answer | open | `46374b0` | 1 | 2026-11-06 | 2026-11-13 | correctness (Qwen live-KV continuation); planned in `130-server-protocol-batch` |
+| #1325 | server: evaluate Qwen's `<\|im_end\|>` after a thinking answer | open | `46374b0` | 1 | 2026-11-06 | 2026-11-13 | correctness (Qwen live-KV continuation); superseded by #1169's end-of-turn policy, adopted in `160-agent-kv-reuse` (owner decision 2026-11-15); not ported |
 | #1140 | Let Qwen and GLM make several tool calls per turn | open | `480f2ae` | 1 | 2026-10-03 | 2026-11-13 | correctness (Qwen tool calls); planned in `130-server-protocol-batch` with #1251 |
 | #1251 | server: stream Qwen tool-call arguments over OpenAI SSE | open | `c98b444` | 1 | 2026-10-22 | 2026-11-13 | protocol (Qwen tool calls); planned in `130-server-protocol-batch` |
 | #1284 | Server: do not let chat content inject control tokens | open | `138cb39` | 2 | 2026-10-26 | 2026-11-13 | base of #1288; its own renderer part is DeepSeek V4.1; ported by `131-trusted-marker-masking` |
@@ -107,24 +107,24 @@ activation quantization, and any route that changes greedy output, is `drop`.
 | #1163 | Unterminated tool call: defer to the parse-failure recovery | open | `115ec43` | 1 | 2026-10-01 | 2026-11-13 | correctness (protocol); planned in `130-server-protocol-batch` |
 | #1155 | Fix misleading prefill progress and false live cache hits after a backend state reset | open | `8f61ece` | 3 | 2026-10-01 | 2026-11-13 | correctness, reported on Qwen3.8; planned in `130-server-protocol-batch` |
 | #1157 | Find the cold KV anchor in ChatML prompts | open | `24c6197` | 1 | 2026-11-02 | 2026-11-13 | correctness: `user_id`/`assistant_id` are -1 in the Qwen vocabulary (`ds4.c:29724`), so the anchor is never found; planned in `130-server-protocol-batch` |
-| #1212 | Reload evicted Qwen tool turns for clients that send reasoning back | open | `5cc8f27` | 1 | 2026-11-10 | 2026-11-13 | KV reuse (Qwen tool turns); planned in `160-agent-kv-reuse` |
-| #1206 | server: preserve Qwen Responses final-answer cache reuse | open | `c7a0d8a` | 1 | 2026-10-30 | 2026-11-13 | KV reuse; needs #1169 first; planned in `160-agent-kv-reuse` |
-| #1169 | Preserve exact tool-call replay across KV checkpoint restores | open | `83b3e88` | 2 | 2026-10-31 | 2026-11-13 | KV reuse and EOS commitment; planned in `160-agent-kv-reuse` |
+| #1212 | Reload evicted Qwen tool turns for clients that send reasoning back | open | `5cc8f27` | 1 | 2026-11-10 | 2026-11-13 | KV reuse (Qwen tool turns); adopted in `160-agent-kv-reuse`: workload `speed-bench/agent_reuse.py` (Q4, defaults) b.return1 cached 16384 -> 19930 (4.99 -> 2.44 s), b.return2 16384 -> 19930 (11.78 -> 9.68 s) |
+| #1206 | server: preserve Qwen Responses final-answer cache reuse | open | `c7a0d8a` | 1 | 2026-10-30 | 2026-11-13 | KV reuse; dropped in `160-agent-kv-reuse`: no target in the workload (no Responses client asks for and replays reasoning summaries); its trailing-whitespace hunk is already in main (132) |
+| #1169 | Preserve exact tool-call replay across KV checkpoint restores | open | `83b3e88` | 2 | 2026-10-31 | 2026-11-13 | end-of-turn half adopted in `160-agent-kv-reuse` (owner policy): `<\|im_end\|>` evaluated into the live KV after tool-call and stop turns, kept in every closed-turn key; tool-memory half not ported (no target). workload `speed-bench/agent_reuse.py` (Q4, defaults): +1 cached token per continuation, no request loses cached tokens |
 | #1175 | server: honor rewritten history in live tool continuations | open | `4e113c7` | 2 | 2026-10-30 | 2026-11-13 | correctness: live tool reuse could substitute cached history; planned in `130-server-protocol-batch` |
-| #1194 | responses: heal the forked live checkpoint on a token-mismatch miss | open | `ce9fd0b` | 1 | 2026-10-07 | 2026-11-13 | KV reuse; planned in `160-agent-kv-reuse` |
-| #1200 | Metal: retain bounded Qwen Responses prompt checkpoints | open | `06d48c0` | 1 | 2026-10-30 | 2026-11-13 | KV reuse: returning to a 73K conversation 38.4 s -> 0.98 s (author); planned in `160-agent-kv-reuse` |
-| #1228 | server: retain bounded cold cache prefixes for long prompts | open | `659889d` | 1 | 2026-10-25 | 2026-11-13 | KV reuse; planned in `160-agent-kv-reuse` |
+| #1194 | responses: heal the forked live checkpoint on a token-mismatch miss | open | `ce9fd0b` | 1 | 2026-10-07 | 2026-11-13 | KV reuse; dropped in `160-agent-kv-reuse`: its trigger matches an ordinary Responses switch (workload a.resp1, common=55), where it would skip the evict store of the outgoing 39867-token chat checkpoint; no forked checkpoint to heal in the workload; deletes cache files on a heuristic |
+| #1200 | Metal: retain bounded Qwen Responses prompt checkpoints | open | `06d48c0` | 1 | 2026-10-30 | 2026-11-13 | KV reuse: 38.4 s -> 0.98 s (author); dropped in `160-agent-kv-reuse`: near-tail files are capped at budget/8 (512 MiB at the default 4 GiB, about 14K tokens); every Responses prompt in the workload is >= 40K tokens (>= 1.3 GiB), so none is admitted, and the one Responses request that misses live (a.resp1) has no later request that would load its frontier |
+| #1228 | server: retain bounded cold cache prefixes for long prompts | open | `659889d` | 1 | 2026-10-25 | 2026-11-13 | KV reuse; deferred in `160-agent-kv-reuse` until `130` lands #1157 (its anchor half needs the ChatML anchor) |
 | #1058 | Key tool-conversation KV checkpoints by the client-visible transcript | open | `889b2c0` | 5 | 2026-10-14 | 2026-11-13 | KV reuse after a restart (reported on Qwen) |
 | #1059 | server: find token-text disk stores by the request's rendered tokens | open | `0e4d448` | 2 | 2026-10-27 | 2026-11-13 | KV reuse |
-| #903 | kvstore: save continued checkpoints after crossed interval frontiers | open | `fd7eda0` | 1 | 2026-10-18 | 2026-11-13 | same problem as #1342; take one |
+| #903 | kvstore: save continued checkpoints after crossed interval frontiers | open | `fd7eda0` | 1 | 2026-10-18 | 2026-11-13 | same problem as #1342; dropped in `160-agent-kv-reuse` with #1342: the same crossing rule, whose extra stores the workload measured as +3.0 s and never loaded |
 | #1020 | kvstore: stamp checkpoints with a behavioral tokenizer fingerprint | open | `9cbf7e5` | 4 | 2026-11-06 | 2026-11-13 | safety: rejects checkpoints from another tokenizer; changes the checkpoint trailer |
-| #1170 | Keep the disk KV checkpoint the next request loads when storing an evict snapshot | open | `80db39c` | 3 | 2026-10-03 | 2026-11-13 | KV reuse; planned in `160-agent-kv-reuse` |
-| #1216 | kvstore: find the longest text-prefix checkpoint in one pass | open | `402c80b` | 1 | 2026-10-15 | 2026-11-13 | lookup speed, same choice; planned in `160-agent-kv-reuse` |
-| #1258 | kvstore: skip store attempts when the session has no checkpoint | open | `4ca5111` | 1 | 2026-10-23 | 2026-11-13 | log noise and wasted work; planned in `160-agent-kv-reuse` |
+| #1170 | Keep the disk KV checkpoint the next request loads when storing an evict snapshot | open | `80db39c` | 3 | 2026-10-03 | 2026-11-13 | KV reuse; adopted in `160-agent-kv-reuse`: workload `speed-bench/agent_reuse.py` (Q4, defaults) b.return1 cached 0 -> 16384 (16.49 -> 4.99 s), b.return2 0 -> 16384 (22.24 -> 11.78 s) |
+| #1216 | kvstore: find the longest text-prefix checkpoint in one pass | open | `402c80b` | 1 | 2026-10-15 | 2026-11-13 | lookup speed, same choice; dropped in `160-agent-kv-reuse`: at most 5 entries on disk in the workload, loads 29-120 ms dominated by the payload read; no lookup cost to remove |
+| #1258 | kvstore: skip store attempts when the session has no checkpoint | open | `4ca5111` | 1 | 2026-10-23 | 2026-11-13 | log noise and wasted work; dropped in `160-agent-kv-reuse`: zero "payload staging failed" lines in every workload run (Qwen stages only at valid chunk boundaries) |
 | #1280 | server: continued KV checkpoints that actually land during a long read | open | `caad877` | 1 | 2026-10-25 | 2026-11-13 | KV reuse; measured on V4.1; check the Qwen chunk listener first |
-| #1281 | server: a short live prefix no longer hides a longer disk-cache hit | open | `296a512` | 2 | 2026-10-25 | 2026-11-13 | KV reuse; planned in `160-agent-kv-reuse` |
-| #1340 | server: align the continued KV checkpoint step with the prefill chunk schedule | open | `702d273` | 1 | 2026-11-10 | 2026-11-13 | KV reuse; alternative to #1342 |
-| #1342 | server: write a continued KV checkpoint at the first chunk past each step | open | `88ac7a1` | 1 | 2026-11-10 | 2026-11-13 | KV reuse; alternative to #1340; planned in `160-agent-kv-reuse` |
+| #1281 | server: a short live prefix no longer hides a longer disk-cache hit | open | `296a512` | 2 | 2026-10-25 | 2026-11-13 | KV reuse; dropped in `160-agent-kv-reuse`: `e9be611` has no target (the one memory-token hit with prompt > live + 512, b.tool3, has a shorter disk entry than live), `296a512` unreachable (no live rewind for Qwen) |
+| #1340 | server: align the continued KV checkpoint step with the prefill chunk schedule | open | `702d273` | 1 | 2026-11-10 | 2026-11-13 | KV reuse; alternative to #1342; dropped in `160-agent-kv-reuse` (does not fix Qwen's unaligned resume; #1342's rule measured no gain) |
+| #1342 | server: write a continued KV checkpoint at the first chunk past each step | open | `88ac7a1` | 1 | 2026-11-10 | 2026-11-13 | KV reuse; dropped in `160-agent-kv-reuse`: workload `speed-bench/agent_reuse.py` (Q4, defaults) cached unchanged (352097), responses identical, wall 159.29 -> 162.28 s: 13 continued stores of 0.6-1.3 GiB instead of 1, which evicted each other in the 4 GiB budget; none was loaded |
 | #1323 | server: `--kv-cache-cold-anchor last-user` | open | `78ec082` | 1 | 2026-11-11 | 2026-11-13 | opt-in KV policy |
 | #815 | server: drop a partial trailing UTF-8 sequence from finished text | open | `130f3e2` | 1 | 2026-10-09 | 2026-11-13 | correctness; overlaps #1226; `130-server-protocol-batch` takes one of the two |
 | #1226 | Replace invalid UTF-8 with U+FFFD in server JSON output | open | `4a02767` | 1 | 2026-10-18 | 2026-11-13 | correctness; overlaps #815; `130-server-protocol-batch` takes one of the two |
@@ -426,8 +426,8 @@ and from `ds4_gpu_routed_moe_one_tensor`.
 
 | Commit | Subject | Verdict | Reason |
 |---|---|---|---|
-| `6752300` | Preserve exact tool-call replay across KV checkpoint restores | open | planned in `160-agent-kv-reuse`. Tool memory, EOS commitment, checkpoint serialization; Qwen-heavy. Required by #1206 |
-| `83b3e88` | Match both tool-turn checkpoint log spellings in replay test | open | test |
+| `6752300` | Preserve exact tool-call replay across KV checkpoint restores | adopt -> `160-agent-kv-reuse` | end-of-turn part only (owner policy 2026-11-15, both turn kinds): `<\|im_end\|>` evaluated after tool-call and `<\|im_end\|>`-stop chat turns, keys published only after it; the Qwen live tool tail starts at the newline. Child changes: chat requests only (a completion continuation would not echo the token); the thinking key also drops its trailing newline, which the live KV never held. Not taken: the tool-memory index (whitespace variants, multi-call identity, `raxFindPrefixes`; the child's scanner already writes single Qwen calls and the workload makes no other kind), the legacy-key shim (no child build wrote an EOS payload under an EOS-less key), DeepSeek/GLM forms. Workload: +1 cached token per continuation; a.tool4 differs with identical prompt tokens (the end token's row now comes from one decode step instead of the next prefill chunk) and conversation A drifts from there |
+| `83b3e88` | Match both tool-turn checkpoint log spellings in replay test | drop | test of the tool-memory part, not ported |
 
 ### #1175 (head `4e113c7`)
 
@@ -465,16 +465,16 @@ and from `ds4_gpu_routed_moe_one_tensor`.
 
 | Commit | Subject | Verdict | Reason |
 |---|---|---|---|
-| `b46cff2` | Keep the disk KV checkpoint the next request loads when storing an evict snapshot | open | eviction order; planned in `160-agent-kv-reuse` |
-| `fd827a2` | Test that the protected KV checkpoint survives earlier victims | open | test |
-| `80db39c` | Drop the evict-snapshot grace period and tighten protection tests | open | same |
+| `b46cff2` | Keep the disk KV checkpoint the next request loads when storing an evict snapshot | adopt -> `160-agent-kv-reuse` | protect text is the request's key text (131 key space). Workload: b.return1 0 -> 16384 cached, b.return2 0 -> 16384 |
+| `fd827a2` | Test that the protected KV checkpoint survives earlier victims | adopt -> `160-agent-kv-reuse` | test |
+| `80db39c` | Drop the evict-snapshot grace period and tighten protection tests | adopt -> `160-agent-kv-reuse` | same |
 
 ### #1281 (head `296a512`)
 
 | Commit | Subject | Verdict | Reason |
 |---|---|---|---|
-| `e9be611` | server: a short live token-prefix stub no longer hides the disk cache | open | KV tier order; planned in `160-agent-kv-reuse` |
-| `296a512` | server: persist a live session before a rewind discards most of it | open | not checked how rewind applies to Qwen's recurrent state (snapshots only) |
+| `e9be611` | server: a short live token-prefix stub no longer hides the disk cache | drop | no target in the workload: no live stub is shorter than a disk hit for the same prompt |
+| `296a512` | server: persist a live session before a rewind discards most of it | not reachable from Qwen | stores before `REUSE_MEMORY_REWIND`, which this child never selects (`backend_can_rewind = false`) |
 
 ### #1137 (head `e320fd7`)
 
@@ -543,24 +543,24 @@ and from `ds4_gpu_routed_moe_one_tensor`.
 | Commit | Subject | Verdict | Reason |
 |---|---|---|---|
 | `7b0e2aa` (#1326) | prompt prefix: close imported Qwen assistant turns once | adopt -> `120-correctness-batch` | not in `upstream/main`; ported by `120-correctness-batch` (Q4 gates, parity and bitwise A/B pass). Bug in the child: `ds4_prompt_prefix_append` pushes EOS (`<\|im_end\|>`, `ds4.c:29722`) after `qwen4_chat_close` already closed the turn. Changes prompt tokens for `--prefix-file` only |
-| `46374b0` (#1325) | server: evaluate Qwen's `<\|im_end\|>` after a thinking answer | next sync | planned in `130-server-protocol-batch`. The reasoning-free live key ends with an `<\|im_end\|>\n` that was never evaluated, so the next turn sees an unclosed answer |
+| `46374b0` (#1325) | server: evaluate Qwen's `<\|im_end\|>` after a thinking answer | drop | superseded by #1169's end-of-turn policy, adopted in `160-agent-kv-reuse` (owner decision 2026-11-15): it fixes the same boundary by leaving `<\|im_end\|>` out of the key, for thinking answers only |
 | `480f2ae` (#1140) | Let Qwen and GLM make several tool calls per turn | next sync | planned in `130-server-protocol-batch`. Generation stops after the first Qwen tool call; the GLM parts drop out. Check together with #1251 |
 | `c98b444` (#1251) | server: stream Qwen tool-call arguments over OpenAI SSE | next sync | planned in `130-server-protocol-batch`. Qwen `<function=…>` syntax in the live translator; the DSML/GLM parts drop out |
 | `1074193` (#1134) | Keep mid-conversation system messages in place | next sync | planned in `130-server-protocol-batch`. Qwen renderer; reported 14.8K re-prefill -> 17 tokens with Claude Code |
 | `00df8df` (#1088) | recover unterminated reasoning as content when the turn completed | next sync | planned in `130-server-protocol-batch`. A completed turn without `</think>` lost its answer |
 | `115ec43` (#1163) | unterminated tool call defers to parse-failure recovery | next sync | planned in `130-server-protocol-batch`. `finish_reason: "error"` on an HTTP 200 |
 | `24c6197` (#1157) | Find the cold KV anchor in ChatML prompts | next sync | planned in `130-server-protocol-batch`. The Qwen vocabulary sets `user_id`/`assistant_id` to -1, so the anchor is never found |
-| `5cc8f27` (#1212) | Reload evicted Qwen tool turns for clients that send reasoning back | open | KV reuse (Pi-style clients); planned in `160-agent-kv-reuse` |
-| `c7a0d8a` (#1206) | preserve Qwen Responses final-answer cache reuse | open | needs #1169; planned in `160-agent-kv-reuse` |
-| `ce9fd0b` (#1194) | heal the forked live checkpoint on a token-mismatch miss | open | KV reuse; planned in `160-agent-kv-reuse` |
-| `06d48c0` (#1200) | retain bounded Qwen Responses prompt checkpoints | open | KV reuse, 38.4 s -> 0.98 s return in the author's workflow; planned in `160-agent-kv-reuse` |
-| `659889d` (#1228) | Preserve bounded cold cache prefixes for long API prompts | open | KV reuse; planned in `160-agent-kv-reuse` |
-| `fd7eda0` (#903) | save continued checkpoints after crossed frontiers | superseded by `88ac7a1` | same rule as #1342; take one of #903/#1340/#1342 |
-| `702d273` (#1340) | align the continued KV checkpoint step with the prefill chunk schedule | open | changes the default interval to 8192; the Qwen prefill chunk is 8192, so check its `ds4_test_default_prefill_caps` values for Qwen |
-| `88ac7a1` (#1342) | write a continued KV checkpoint at the first chunk past each step | open | independent of the chunk schedule; preferred over #903; planned in `160-agent-kv-reuse` |
+| `5cc8f27` (#1212) | Reload evicted Qwen tool turns for clients that send reasoning back | adopt -> `160-agent-kv-reuse` | workload b.return1 16384 -> 19930 cached (same response), b.return2 16384 -> 19930 |
+| `c7a0d8a` (#1206) | preserve Qwen Responses final-answer cache reuse | drop | no target in the `160` workload (no client replays reasoning summaries); re-evaluate with one that does |
+| `ce9fd0b` (#1194) | heal the forked live checkpoint on a token-mismatch miss | drop | see the PR line: skips the evict store on an ordinary Responses switch; nothing to heal in the workload |
+| `06d48c0` (#1200) | retain bounded Qwen Responses prompt checkpoints | drop | near-tail admission (budget/8) admits no prompt of the workload; no request would load it |
+| `659889d` (#1228) | Preserve bounded cold cache prefixes for long API prompts | open | deferred by `160-agent-kv-reuse` until `130` lands #1157 |
+| `fd7eda0` (#903) | save continued checkpoints after crossed frontiers | drop | same crossing rule as #1342, which `160` measured: extra stores, none loaded |
+| `702d273` (#1340) | align the continued KV checkpoint step with the prefill chunk schedule | drop | does not fix Qwen's unaligned resume; `160` measured the #1342 rule with no gain |
+| `88ac7a1` (#1342) | write a continued KV checkpoint at the first chunk past each step | drop | `160` workload: cached unchanged, wall +3.0 s (13 continued stores instead of 1, none loaded) |
 | `78ec082` (#1323) | `--kv-cache-cold-anchor last-user` | open | low priority; opt-in |
-| `402c80b` (#1216) | find the longest text-prefix checkpoint in one pass | open | same result, faster lookup; planned in `160-agent-kv-reuse` |
-| `4ca5111` (#1258) | skip store attempts when the session has no checkpoint | open | planned in `160-agent-kv-reuse` |
+| `402c80b` (#1216) | find the longest text-prefix checkpoint in one pass | drop | no lookup cost visible in the `160` workload (at most 5 entries) |
+| `4ca5111` (#1258) | skip store attempts when the session has no checkpoint | drop | its condition never occurred in the `160` workload |
 | `caad877` (#1280) | continued checkpoints that actually land during a long read | open | measured on V4.1; verify the Qwen chunk listener first |
 | `130f3e2` (#815) | drop a partial trailing UTF-8 sequence from finished text | next sync | invalid UTF-8 in final JSON; `130-server-protocol-batch` takes one of #815/#1226 |
 | `4a02767` (#1226) | Replace invalid UTF-8 with U+FFFD in server JSON output | next sync | broader than #815 (all escapers); `130-server-protocol-batch` takes one of the two |

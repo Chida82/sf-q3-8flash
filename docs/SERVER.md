@@ -67,6 +67,40 @@ trailing whitespace, which the model sampled; an answer with tool calls is
 trimmed at both ends. Echo answers as received: a client that strips a plain
 answer's trailing newline renders a different prompt and misses that key.
 
+### Cache tiers
+
+A request is served from the first tier that matches, in this order:
+
+1. Live session, by protocol: the Responses-visible transcript, then the
+   tool-call IDs of a Responses or Anthropic continuation.
+2. Live session, by tokens: the request's tokens extend the live tokens. The
+   Qwen session is never rewound, so a shorter or diverging prompt misses here.
+3. Live session, by visible text: the key of the last chat turn without its
+   reasoning (`thinking-visible`), then the rendered text of the live tokens.
+4. Disk: the longest stored key that is a byte prefix of the request's key
+   text. Before loading, the outgoing live session is stored (`reason=evict`).
+
+Every key that closes a turn ends with its `<|im_end|>`. After a turn that
+ends in tool calls, or on the `<|im_end|>` stop token, the server evaluates
+that token into the live session before it answers (one decode step), so the
+session ends exactly where the key does and the next request starts at the
+newline after it. A turn cut by a client stop sequence, another stop token or
+an output limit publishes no key. Checkpoints written before this rule keep
+loading; a thinking-visible one written by an older build misses the end
+token once when it is loaded.
+
+The evict store never deletes the checkpoint the incoming request is about to
+load: eviction skips it, and if the budget cannot be met without it, the
+outgoing session is not stored. A tool turn from a client that sends
+reasoning back (its latest assistant message carries reasoning) is stored
+under the rendered text of its tokens, which its next request reproduces,
+instead of under the reasoning-free visible key.
+
+Continued checkpoints are written when a prefill chunk ends on an exact
+multiple of the interval (10240 tokens by default; with 8192-token chunks from
+position 0 that is every 40960 tokens); a prefill resumed off that grid writes
+none.
+
 ## Concurrency
 
 `--batched-session N` keeps N resident sessions and batches decode-ready work.

@@ -7258,7 +7258,9 @@ static void test_special_token_injection_qwen(void) {
         ds4_tokens tokens = {0};
         ds4_tokenize_rendered_chat_masked(engine, tail, trusted, &tokens);
         TEST_ASSERT(test_count_token_spelling(engine, &tokens, "<|im_start|>") == 2);
-        TEST_ASSERT(test_count_token_spelling(engine, &tokens, "<|im_end|>") == 2);
+        /* only the tool turn's close: the previous turn's <|im_end|> is
+         * already in the live KV, so the tail starts after it */
+        TEST_ASSERT(test_count_token_spelling(engine, &tokens, "<|im_end|>") == 1);
         ds4_tokens_free(&tokens);
         free(tail);
         free(trusted);
