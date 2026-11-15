@@ -56,8 +56,10 @@ written by `30-mtp-cycle`.
 | perf/95-mtp-last-row | 2026-11-14 | this row's commit | Qwen3.8-Flash-Next-Q4.gguf | 20 | PASS | 57.7 (+6.1%) | 1482.1 (+2.2%) | 1017.6 (+1.9%) | 1344.3 (+2.4%) | 90.1 (+26.0%) | 2.46 (+34.6%) | 1416.5 (+1.6%) |  |  |  |
 | perf/140-deferred-hc-residual | 2026-11-15 | this row's commit | Qwen3.8-Flash-Next-Q4.gguf | 24 | PASS | 57.7 (+6.0%) | 1500.3 (+3.0%) | 1035.2 (+3.2%) | 1379.9 (+5.4%) | 90.4 (+26.0%) | 2.46 (+34.6%) | 1465.1 (+4.5%) | 66.5 (+8.2%) | 1.49 (-1.2%) | 1457.7 (+4.5%) |
 | perf/97-mtp-verify-speed | 2026-11-15 | this row's commit | Qwen3.8-Flash-Next-Q2.gguf | 20 | PASS | 58.8 (+13.5%) | 1481.6 (+4.3%) | 1055.6 (+12.7%) | 1372.1 (+8.2%) | 81.3 (+16.6%) | 1.91 (+4.5%) | 1478.6 (+9.5%) |  |  |  |
+| fix/110-mtp-image-turn-divergence | 2026-11-15 | this row's commit | Qwen3.8-Flash-Next-Q4.gguf | 20 | PASS | 57.6 (+5.8%) | 1508.9 (+2.8%) | 1039.7 (+3.5%) | 1386.3 (+5.5%) | 90.0 (+25.8%) | 2.46 (+34.6%) | 1462.6 (+4.4%) |  |  |  |
 
-The `fix/82-mtp-greedy-divergence`, `sync/b3f5018`, `perf/95-mtp-last-row` and `perf/97-mtp-verify-speed` rows leave MTP prose empty.
+The `fix/82-mtp-greedy-divergence`, `sync/b3f5018`, `perf/95-mtp-last-row`, `perf/97-mtp-verify-speed` and `fix/110-mtp-image-turn-divergence` rows leave MTP prose empty.
+The `fix/110-mtp-image-turn-divergence` row changes only the REPL, which the bench does not link; against `main` it read within noise on every metric (24 pairs, bitwise).
 The `perf/97-mtp-verify-speed` row is the first Q2 row since `82`, so it also carries the sync, `95`, `140` and `101`; the step itself, against `main`, read MTP decode +0.8% code and +1.0% prose on Q2 (46 pairs, bitwise). Thermal reached Heavy during part of its timed runs. The start
 commit's MTP output on the prose prompt is not its plain greedy output (the
 defect `82` fixed), so the token gate cannot pair the two builds on that kind.

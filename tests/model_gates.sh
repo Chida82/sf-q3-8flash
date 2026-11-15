@@ -10,9 +10,12 @@ Usage: tests/model_gates.sh MODEL.gguf [--mmproj FILE --image A --image B] [--ou
 Gates, in order (each one PASS or FAIL, stop at the first FAIL):
   mtp-identity  tests/test_qwen4_mtp_identity.py --fail-fast (all depths; DIFF or SLOW fails)
   mtp-limits    tests/test_qwen4_mtp_limits.py
+  mtp-turns     tests/test_qwen4_cli_vision.py --text-turns --compare (REPL turns,
+                MTP equal to plain)
   ds4_test      DS4_TEST_MODEL=MODEL DS4_TEST_GLM_MTP=1 ./ds4_test; only the failures
                 docs/TESTING.md lists are allowed
-  vision        tests/test_qwen4_cli_vision.py (only with --mmproj and two --image)
+  vision        tests/test_qwen4_cli_vision.py --compare (only with --mmproj and
+                two --image)
   host-paths    make test-qwen4-host-paths QWEN4_GGUF=MODEL
 
 Builds `all` and `ds4_test` first. The StarForge parity oracle is separate.
@@ -87,14 +90,16 @@ run_ds4_test() {
     grep -q 'ds4 tests: ' "$OUT/ds4_test.raw" || { echo "ds4_test did not finish"; return 1; }
 }
 
-for step in identity limits ds4_test vision host; do
+for step in identity limits turns ds4_test vision host; do
     [ $failed -eq 0 ] || break
     case $step in
         identity) gate mtp-identity python3 tests/test_qwen4_mtp_identity.py --model "$MODEL" --fail-fast --output "$OUT/identity" ;;
         limits)   gate mtp-limits python3 tests/test_qwen4_mtp_limits.py --model "$MODEL" ;;
+        turns)    gate mtp-turns python3 tests/test_qwen4_cli_vision.py --model "$MODEL" \
+                      --text-turns --compare --out-dir "$OUT/turns" ;;
         ds4_test) gate ds4_test run_ds4_test ;;
         vision)   [ -n "$MMPROJ" ] && gate vision python3 tests/test_qwen4_cli_vision.py --model "$MODEL" \
-                      --vision "$MMPROJ" --image "${IMAGES[0]}" --image "${IMAGES[1]}" --out-dir "$OUT/vision" ;;
+                      --vision "$MMPROJ" --image "${IMAGES[0]}" --image "${IMAGES[1]}" --compare --out-dir "$OUT/vision" ;;
         host)     gate host-paths make test-qwen4-host-paths QWEN4_GGUF="$MODEL" ;;
     esac
 done

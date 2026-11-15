@@ -31,6 +31,15 @@ single decoded token would, or near ties can flip. So the verify rows take:
 
 `tests/test_qwen4_mtp_identity.py` checks this over 12 prompts at every depth.
 
+Across turns the same holds only if both modes start each turn from the same
+KV. Plain decode stops at a sampled stop token without evaluating it; a verify
+pass can accept it as a draft, and commit drafts after it. The server and the
+REPL therefore rewind a verify block to the tokens they keep (the server's
+speculative boundary rewind, the REPL's turn end). The rewind restores the
+verify snapshot, so it costs no recomputation. `tests/test_qwen4_cli_vision.py
+--compare` checks REPL conversations, text-only (`--text-turns`) and with
+images.
+
 The predictor gathers token embeddings on the GPU, which reads f32, f16, bf16,
 q8_0 and q4_0 tables; `--mtp` refuses a model whose table is another type. The
 published GGUFs store it as bf16.

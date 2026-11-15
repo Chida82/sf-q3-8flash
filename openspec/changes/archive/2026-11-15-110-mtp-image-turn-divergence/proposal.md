@@ -37,7 +37,7 @@ Not measured yet:
 - whether the outputs repeat over runs;
 - which turn's state first differs;
 - whether a text-only multi-turn conversation also diverges;
-- whether Q2 behaves the same (the Q2 pack is not on this machine).
+- whether Q2 behaves the same (the Q2 pack is on this machine, in `gguf/`).
 
 **What the code says** (read on 2026-11-14 at `765e9a5`):
 - `qwen4_graph_mtp_priming` primes only chunks without image spans
@@ -102,7 +102,7 @@ Not measured yet:
 4. **Cause.** Cheapest test first (design D3).
 5. **Fix or decision**, as in `82` (design D4).
 6. **Closing:**
-   - S0 passes on Q4, and on Q2 if the owner approves its download;
+   - S0 passes on Q4 and on Q2;
    - the parity oracle and the MTP identity and limits checks pass;
    - an A/B against `main` and a record row, if code outside `tests/`
      changed;

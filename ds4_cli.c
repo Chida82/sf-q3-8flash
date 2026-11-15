@@ -1587,6 +1587,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
         }
 
         bool stop = false;
+        int kept = 0;
         for (int j = 0; j < ntok; j++) {
             if (ds4_token_is_stop_for_think_mode(engine, toks[j], think_mode)) {
                 stop = true;
@@ -1599,7 +1600,17 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
             fflush(stdout);
             free(piece);
             generated++;
+            kept++;
             if (generated >= max_tokens) break;
+        }
+        /* The verify pass committed a stop token (and maybe drafts after it)
+         * that the transcript does not keep.  Rewind to the kept tokens, as
+         * plain decode never evaluates the stop token: otherwise the next turn
+         * prefills from a different frontier, or replays the whole
+         * conversation, and MTP output departs from plain output. */
+        if (kept < ntok) {
+            ds4_session_rewind(chat->session,
+                               ds4_session_pos(chat->session) - (ntok - kept));
         }
         if (stop) break;
     }

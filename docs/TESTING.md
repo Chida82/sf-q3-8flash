@@ -35,6 +35,9 @@ Model-backed checks require a Qwen3.8 GGUF:
 DS4_TEST_MODEL=/absolute/path/model.gguf DS4_TEST_GLM_MTP=1 ./ds4_test
 python3 tests/test_qwen4_mtp_limits.py --model /absolute/path/model.gguf
 python3 tests/test_qwen4_mtp_identity.py --model /absolute/path/model.gguf
+python3 tests/test_qwen4_cli_vision.py --model /absolute/path/model.gguf --text-turns --compare
+python3 tests/test_qwen4_cli_vision.py --model /absolute/path/model.gguf \
+    --vision /absolute/path/mmproj.gguf --image A.png --image B.png --compare
 python3 tests/test_qwen4_reasoning_retention.py --model /absolute/path/model.gguf
 ./sf-q3-8flash-eval -m /absolute/path/model.gguf --suite core
 ./sf-q3-8flash-bench -m /absolute/path/model.gguf --prompt-file speed-bench/promessi_sposi.txt
@@ -44,6 +47,17 @@ python3 tests/test_qwen4_reasoning_retention.py --model /absolute/path/model.ggu
 prompts at the automatic depth and at depths 2 and 3. Run it on both packs
 before landing MTP, prefill or decode work; it takes about 30 minutes per pack,
 or half with `--depths auto`.
+
+`test_qwen4_cli_vision.py --compare` covers what the identity check cannot:
+several turns of one REPL session. It runs the conversation without and with
+`--mtp` and prints `SAME` or `DIFF` per turn, with the first differing line,
+and exits 1 on any `DIFF`. `--text-turns` runs four text turns; without it the
+conversation reads two images and asks about each. Set
+`DS4_QWEN4_MTP_DEPTH=2` or `=3` inline to pin the depth. The modes can part
+where a turn ends on a stop token accepted as a draft: the REPL rewinds the
+verify block to the tokens it keeps, so both modes start the next turn from the
+same KV. The per-turn `processing N input tokens` counts in the two `.stderr`
+files must then match. `tests/model_gates.sh` runs both forms.
 
 `test_qwen4_reasoning_retention.py` drives the server's `preserve_thinking`
 switch through one server run and a restart; see `docs/QWEN38_FLASH_NEXT.md`.

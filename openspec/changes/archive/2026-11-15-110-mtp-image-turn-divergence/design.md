@@ -114,7 +114,7 @@ No probe code lands.
   server. If confirmed, the server's live session path is checked the same
   way before closing (one two-turn request pair through
   `sf-q3-8flash-server`).
-- **Q2 is not on this machine** → the change closes on Q4 and lists the Q2
-  run as pending the owner's approval of the 137 GiB download.
+- **Q2 runs too.** The Q2 pack is in the child's `gguf/` (the model gates of
+  `132`, `160`, `130` and `97` ran on it), so S0 closes on Q4 and on Q2.
 - **`90` may change the result** → task 1.2 re-measures the case on the synced
   `main` before anything else.

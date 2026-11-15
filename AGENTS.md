@@ -91,8 +91,9 @@ For vision changes, run the model-less Python metric tests first, then
 smallest existing server integration test matching the changed protocol.
 
 Before a PR, when local GGUFs exist, run the model gates (MTP identity and
-limits, `ds4_test` against its known failures, vision, host paths; one model
-process at a time, stopping at the first failure), on Q2 and Q4:
+limits, MTP against plain over REPL turns, `ds4_test` against its known
+failures, vision with the same comparison, host paths; one model process at
+a time, stopping at the first failure), on Q2 and Q4:
 
 ```sh
 tests/model_gates.sh /absolute/path/model.gguf \
