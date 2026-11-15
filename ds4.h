@@ -152,7 +152,6 @@ typedef struct {
     bool glm_mtp;
     bool glm_mtp_timing;
     bool dspark_exact_sampling;
-    bool cuda_tensor_parallel;
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
@@ -221,8 +220,6 @@ void ds4_engine_close(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);
 int ds4_engine_vocab_size(ds4_engine *e);
 uint32_t ds4_engine_prefill_chunk(ds4_engine *e);
-int ds4_engine_power(ds4_engine *e);
-int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
 /* Decode gate schedule for the TP transport; see ds4_tp_identity. */
@@ -280,7 +277,6 @@ bool ds4_think_mode_enabled(ds4_think_mode mode);
 int ds4_think_mode_level(ds4_think_mode mode);
 bool ds4_think_mode_parse_level(const char *text, ds4_think_mode *out);
 const char *ds4_think_mode_name(ds4_think_mode mode);
-const char *ds4_think_max_prefix(void);
 uint32_t ds4_think_max_min_context(void);
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
 /* Uses the active model shape selected by ds4_engine_open(); call after opening
@@ -340,7 +336,6 @@ void ds4_encode_chat_prompt(
         const char *prompt,
         ds4_think_mode think_mode,
         ds4_tokens *out);
-void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens);
 void ds4_chat_append_think_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode mode);
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content);
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode);

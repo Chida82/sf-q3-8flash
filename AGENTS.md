@@ -188,9 +188,12 @@ them on the strength of the name alone.
 | `glm_mtp`, `glm_mtp_timing`, `glm_mtp_have` | the built-in MTP switch. `--mtp` sets `engine.glm_mtp`; Qwen speculation is off without it | `ds4_cli.c` `--mtp` handler; `ds4_session_eval_speculative*` Qwen branch |
 | `spec_frontier_*`, `metal_graph_dspark_cache_*`, `g->dspark_cache_*` | snapshot/rollback frontier used by `ds4_session_tp_spec_cycle` (TP plumbing, SPEC.md §B). Qwen's own `--mtp` path never reaches it | runtime probes: zero hits with `--mtp`, with depth pinned to 2, and with `DS4_MTP_FORCE_SNAPSHOT` |
 | `dspark_exact_sampling` | the `--mtp-exact-sampling` flag for built-in MTP; not DSpark | `ds4_cli.c`, `ds4_server.c` handlers |
-| `dsv4_*.metal`, `kernel_dsv4_*` | DeepSeek-derived kernels that the Qwen graph reuses (hc, kv, rope, misc) | referenced is not dispatched: a literal in `ds4_metal.m` only proves a pipeline can be formed. Change 100 removed the pipelines `ds4_gpu_init` built and nothing dispatched (the GLM set and 7 generic ones) with their GLM kernels, and the V4.1 kernels with no literal. Every remaining `kernel_dsv4_*` has a literal, but some only in host functions no Qwen path calls (DeepSeek compressed attention such as `ds4_gpu_indexer_score_one_tensor`, change 101) |
+| `dsv4_*.metal`, `kernel_dsv4_*` | DeepSeek-derived kernels that the Qwen graph reuses (hc, kv, rope, misc) | referenced is not dispatched: a literal in `ds4_metal.m` only proves a pipeline can be formed. Change 100 removed the pipelines `ds4_gpu_init` built and nothing dispatched (the GLM set and 7 generic ones) with their GLM kernels, and the V4.1 kernels with no literal. Change 101 removed DeepSeek compressed attention (indexer scores, top-k mask, indexed mixed attention, compressor quad/finalize) with its wrappers and kernels; the compressor wrappers `tests/ds4_test.c` calls (`ds4_gpu_compressor_{update,prefill,prefill_ratio4_replay}_tensor`) stay with their kernels. `ds4_gpu_indexer_topk_tensor` is Qwen's (`qwen4_idx_select`) |
 | `metal/*.metal` kernels that no string literal names | usually template bodies, instantiated through `typedef decltype(...)` plus `template [[host_name("...")]] kernel alias_t body<...>;` | a search for `"kernel_x"` misses them; check `\bkernel_x<` and `decltype(kernel_x` before calling a kernel dead. Every name reaches `newFunctionWithName:` from a literal or a switch of literals, so the formable set is exactly the literal set plus the four `kernel_flash_attn_ext_*` format patterns; after that audit only 11 instantiations were dead |
-| `ds4_deepseek4_attention_bounds` and the `deepseek4.*` GGUF key readers | shared attention-bounds helper and metadata readers | called from the Qwen path |
+| `ds4_deepseek4_attention_bounds`, `ds4_deepseek4_next_image_span`, the `ds4_deepseek4_image_token_type` enum | the DeepSeek graph's visual-mask helpers, not Qwen's: `ds4_gpu_fill_visual_mixed_batch_mask` calls the bounds helper from the batch attention wrappers `metal_graph_encode_layer_attention_batch` uses on the layer-slice path; `tests/ds4_test.c` uses the enum | kept for the layer-slice plumbing (SPEC.md §B); the DeepSeek and GLM image preprocessing around them went in change 101, vision here is Qwen3-VL only |
+| the `deepseek4.*` GGUF key readers | metadata readers | called from the Qwen loader |
+| `ds4_layer_compress_ratio`, `ds4_engine_layer_compress_ratio`, `g_ds4_compress_ratios` | the compress-ratio helpers return a literal 0 for every layer; the Qwen loader validates `qwen4exp.attention.compress_ratios` into `g_ds4_compress_ratios`, which nothing reads | change 101 cut every GPU `ratio != 0` branch (DeepSeek graph, layer/session payload save/load) with `sf-ablate(ds4)` markers; the CPU reference keeps its compressed-attention code (§B) and `dist_kv_layer_tensor_bytes` keeps its sizing branch. If `g_ds4_compress_ratios` is ever wired into `ds4_layer_compress_ratio`, the removed GPU paths are needed again: restore them from upstream, do not patch around them |
+| `g->cuda_qkv_pair`, `DS4_CUDA_NO_QKV_PAIR` | a Metal q/kv pair-projection switch, true by default; not CUDA | `metal_graph_encode_decode_layer_phase` |
 
 When in doubt, prove it: build with the symbol removed, or add a one-line
 `fprintf` probe and run the model. A probe result outranks any name.
@@ -233,6 +236,16 @@ When in doubt, prove it: build with the symbol removed, or add a one-line
   enough -- it cost hours twice -- so the CPU flavour now has its own names.
 - `mtp-verify-depth` (removed) exercised the external MTP support model, not
   built-in MTP, so it could only skip or fail here.
+- The CUDA tensor-parallel code in the DeepSeek graph sat behind predicates
+  that return false under `__APPLE__`, but one of its helpers,
+  `metal_graph_cuda_stream_prefill_batch_selected_load`, returned **true** on
+  Apple: removing it meant dropping the call and keeping `ok`, not folding it to
+  false. Change 101 removed the CUDA code (TP blocks, multi-GPU engine
+  placement, decode-island capture, split-kv/vec4 decode); the multi-tier
+  plumbing of the DeepSeek graph (`g->placement`, `*_by_tier[]`,
+  `metal_graph_set_active_tier_*`) is still there, dead on Metal because no
+  frontend passes a placement, and only three tier helpers remain in
+  `ds4_gpu_mgpu.h`.
 - A preprocessor-output diff (`cc -E -P` before/after) cannot see the removal
   of `#error`/`#warning` guards or of `#else` fallbacks whose condition is true
   in the tested configuration. Check those with a negative compile, never with

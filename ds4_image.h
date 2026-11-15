@@ -29,19 +29,6 @@ typedef struct {
     float *patches;
 } ds4_image_patches;
 
-typedef struct {
-    uint32_t content_width;
-    uint32_t content_height;
-    uint32_t padded_width;
-    uint32_t padded_height;
-    uint32_t grid_width;
-    uint32_t grid_height;
-    uint32_t llm_grid_width;
-    uint32_t llm_grid_height;
-    uint32_t patch_count;
-    float *patches;
-} ds4_deepseek4_image_patches;
-
 typedef enum {
     DS4_DEEPSEEK4_IMAGE_START = 0,
     DS4_DEEPSEEK4_IMAGE_PAD = 1,
@@ -50,12 +37,7 @@ typedef enum {
     DS4_DEEPSEEK4_IMAGE_END = 4,
 } ds4_deepseek4_image_token_type;
 
-typedef struct {
-    uint32_t token_count;
-    uint32_t image_count;
-    uint8_t *types;
-    uint32_t *perm;
-} ds4_deepseek4_image_layout;
+/* sf-ablate(vision): DeepSeek and GLM image preprocessing removed; vision here is Qwen3-VL only. */
 
 int ds4_image_decode_memory(
         ds4_image     *out,
@@ -72,14 +54,6 @@ int ds4_image_decode_file(
 
 void ds4_image_free(ds4_image *image);
 
-int ds4_image_preprocess_glm53(
-        ds4_image_patches *out,
-        const ds4_image   *image,
-        uint32_t           min_image_tokens,
-        uint32_t           max_image_tokens,
-        char              *error,
-        size_t             error_cap);
-
 /* Qwen3-VL style: resize to multiples of 32 within the token budget, normalize
  * with mean/std 0.5, emit 3*16*16 patches in 2x2 merge-window order. */
 int ds4_image_preprocess_qwen4(
@@ -92,31 +66,6 @@ int ds4_image_preprocess_qwen4(
 
 void ds4_image_patches_free(ds4_image_patches *patches);
 
-int ds4_image_preprocess_deepseek4(
-        ds4_deepseek4_image_patches *out,
-        const ds4_image             *image,
-        char                        *error,
-        size_t                       error_cap);
-
-int ds4_image_preprocess_deepseek41(
-        ds4_deepseek4_image_patches *out, const ds4_image *image,
-        char *error, size_t error_cap);
-
-int ds4_deepseek41_image_layout_build(
-        ds4_deepseek4_image_layout *out, uint32_t height, uint32_t width,
-        char *error, size_t error_cap);
-
-int ds4_deepseek4_image_layout_build(
-        ds4_deepseek4_image_layout *out,
-        uint32_t                    grid_height,
-        uint32_t                    grid_width,
-        uint32_t                    start_pos,
-        char                       *error,
-        size_t                      error_cap);
-
-void ds4_deepseek4_image_patches_free(ds4_deepseek4_image_patches *patches);
-void ds4_deepseek4_image_layout_free(ds4_deepseek4_image_layout *layout);
-
 /* Find the next DeepSeek image block at or after *cursor. A block includes
  * the alignment PAD tokens immediately before IMAGE_START. Returns 1 when a
  * block was found, 0 at end of input, and -1 for malformed synthetic tokens. */
@@ -128,15 +77,6 @@ int ds4_deepseek4_next_image_span(
         uint32_t  *block_start,
         uint32_t  *image_start,
         uint32_t  *image_end);
-
-/* Choose a prefill chunk without splitting a DeepSeek image block. */
-int ds4_deepseek4_prefill_chunk(
-        const int *tokens,
-        uint32_t   token_count,
-        uint32_t   vocab_size,
-        uint32_t   pos0,
-        uint32_t   cap,
-        uint32_t  *chunk);
 
 /* Fill [lo, hi] absolute raw-key bounds for every query row. */
 int ds4_deepseek4_attention_bounds(
