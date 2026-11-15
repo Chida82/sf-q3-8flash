@@ -21,4 +21,4 @@
 
 ## 4. Serve (owner)
 
-- [ ] 4.1 After the merge into `main`, from the child's main checkout (serve's own script is pre-136 and does not hand over): `./sfctl/sfctl update q3-8flash`. It links Q2, writes the Q4 agent, and restarts the service on Q4 if it was running. Then `sfctl status`, and `sfctl start q3-8flash-q4` if it was stopped. Later updates run as `sfctl update q3-8flash`.
+- [x] 4.1 After the merge into `main`, from the child's main checkout (serve's own script is pre-136 and does not hand over): `./sfctl/sfctl update q3-8flash`. It links Q2, writes the Q4 agent, and restarts the service on Q4 if it was running. Then `sfctl status`, and `sfctl start q3-8flash-q4` if it was stopped. Later updates run as `sfctl update q3-8flash`.
