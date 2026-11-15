@@ -244,6 +244,12 @@ When in doubt, prove it: build with the symbol removed, or add a one-line
   after it failed with "requires Metal or single-GPU CUDA" and `make` would not
   relink: the binaries were newer than every object. Documenting it was not
   enough -- it cost hours twice -- so the CPU flavour now has its own names.
+- Kernels used to be read from `metal/` in the current directory, so a binary
+  run from another tree compiled that tree's kernels against its own host code,
+  silently: in change 97 a mixed run produced different greedy text and two
+  wrong findings. Since change 134 `ds4_gpu_full_source` looks only beside the
+  executable and in its parent (plus the `DS4_METAL_*_SOURCE` overrides); keep
+  that resolution at a sync.
 - `mtp-verify-depth` (removed) exercised the external MTP support model, not
   built-in MTP, so it could only skip or fail here.
 - The CUDA tensor-parallel code in the DeepSeek graph sat behind predicates

@@ -4715,6 +4715,16 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_QWEN4_VISION_SOURCE", @"metal/qwen4_vision.metal"],
     ];
 
+    /* sf-change(134): kernels resolve beside the executable (then its parent, for tests/), never the cwd: a binary run from another tree compiled that tree's kernels */
+    char exe_raw[PATH_MAX], exe_real[PATH_MAX];
+    uint32_t exe_len = sizeof(exe_raw);
+    if (_NSGetExecutablePath(exe_raw, &exe_len) != 0 || !realpath(exe_raw, exe_real)) {
+        fprintf(stderr, "ds4: cannot resolve the executable path to find metal/\n");
+        return nil;
+    }
+    NSString *exe_dir = [[NSString stringWithUTF8String:exe_real] stringByDeletingLastPathComponent];
+    NSArray<NSString *> *search_dirs = @[exe_dir, [exe_dir stringByDeletingLastPathComponent]];
+
     NSMutableString *source = [NSMutableString stringWithString:base];
     for (NSArray<NSString *> *spec in required_sources) {
         const char *override_path = getenv([spec[0] UTF8String]);
@@ -4722,8 +4732,9 @@ static NSString *ds4_gpu_full_source(void) {
         if (override_path && override_path[0]) {
             [paths addObject:[NSString stringWithUTF8String:override_path]];
         }
-        [paths addObject:spec[1]];
-        [paths addObject:[@"./" stringByAppendingString:spec[1]]];
+        for (NSString *dir in search_dirs) {
+            [paths addObject:[dir stringByAppendingPathComponent:spec[1]]];
+        }
 
         NSString *loaded = nil;
         NSString *loaded_path = nil;
@@ -4745,8 +4756,10 @@ static NSString *ds4_gpu_full_source(void) {
 
         if (!loaded) {
             fprintf(stderr,
-                    "ds4: Metal source %s not found (set %s to override)\n",
-                    [spec[1] UTF8String], [spec[0] UTF8String]);
+                    "ds4: Metal source %s not found; tried %s (set %s to override)\n",
+                    [spec[1] UTF8String],
+                    [[paths componentsJoinedByString:@", "] UTF8String],
+                    [spec[0] UTF8String]);
             return nil;
         }
         [source appendFormat:@"\n// appended %@\n%@\n", loaded_path, loaded];

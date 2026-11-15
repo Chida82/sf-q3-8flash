@@ -13,6 +13,14 @@ memory. Start Q2 conservatively on a 64 GB Mac:
 ./sf-q3-8flash --ctx 8192 --prefill-chunk 1024
 ```
 
+Kernels are read from `metal/*.metal` and compiled when the GPU starts. Each
+file is looked up beside the running executable, then in its parent directory
+(for the binaries built under `tests/`); the current directory is never
+searched, so a binary always compiles its own tree's kernels wherever it is
+run from. `DS4_METAL_<NAME>_SOURCE` (for example `DS4_METAL_QWEN4_SOURCE`)
+overrides one file for a diagnostic run. A missing file is an error that names
+the paths tried.
+
 Set diagnostics inline, never globally:
 
 ```sh
