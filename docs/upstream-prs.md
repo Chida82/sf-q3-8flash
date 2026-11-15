@@ -18,6 +18,18 @@ each one met the child's own ports. A `next sync`
 commit that is not in `upstream/main` does not arrive by merging: its reason
 names the change that ports it.
 
+## Intake criteria
+
+An unmerged PR is ported only when it improves **performance** (speed, cache
+reuse, less re-prefill) or **quality** (correct output, correct tool calls,
+valid JSON, correctness fixes). A PR that only adds protocol conformance (a
+response field, a reason code) with neither effect is dropped at triage, with
+that reason in its verdict. `130` took #1161 and #1162 before this rule was
+written; they stay.
+
+The criteria cover PRs only. A sync from `upstream/main` takes every commit,
+minus what this child ablates (StarForge `SYNC.md`).
+
 ## Finding what changed
 
 ```sh
