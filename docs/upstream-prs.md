@@ -7,8 +7,8 @@ new commits on PRs already judged. The head SHAs record what was reviewed; they
 are not a sync base. The base stays in git: `sync-*` tags and
 `git merge-base HEAD upstream/main`.
 
-Last review: 2026-11-14. The PR list was taken on 2026-11-13, so the next
-search starts from `updated:>=2026-11-13`.
+Last review: 2026-11-16. The PR list was taken on 2026-11-16, so the next
+search starts from `updated:>=2026-11-16`.
 
 Verdicts are relative to the child's `main`, synced to `b3f5018` by
 `90-upstream-sync-b3f5018` (2026-11-14). `already in main` and `in main,
@@ -102,9 +102,9 @@ activation quantization, and any route that changes greedy output, is `drop`.
 | #1128 | Metal: reject unsupported shapes in five kernels | open | `fa7bc8a` | 5 | 2026-10-25 | 2026-11-13 | 2 latent Qwen guards reachable (indexer `n_rot`, tile maxima), planned in `120-correctness-batch`; the other 3 not reachable |
 | #1347 | Run the Metal queue keepalive every 250 ms | open | `2f0a0aa` | 1 | 2026-11-12 | 2026-11-13 | open: idle-mapping drop measured on M5 Ultra with 205 GB of views; needs an M5 Max measurement |
 | #1324 | metal: select the shader language version explicitly | open | `bfaa6a2` | 1 | 2026-11-06 | 2026-11-13 | open, low priority: only for hosts linked against an older SDK |
-| #575 | Resolve Metal shader sources relative to the executable | open | `6860463` | 1 | 2026-09-29 | 2026-11-13 | open, low priority: the child loads `metal/*.metal` from the cwd; sfctl runs from the serve worktree |
-| #873 | tokenizer: fix bpe_emit_piece's O(n^2) merge loop | open | `142d95b` | 1 | 2026-10-16 | 2026-11-13 | reachable (Qwen BPE); superseded by #1219 if that one is taken |
-| #1219 | Make the BPE tokenizer and detokenizer linear | open | `b3f552f` | 1 | 2026-10-16 | 2026-11-13 | open: token-identical claimed (4.29 M pieces per vocab), 3-11 -> 15-53 MB/s, unbroken runs 1.4 s -> 1 ms |
+| #575 | Resolve Metal shader sources relative to the executable | open | `6860463` | 1 | 2026-09-29 | 2026-11-16 | superseded by `ceccded` (`134-metal-source-path`): the child resolves `metal/*.metal` against the executable's directory, then its parent, and no longer searches the cwd. #575 adds the executable's directory after the cwd, which keeps the mixed-tree trap 134 removed |
+| #873 | tokenizer: fix bpe_emit_piece's O(n^2) merge loop | open | `142d95b` | 1 | 2026-10-16 | 2026-11-13 | reachable (Qwen BPE); superseded by #1219, planned in `182-linear-bpe-tokenizer` |
+| #1219 | Make the BPE tokenizer and detokenizer linear | open | `b3f552f` | 1 | 2026-10-16 | 2026-11-16 | open, planned in `182-linear-bpe-tokenizer`: token-identical claimed (4.29 M pieces per vocab), 3-11 -> 15-53 MB/s, unbroken runs 1.4 s -> 1 ms. Reachable: the child's `bpe_tokenize_text` calls only the Qwen splitter, which emits through `bpe_emit_piece`. A rewrite, not a cherry-pick: its GLM/DeepSeek pre-tokenizer hunks have no target, and the child's key builders (`131`) keep `special_token_at` |
 | #942 | Detach tokenizer storage from model mmap | open | `4104bd0` | 1 | 2026-09-24 | 2026-11-13 | open, low priority: avoids late page faults on tokenization; overlaps #1219's arena |
 | #1145 | Refuse duplicate tensor names and name the file of a missing tensor | open | `4fbba5d` | 1 | 2026-09-28 | 2026-11-13 | correctness at the GGUF trust boundary; planned in `120-correctness-batch` |
 | #1156 | Fix the iq1_s and iq4_nl block sizes in the GGUF type table | open | `f63ae1d` | 1 | 2026-10-01 | 2026-11-13 | correctness: wrong entries in the child (`ds4.c:2086-2087`); planned in `120-correctness-batch` |
@@ -166,9 +166,23 @@ activation quantization, and any route that changes greedy output, is `drop`.
 | #1278 | server: persistent vision embedding cache | open | `deb6764` | 5 | 2026-10-28 | 2026-11-13 | idea only: stacked on #1277/#1276 (V4.1 image budgets) |
 | #1229 | docs: add Qwen API client setup and diagnosis guide | open | `abd9b8b` | 1 | 2026-10-18 | 2026-11-13 | docs; compare with the child's `docs/CLIENTS.md` |
 | #1350 | Agent: Option/Alt/Ctrl + arrows/backspace | open | `af03a2f` | 1 | 2026-11-13 | 2026-11-13 | open, low priority: linenoise word navigation, which the child CLI also uses |
-| #1312 | ci: add a model-free pull request gate | open | `fa308b3` | 6 | 2026-11-11 | 2026-11-13 | idea: the child's own CI gate |
+| #1312 | ci: add a model-free pull request gate | closed | `c8a9538` | 7 | 2026-11-15 | 2026-11-16 | closed upstream unmerged (2026-11-15; one more commit, `c8a9538`). The idea stays: the child's own CI gate |
 | #987 | Introduce welcome screen with DwarfStar logo | open | `383593f` | 9 | 2026-11-12 | 2026-11-13 | drop: CLI cosmetics, mostly `ds4-agent` |
 | #1004 | Ignore the build outputs tests and benchmarks leave behind | open | `9932596` | 1 | 2026-11-02 | 2026-11-13 | drop: the child keeps its own ignore list |
+| #1112 | Upsample a subsampled JPEG luma plane instead of reading past it | open | `a6ccd45` | 1 | 2026-09-23 | 2026-11-16 | correctness at the image trust boundary: a frame with luma sampled below chroma reads the Y plane past its end (`third_party/iris/jpeg.h:1492`, `:1547`; ASan heap-buffer-overflow on the PR's fixtures). Every client JPEG goes through this decoder. Planned in `180-jpeg-decode-fixes` |
+| #1110 | Decode single-component JPEG scans in raster order | open | `96ab887` | 1 | 2026-09-23 | 2026-11-16 | correctness: one-component DC scans decoded in MCU order (wrong pixels; `jpeg.h:1032`), grayscale 2x2 frames rejected. Planned in `180-jpeg-decode-fixes` |
+| #1113 | Reject progressive JPEG scans whose band ends past coefficient 63 | open | `73b38df` | 1 | 2026-09-23 | 2026-11-16 | already in main: upstream `2768d0e` (validates SOS `Ss`/`Se`/`Ah`/`Al`) came in with the sync; fixture `prog_sos_se_oob.jpg` |
+| #986 | kvstore: age the eviction value of unused checkpoints | open | `ba4b40e` | 1 | 2026-10-18 | 2026-11-16 | KV reuse: the score's `+ 1.0` (`ds4_kvstore.c:580`) never decays, so old never-hit dumps outrank a just-saved conversation. Planned in `181-kvstore-checkpoint-aging` |
+| #1071 | server: decode an open tool call past a stop token | open | `1018c65` | 1 | 2026-09-22 | 2026-11-16 | correctness (Qwen tool calls), reported on Qwen3.8 Q2: `<\|im_end\|>` sampled inside an open `<tool_call>`. Planned in `183-tool-call-past-stop`, with the child's own "open call" predicate (the tracker's state; upstream's `saw_tool_start && !saw_tool_end` would also suppress a legitimate stop between Qwen calls) |
+| #997 | server: fix incremental DSML tracking across malformed text and split close tags | open | `4c6a9c3` | 1 | 2026-09-06 | 2026-11-16 | reachable: the child's Qwen tool-call tracker is `dsml_decode_tracker_update`. Its structural-loop fix (a stray byte parks the cursor, holding greedy sampling to the end of the turn) is planned in `183-tool-call-past-stop`; its lone-`<` fix is already in the child in another form (`ds4_server.c:6886`) |
+| #1008 | Precompute the vision resize tap weights | open | `7d14832` | 1 | 2026-09-09 | 2026-11-16 | performance (vision preprocessing, about 2x single-threaded x86, author); identical output claimed except under `-ffast-math -march=native` on znver4. Planned in `184-vision-resize-taps`, conditional on a bitwise canvas comparison with the child's flags; the child's resize is threaded, unlike the PR's base |
+| #1013 | Filter vision images in two separable passes | open | `bab5b5a` | 2 | 2026-09-09 | 2026-11-16 | drop: changes pixels (.5 ties move by one level on 13 of 457 geometries, author). Its first commit is #1008 |
+| #752 | server: resolve Responses response ids to KV prefixes | open | `54c8e2e` | 1 | 2026-11-16 | 2026-11-16 | drop: protocol (`previous_response_id`), +2.1K lines in `ds4_server.c`; the measured gain is host-side parsing and tokenization only (model not run), which `182` addresses for every request |
+| #1353 | K3: bound SSD streaming memory and accelerate Metal prefill/decode | open | `2ce73fa` | 9 | 2026-11-15 | 2026-11-16 | drop: Kimi K3 only; its shared stream-expert-cache hunks are gated on `g_k3_ssd_streaming_defaults`, false for Qwen |
+| #1095 #1027 | (superseded) | open | - | - | - | 2026-11-16 | #1095 (GGUF block sizes of q8_1, iq1_s, iq4_nl) superseded by #1156, ported by `120-correctness-batch`; the child's q8_1 entry is already 36 bytes. #1027 (O(n log n) BPE merge) superseded by #1219 (`182`) |
+| #1104 #1102 #1084 #1012 #1006 | (protocol or feature) | open | - | - | - | 2026-11-16 | drop under the intake criteria: #1104 startup sampling defaults and reasoning stripping (feature), #1102 `presence_penalty` (feature), #1084 incremental content streaming with tools (protocol), #1012 raw prompts in `/v1/completions` (protocol), #1006 SSE keep-alive while tool output is withheld (protocol) |
+| #1074 | Enhance reasoning effort parsing logic | open | `de418c0` | 1 | 2026-09-22 | 2026-11-16 | already in main (`ecf7a93`) |
+| #1094 #1048 | (docs) | open | - | - | - | 2026-11-16 | docs: #1094 VitePress site; #1048 `download_model.sh` resume wording (the child has its own `download.sh`) |
 | #1021 #106 #274 #374 #423 #489 #764 #811 #1159 #1327 | (closed, reachable) | closed | - | - | - | 2026-11-13 | closed unmerged and not in `upstream/main` (checked by patch and subject). No action. Superseded: #423 by #1139; #1159 and #1327 by #1284/#1288; #1021 by #1194/#1170 |
 
 ## Commits
@@ -548,7 +562,7 @@ and from `ds4_gpu_routed_moe_one_tensor`.
 | `7213dd9`, `1709dd5` (#186) | Compressed KV disk cache via streaming LZ4 | idea -> later change | lossless LZ4 on the disk KV payload; vendors LZ4 (about 6K lines) and touches `ds4_agent.c`. Measure checkpoint size, write/read time and SSD wear against reuse latency |
 | 39 commits (#302) | Structured outputs via llguidance | idea -> later change | external Rust dependency; a feature, not performance |
 | 5 commits (#1278) | server: persistent vision embedding cache | idea -> later vision change | only the last commit (persistent vision embedding cache on disk) is model-agnostic; the rest is V4.1 (#1276/#1277) |
-| 6 commits (#1312) | ci: add a model-free pull request gate | idea -> later change | adapt it to the child's `make test` target list (StarForge rule 19: check that the named tests ran) |
+| 7 commits (#1312, closed) | ci: add a model-free pull request gate | idea -> later change | adapt it to the child's `make test` target list (StarForge rule 19: check that the named tests ran) |
 
 ### Single-commit PRs
 
@@ -583,12 +597,12 @@ and from `ds4_gpu_routed_moe_one_tensor`.
 | `6f9d7d1` (#1309) | Raise the server request body cap to 256 MiB | open | needed with 256 images per request (`f5127df`, in `upstream/main`); adds `DS4_SERVER_MAX_BODY_MB` |
 | `4fbba5d` (#1145) | Refuse duplicate tensor names and name the file of a missing tensor | adopt -> `120-correctness-batch` | not in `upstream/main`; ported by `120-correctness-batch` (Q4 gates, parity and bitwise A/B pass). GGUF trust boundary: `model_find_tensor` is first-match and nothing rejects a repeated name |
 | `f63ae1d` (#1156) | Fix the iq1_s and iq4_nl block sizes in the GGUF type table | adopt -> `120-correctness-batch` | not in `upstream/main`; ported by `120-correctness-batch` (Q4 gates, parity and bitwise A/B pass). Bug in the child (`ds4.c:2086-2087`): iq4_nl tensors are sized at about a third |
-| `b3f552f` (#1219) | Make the BPE tokenizer and detokenizer linear | open | Qwen BPE reaches `bpe_emit_piece`. Token-identical claimed. Gate: token identity on a large corpus plus `make test-qwen4-ngrams` |
+| `b3f552f` (#1219) | Make the BPE tokenizer and detokenizer linear | open | planned in `182-linear-bpe-tokenizer`. Qwen BPE reaches `bpe_emit_piece`. Token-identical claimed. Gate: token identity against a reference copy on a real-vocabulary corpus (CPU), key-text identity, plus `make test-qwen4-ngrams` |
 | `142d95b` (#873) | fix bpe_emit_piece's O(n^2) merge loop | superseded by `b3f552f` | the same heap approach, smaller; take it if #1219 is too large |
 | `4104bd0` (#942) | Detach tokenizer storage from model mmap | open | low priority; overlaps #1219's arena |
 | `2f0a0aa` (#1347) | Run the Metal queue keepalive every 250 ms | open | measure idle-request latency on M5 Max with the Q4 (about 145 GB of views) and Q2 packs; the author saw drops every ~6 s at 1000 ms on M5 Ultra |
 | `bfaa6a2` (#1324) | select the shader language version explicitly | open | low priority; only matters when embedded in a host linked against an older SDK |
-| `6860463` (#575) | Resolve Metal shader sources relative to the executable | open | low priority; the child CLI started from another cwd falls back to CPU silently |
+| `6860463` (#575) | Resolve Metal shader sources relative to the executable | superseded by `ceccded` | `134-metal-source-path` resolves kernels against the executable's directory and its parent, without the cwd |
 | `ca9df3a` (#1153) | `--image-prefix-snapshot` | open | vision KV reuse designed around Qwen's non-rewindable recurrent state |
 | `2b720e8` (#1221) | let the memory-text tier survive images | open | vision KV reuse |
 | `15b7216` (#1322) | let a request with an image use the disk KV cache | open | vision KV reuse; overlaps #1343 |
@@ -599,6 +613,15 @@ and from `ds4_gpu_routed_moe_one_tensor`.
 | `24bbd1d` (#1319) | `--loop-guard` | open | low priority; opt-in, changes output only when engaged |
 | `abd9b8b` (#1229) | docs: Qwen API client setup and diagnosis guide | docs | compare with `docs/CLIENTS.md` |
 | `af03a2f` (#1350) | linenoise word navigation | open | low priority; CLI UX |
+| `a6ccd45` (#1112) | Upsample a subsampled JPEG luma plane instead of reading past it | open | planned in `180-jpeg-decode-fixes`; cherry-picks onto `jpeg.h:1492`/`:1547` |
+| `96ab887` (#1110) | Decode single-component JPEG scans in raster order | open | planned in `180-jpeg-decode-fixes` |
+| `73b38df` (#1113) | Reject progressive JPEG scans whose band ends past coefficient 63 | in main, modified | landed upstream as `2768d0e` (SOS spectral validation) |
+| `ba4b40e` (#986) | kvstore: age the value of unused checkpoints | open | planned in `181-kvstore-checkpoint-aging`; the child's test fixtures stamped at time 100 must move to `now` |
+| `1018c65` (#1071) | fix: decode an open tool call past a stop token | open | planned in `183-tool-call-past-stop`; predicate rewritten on the tracker state, decided per drafted token; the log's generation tail not taken |
+| `4c6a9c3` (#997) | server: fix incremental DSML tracking across malformed text and split close tags | open | structural advance planned in `183-tool-call-past-stop`; lone-`<` part already in the child; reference recognizer not taken |
+| `7d14832` (#1008, #1013) | Precompute the vision resize tap weights | open | planned in `184-vision-resize-taps`; dropped there if any canvas float differs |
+| `bab5b5a` (#1013) | Filter vision images in two separable passes | drop | changes pixels |
+| `54c8e2e` (#752) | server: resolve Responses response ids to KV prefixes | drop | protocol; host-side tokenization gain only |
 | `9932596` (#1004) | Ignore build outputs | drop | the child keeps its own ignores |
 | `383593f` (#987, 9 commits) | Introduce welcome screen with DwarfStar logo | drop | CLI cosmetics, mostly `ds4-agent` |
 
@@ -607,17 +630,18 @@ and from `ds4_gpu_routed_moe_one_tensor`.
 Not reachable from the Qwen graph, or not Metal:
 #105 #121 #196 #197 #206 #261 #279 #371 #373 #381 #383 #385 #396 #573 #583 #758
 #770 #794 #797 #813 #822 #830 #831 #835 #846 #850 #869 #919 #920 #924 #939 #952
-#953 #954 #963 #972 #981 #982 #985 #990 #1000 #1005 #1010 #1011 #1018 #1024
-#1033 #1034 #1035 #1036 #1041 #1042 #1055 #1060 #1061 #1063 #1068 #1070 #1073
-#1079 #1083 #1089 #1090 #1093 #1097 #1098 #1099 #1100 #1116 #1117 #1120 #1121
-#1122 #1123 #1124 #1127 #1129 #1130 #1135 #1138 #1142 #1143 #1144 #1147 #1148
-#1152 #1158 #1160 #1167 #1168 #1172 #1174 #1177 #1178 #1180 #1183 #1187 #1190
-#1191 #1192 #1193 #1199 #1204 #1205 #1207 #1208 #1210 #1213 #1217 #1218 #1220
-#1222 #1225 #1227 #1230 #1232 #1233 #1234 #1236 #1237 #1241 #1242 #1246 #1247
-#1248 #1250 #1252 #1253 #1254 #1256 #1257 #1261 #1262 #1263 #1264 #1265 #1267
-#1269 #1270 #1272 #1273 #1274 #1275 #1276 #1277 #1279 #1282 #1283 #1285 #1286
-#1287 #1289 #1290 #1291 #1293 #1295 #1298 #1299 #1300 #1306 #1310 #1313 #1314
-#1315 #1320 #1321 #1331 #1334 #1337 #1338 #1339 #1345 #1346 #1349.
+#953 #954 #963 #972 #981 #982 #985 #990 #993 #995 #1000 #1003 #1005 #1010 #1011
+#1016 #1018 #1024 #1030 #1031 #1033 #1034 #1035 #1036 #1041 #1042 #1043 #1050
+#1052 #1055 #1060 #1061 #1063 #1067 #1068 #1070 #1073 #1079 #1081 #1083 #1089
+#1090 #1093 #1096 #1097 #1098 #1099 #1100 #1101 #1103 #1108 #1116 #1117 #1120
+#1121 #1122 #1123 #1124 #1127 #1129 #1130 #1135 #1138 #1142 #1143 #1144 #1147
+#1148 #1152 #1158 #1160 #1167 #1168 #1172 #1174 #1177 #1178 #1180 #1183 #1187
+#1190 #1191 #1192 #1193 #1199 #1204 #1205 #1207 #1208 #1210 #1213 #1217 #1218
+#1220 #1222 #1225 #1227 #1230 #1232 #1233 #1234 #1236 #1237 #1241 #1242 #1246
+#1247 #1248 #1250 #1252 #1253 #1254 #1256 #1257 #1261 #1262 #1263 #1264 #1265
+#1267 #1269 #1270 #1272 #1273 #1274 #1275 #1276 #1277 #1279 #1282 #1283 #1285
+#1286 #1287 #1289 #1290 #1291 #1293 #1295 #1298 #1299 #1300 #1306 #1310 #1313
+#1314 #1315 #1320 #1321 #1331 #1334 #1337 #1338 #1339 #1345 #1346 #1349.
 
 Notes on the ones a name or a file could make look reachable (2026-11-13):
 
@@ -646,6 +670,19 @@ Notes on the ones a name or a file could make look reachable (2026-11-13):
   Ultra speed-bench data), #1275 (superseded by merged #1165), #1276/#1277 (V4.1
   image budgets, ffmpeg video), #1274 (DeepSeek ViT), #981 (already in the
   child's base as `ac43e90`).
+
+Added on 2026-11-16 (PRs #993-#1113 with no row above):
+
+- CUDA or ROCm only: #993, #995, #1030, #1031, #1052, #1101, #1103 (Kimi
+  Linear, CUDA).
+- DeepSeek V4.1: #1043 (Q4_K group-6 expert table: needs 6 of 384 experts
+  and the 5120x2304 routed shape; Qwen routes 10 of 512 at 2560x640) and
+  #1067 (V4.1 decode waits, Engram).
+- Removed features: #1003 (DSpark snapshot reuse; Qwen's `--mtp` never
+  reaches the DSpark frontier), #1016 (GLM tool-call JSON types), #1050,
+  #1081 and #1108 (`ds4-agent`).
+- #1096: a Linux-only tolerance in `tests/test_tp_commands.c` (socket
+  timeouts rounded to jiffies); macOS reads back the exact value.
 
 Qwen support itself landed with #991 (2026-09-06); older PRs cannot touch the
 Qwen path.
