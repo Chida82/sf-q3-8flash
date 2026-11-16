@@ -17,8 +17,15 @@ Each cycle drafts one token (depth two) or two chained tokens (depth three). The
 runtime moves to depth three after a run of accepted first drafts, and back when
 acceptance or the second draft falters. `DS4_QWEN4_MTP_DEPTH=2` or `=3` pins the
 depth for diagnosis. `--mtp-exact-sampling` preserves ordinary sampling
-semantics, and runs at depth two at nonzero temperature; greedy decoding accepts
-matching drafts directly.
+semantics at nonzero temperature and follows the same depth policy and pin:
+each draft is accepted with its target probability, position by position, and
+the first rejection emits a residual sample and ends the cycle. The cycle draws
+the next token itself, from the same sampler and RNG, so the next draft is
+conditioned on the token that will be emitted, and a residual sample opens the
+next verify instead of a one-row replay; `ds4_session_sample` returns that held
+token at the same position and sampler, and a rewind, sync, snapshot restore
+or `ds4_session_set_logits` drops it. Greedy decoding accepts matching drafts
+directly.
 
 Greedy output with `--mtp` is byte-identical to plain greedy output. The verify
 pass scores two or three rows at once, and each row must compute exactly as a
@@ -51,6 +58,16 @@ run the session and snapshot tests with built-in MTP enabled:
 DS4_TEST_MODEL=/absolute/path/model.gguf DS4_TEST_GLM_MTP=1 ./ds4_test
 python3 tests/test_qwen4_mtp_limits.py --model /absolute/path/model.gguf
 python3 tests/test_qwen4_mtp_identity.py --model /absolute/path/model.gguf
+```
+
+After changes to exact sampling, also run its session test and compare the
+sampled distribution with the previous build (a built tree at `PREV`):
+
+```sh
+DS4_TEST_MODEL=/absolute/path/model.gguf DS4_TEST_GLM_MTP=1 DS4_TEST_MTP_EXACT=1 \
+    ./ds4_test --session-exact-held --session-rewind-resample
+python3 tests/test_qwen4_exact_sampling_dist.py --model /absolute/path/model.gguf \
+    --a PREV --b . --depth 3
 ```
 
 There is no depth-verification target: the one inherited from upstream drove

@@ -162,6 +162,8 @@ approximate kernel, no route that changes a single logit.
   limits.
 - `tests/test_qwen4_mtp_identity.py` checks that greedy output with MTP equals
   plain greedy output, over 12 prompts at every draft depth.
+- `tests/test_qwen4_exact_sampling_dist.py` checks that exact-sampling MTP
+  output keeps the distribution of a previous build, position by position.
 
 ### Speed
 

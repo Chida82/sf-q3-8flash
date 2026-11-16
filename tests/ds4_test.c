@@ -347,6 +347,98 @@ cleanup:
     ds4_session_free(live);
 }
 
+/* Exact sampled MTP (#1185) draws the next token inside the cycle and holds
+ * it for ds4_session_sample.  A held token consumes no RNG when returned, so
+ * an RNG that advances shows a fresh draw.  After a rewind by one token
+ * (and a different token back to the held length), a snapshot restore and a
+ * resync to the held length, the next sample must be a fresh draw from the
+ * session's current logits, equal to ds4_sample_logits on a copy.  Needs
+ * DS4_TEST_GLM_MTP and DS4_TEST_MTP_EXACT. */
+static bool test_exact_cycle(ds4_engine *engine, ds4_session *s, uint64_t *rng, char *err, size_t errlen) {
+    int acc[3];
+    const int tok = ds4_session_sample(s, 1.0f, 0, 1.0f, 0.0f, rng);
+    if (tok < 0) return false;
+    return ds4_session_eval_speculative(s, tok, 8, ds4_token_eos(engine), 1.0f, 0, 1.0f, 0.0f, rng,
+                                        acc, 3, err, errlen) >= 1;
+}
+
+static void test_exact_fresh_draw(ds4_session *s, float *logits, int vocab) {
+    uint64_t r1 = 777, r2 = 777;
+    TEST_ASSERT(ds4_session_copy_logits(s, logits, vocab) == vocab);
+    const int got = ds4_session_sample(s, 1.0f, 0, 1.0f, 0.0f, &r1);
+    const int want = ds4_sample_logits(logits, vocab, 1.0f, 0, 1.0f, 0.0f, &r2);
+    TEST_ASSERT(r1 != 777);
+    TEST_ASSERT(got == want && r1 == r2);
+}
+
+static void test_session_exact_held_token(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+    if (!ds4_engine_is_qwen4(engine) || !ds4_engine_mtp_exact_sampling(engine)) {
+        puts("session-exact-held: Qwen3.8 model with DS4_TEST_MTP_EXACT required, skipped");
+        return;
+    }
+    ds4_session *s = NULL;
+    ds4_tokens prompt = {0};
+    ds4_session_snapshot snap = {0};
+    char err[192] = {0};
+    uint64_t rng = 4242;
+    const int vocab = ds4_engine_vocab_size(engine);
+    float *logits = xmalloc((size_t)vocab * sizeof(float));
+
+    ds4_chat_begin(engine, &prompt);
+    ds4_chat_append_message(engine, &prompt, "user", "Write a short poem about the sea.");
+    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    TEST_ASSERT(ds4_session_create(&s, engine, 1024) == 0);
+    if (!s) goto cleanup;
+    TEST_ASSERT(ds4_session_sync(s, &prompt, err, sizeof(err)) == 0);
+
+    /* a held token is returned without touching the RNG */
+    for (int i = 0; i < 4; i++) TEST_ASSERT(test_exact_cycle(engine, s, &rng, err, sizeof(err)));
+    {
+        uint64_t r = 99;
+        TEST_ASSERT(ds4_session_sample(s, 1.0f, 0, 1.0f, 0.0f, &r) >= 0);
+        TEST_ASSERT(r == 99);
+    }
+
+    /* rewind by one token, then a different token back to the held length */
+    TEST_ASSERT(test_exact_cycle(engine, s, &rng, err, sizeof(err)));
+    {
+        const int len = ds4_session_pos(s);
+        const int last = ds4_session_tokens(s)->v[len - 1];
+        ds4_session_rewind(s, len - 1);
+        TEST_ASSERT(ds4_session_eval(s, ds4_session_argmax_excluding(s, last), err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_session_pos(s) == len);
+        test_exact_fresh_draw(s, logits, vocab);
+    }
+
+    /* snapshot restore */
+    TEST_ASSERT(ds4_session_save_snapshot(s, &snap, err, sizeof(err)) == 0);
+    TEST_ASSERT(test_exact_cycle(engine, s, &rng, err, sizeof(err)));
+    TEST_ASSERT(ds4_session_load_snapshot(s, &snap, err, sizeof(err)) == 0);
+    test_exact_fresh_draw(s, logits, vocab);
+
+    /* resync to the same length with a different last token */
+    TEST_ASSERT(test_exact_cycle(engine, s, &rng, err, sizeof(err)));
+    {
+        ds4_tokens alt = {0};
+        const ds4_tokens *hist = ds4_session_tokens(s);
+        for (int i = 0; i < hist->len; i++) ds4_tokens_push(&alt, hist->v[i]);
+        alt.v[alt.len - 1] = alt.v[alt.len - 2];
+        if (alt.v[alt.len - 1] == hist->v[hist->len - 1]) alt.v[alt.len - 1] = prompt.v[0];
+        TEST_ASSERT(ds4_session_sync(s, &alt, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_session_pos(s) == alt.len);
+        test_exact_fresh_draw(s, logits, vocab);
+        ds4_tokens_free(&alt);
+    }
+
+cleanup:
+    ds4_session_snapshot_free(&snap);
+    ds4_tokens_free(&prompt);
+    ds4_session_free(s);
+    free(logits);
+}
+
 /* A continued checkpoint must be loadable and immediately sampleable at a
  * completed prefill chunk, including after a resumed prefill or cancellation. */
 typedef struct {
@@ -7404,6 +7496,7 @@ static const ds4_test_entry test_entries[] = {
     {"--session-rewind", "session-rewind", "Qwen3.8 rewind by snapshot restore and by replay", test_session_rewind_replay},
     {"--prompt-prefix-qwen", "prompt-prefix-qwen", "Qwen3.8 prefix import closes each turn once", test_prompt_prefix_qwen_turn_close},
     {"--session-rewind-resample", "session-rewind-resample", "exact-sampling tool-boundary resample rewind restores the block-start state", test_session_rewind_resample_boundary},
+    {"--session-exact-held", "session-exact-held", "exact-sampling MTP held next token is dropped by rewind, snapshot restore and resync", test_session_exact_held_token},
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model tool call and post-result stop regression", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "recover a complete tool call emitted inside unclosed reasoning", test_think_tool_recovery},
