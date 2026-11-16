@@ -651,7 +651,10 @@ static void jpeg_ycbcr_to_rgb(uint8_t y, uint8_t cb, uint8_t cr, uint8_t *rgb) {
 
 /* DS4: interpolate common subsampled chroma at pixel centers, matching the
  * triangle filter used by libjpeg/Pillow. Clamp to the real component extent,
- * not its padded MCU storage. Unusual sampling ratios retain replication. */
+ * not its padded MCU storage. Unusual sampling ratios retain replication.
+ * Luma goes through here too when a frame gives Y lower sampling factors than
+ * Cb or Cr: then its plane is smaller than the image. Full-resolution luma,
+ * the usual layout, keeps the direct read in the callers. */
 static uint8_t jpeg_sample_chroma(const jpeg_decoder *dec, int component,
                                   const uint8_t *plane, int stride, int x, int y) {
     const int hs = dec->comp[component].h_samp;
@@ -1028,8 +1031,9 @@ static int jpeg_decode_progressive_scan(jpeg_decoder *dec, int *scan_comps, int 
     }
     dec->eobrun = 0;
 
-    /* DC scans process all components interleaved, AC scans process one component */
-    if (dec->ss == 0) {
+    /* Interleaved scans (more than one component) can only be DC scans. A
+     * scan with one component is non-interleaved, DC or AC alike. */
+    if (dec->ss == 0 && num_scan_comps > 1) {
         /* DC scan - interleaved MCUs */
         for (int mcu_y = 0; mcu_y < dec->mcus_y; mcu_y++) {
             for (int mcu_x = 0; mcu_x < dec->mcus_x; mcu_x++) {
@@ -1073,7 +1077,8 @@ static int jpeg_decode_progressive_scan(jpeg_decoder *dec, int *scan_comps, int 
             }
         }
     } else {
-        /* AC scan - non-interleaved, single component.
+        /* Non-interleaved scan, single component: every AC scan, and a DC scan
+         * that carries one component (e.g. one DC scan per component).
          * Per JPEG spec section A.2.3, non-interleaved scans process data units
          * in raster order. For components with sampling factors > 1, the number
          * of data units is based on the COMPONENT dimensions (scaled from image
@@ -1115,7 +1120,13 @@ static int jpeg_decode_progressive_scan(jpeg_decoder *dec, int *scan_comps, int 
                 /* Map image-based block position to MCU-aligned storage index */
                 int16_t *coef = dec->comp[comp_idx].coefs + (by * store_blocks_x + bx) * 64;
 
-                if (dec->ah == 0) {
+                if (dec->ss == 0) {
+                    if (dec->ah == 0) {
+                        if (jpeg_prog_decode_dc_first(dec, comp_idx, coef) < 0) return -1;
+                    } else {
+                        if (jpeg_prog_decode_dc_refine(dec, coef) < 0) return -1;
+                    }
+                } else if (dec->ah == 0) {
                     if (jpeg_prog_decode_ac_first(dec, comp_idx, coef) < 0) return -1;
                 } else {
                     if (jpeg_prog_decode_ac_refine(dec, comp_idx, coef) < 0) return -1;
@@ -1245,6 +1256,13 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 if (dec.comp[i].h_samp == 0 || dec.comp[i].h_samp > 4) goto fail;
                 if (dec.comp[i].v_samp == 0 || dec.comp[i].v_samp > 4) goto fail;
                 if (dec.comp[i].qt_idx > 3) goto fail;
+
+                /* DS4: a single-component frame has only non-interleaved
+                 * scans, whose data units are single blocks in raster order
+                 * (T.81 A.2.2), so sampling factors other than 1x1 must not
+                 * group its blocks into MCUs. */
+                if (dec.num_components == 1)
+                    dec.comp[i].h_samp = dec.comp[i].v_samp = 1;
 
                 if (dec.comp[i].h_samp > dec.max_h_samp) dec.max_h_samp = dec.comp[i].h_samp;
                 if (dec.comp[i].v_samp > dec.max_v_samp) dec.max_v_samp = dec.comp[i].v_samp;
@@ -1487,9 +1505,12 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                         }
                     }
                 } else {
+                    const int y_full = dec.comp[0].h_samp == dec.max_h_samp &&
+                                       dec.comp[0].v_samp == dec.max_v_samp;
                     for (int y = 0; y < dec.height; y++) {
                         for (int x = 0; x < dec.width; x++) {
-                            uint8_t yy = y_data[y * y_stride + x];
+                            uint8_t yy = y_full ? y_data[y * y_stride + x]
+                                                : jpeg_sample_chroma(&dec, 0, y_data, y_stride, x, y);
                             uint8_t cb = jpeg_sample_chroma(&dec, 1, cb_data, cb_stride, x, y);
                             uint8_t cr = jpeg_sample_chroma(&dec, 2, cr_data, cr_stride, x, y);
 
@@ -1542,9 +1563,12 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 }
             }
         } else {
+            const int y_full = dec.comp[0].h_samp == dec.max_h_samp &&
+                               dec.comp[0].v_samp == dec.max_v_samp;
             for (int y = 0; y < dec.height; y++) {
                 for (int x = 0; x < dec.width; x++) {
-                    uint8_t yy = planes[0][y * strides[0] + x];
+                    uint8_t yy = y_full ? planes[0][y * strides[0] + x]
+                                        : jpeg_sample_chroma(&dec, 0, planes[0], strides[0], x, y);
                     uint8_t cb = jpeg_sample_chroma(&dec, 1, planes[1], strides[1], x, y);
                     uint8_t cr = jpeg_sample_chroma(&dec, 2, planes[2], strides[2], x, y);
 

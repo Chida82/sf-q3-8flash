@@ -26,6 +26,8 @@ static int check_jpeg(const char *path, uint32_t width, uint32_t height,
         fprintf(stderr, "%s: got %ux%u fp=%s, expected %ux%u fp=%s\n",
                 path, image.width, image.height, got,
                 width, height, expected_fp);
+    } else {
+        printf("test_image_decode: %s decodes bit-exact: OK\n", path);
     }
     ds4_image_free(&image);
     return ok;
@@ -39,6 +41,7 @@ static int check_jpeg_rejected(const char *path) {
         ds4_image_free(&image);
         return 0;
     }
+    printf("test_image_decode: %s rejected: OK\n", path);
     return 1;
 }
 
@@ -70,6 +73,7 @@ static int check_jpeg_sos_rejected(uint8_t ss, uint8_t se) {
         ds4_image_free(&image);
         return 0;
     }
+    printf("test_image_decode: SOS Ss=%u Se=%u rejected: OK\n", ss, se);
     return 1;
 }
 
@@ -93,5 +97,33 @@ int main(void) {
         return 1;
     /* DC scans must have Se == 0. */
     if (!check_jpeg_sos_rejected(0, 5)) return 1;
+    /* 40x24 JPEGs sampled 1x1,2x2,1x1: luma below Cb, so the Y plane is
+     * 24x16 while the image is 40x24. Unpatched conversion reads Y past the
+     * end of its plane; patched decode upsamples it and matches libjpeg-turbo
+     * djpeg bit-exactly, baseline and progressive alike. */
+    if (!check_jpeg("tests/vision-fixtures/jpeg/base_luma_subsampled.jpg",
+                    40u, 24u,
+                    "bca52b9d8e46d760e9d66c852030e5635a6c5c6b8ce63562638c44fde9a1da37"))
+        return 1;
+    if (!check_jpeg("tests/vision-fixtures/jpeg/prog_luma_subsampled.jpg",
+                    40u, 24u,
+                    "bca52b9d8e46d760e9d66c852030e5635a6c5c6b8ce63562638c44fde9a1da37"))
+        return 1;
+    /* 48x32 4:2:0 progressive JPEG with one DC scan per component, first
+     * and refinement. A one-component DC scan is non-interleaved: the 2x2
+     * luma blocks come in raster order, not grouped by MCU. Matches
+     * libjpeg-turbo djpeg bit-exactly. */
+    if (!check_jpeg("tests/vision-fixtures/jpeg/prog_dc_per_component_420.jpg",
+                    48u, 32u,
+                    "555e6729c69706675c9458c642627e0562533eb028b89dafdc233c97db8ea020"))
+        return 1;
+    /* 40x24 baseline grayscale JPEG whose only component declares 2x2
+     * sampling. Its scan is non-interleaved, so the blocks are in raster
+     * order. Unpatched jpeg_load returns NULL; patched decode matches
+     * libjpeg-turbo djpeg bit-exactly. */
+    if (!check_jpeg("tests/vision-fixtures/jpeg/base_gray_2x2.jpg",
+                    40u, 24u,
+                    "978d9ef28446264cf02e0b023ee4b921447d8b7d61e7cfc11a3f1fdf27a1eb0c"))
+        return 1;
     return 0;
 }

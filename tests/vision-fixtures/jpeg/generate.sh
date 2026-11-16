@@ -1,5 +1,5 @@
 #!/bin/sh
-# Recreate the AC-refinement ZRL JPEG fixtures with libjpeg-turbo cjpeg.
+# Recreate the progressive and sampling-factor JPEG fixtures with libjpeg-turbo cjpeg.
 set -e
 cd "$(dirname "$0")"
 if ! command -v cjpeg >/dev/null 2>&1; then
@@ -32,6 +32,9 @@ def write_ppm(path, w, h):
 
 write_pgm("/tmp/ds4_zrl_gray.pgm", 24, 16)
 write_ppm("/tmp/ds4_zrl_420.ppm", 64, 48)
+write_ppm("/tmp/ds4_luma_sub.ppm", 40, 24)
+write_ppm("/tmp/ds4_dc_420.ppm", 48, 32)
+write_pgm("/tmp/ds4_gray22.pgm", 40, 24)
 PY
 
 cat > /tmp/ds4_zrl_gray.scans << 'EOF'
@@ -58,4 +61,31 @@ cjpeg -grayscale -quality 75 -restart 1 -scans /tmp/ds4_zrl_gray.scans \
     -outfile prog_ac_refine_zrl_gray.jpg < /tmp/ds4_zrl_gray.pgm
 cjpeg -quality 75 -restart 1 -scans /tmp/ds4_zrl_color.scans \
     -outfile prog_ac_refine_zrl_420.jpg < /tmp/ds4_zrl_420.ppm
-echo "wrote prog_ac_refine_zrl_gray.jpg and prog_ac_refine_zrl_420.jpg"
+
+# Luma sampled below Cb: the Y plane is smaller than the image.
+cjpeg -quality 75 -sample 1x1,2x2,1x1 \
+    -outfile base_luma_subsampled.jpg < /tmp/ds4_luma_sub.ppm
+cjpeg -quality 75 -sample 1x1,2x2,1x1 -progressive \
+    -outfile prog_luma_subsampled.jpg < /tmp/ds4_luma_sub.ppm
+
+# One DC scan per component: non-interleaved DC scans, first and refinement.
+cat > /tmp/ds4_dc_split.scans << 'EOF'
+0: 0-0, 0, 1 ;
+1: 0-0, 0, 1 ;
+2: 0-0, 0, 1 ;
+0: 1-63, 0, 0 ;
+1: 1-63, 0, 0 ;
+2: 1-63, 0, 0 ;
+0: 0-0, 1, 0 ;
+1: 0-0, 1, 0 ;
+2: 0-0, 1, 0 ;
+EOF
+
+cjpeg -quality 75 -sample 2x2,1x1,1x1 -scans /tmp/ds4_dc_split.scans \
+    -outfile prog_dc_per_component_420.jpg < /tmp/ds4_dc_420.ppm
+# Single-component frame with 2x2 sampling factors: blocks stay in raster order.
+cjpeg -grayscale -quality 75 -sample 2x2 \
+    -outfile base_gray_2x2.jpg < /tmp/ds4_gray22.pgm
+echo "wrote prog_ac_refine_zrl_gray.jpg, prog_ac_refine_zrl_420.jpg,"
+echo "      base_luma_subsampled.jpg, prog_luma_subsampled.jpg,"
+echo "      prog_dc_per_component_420.jpg and base_gray_2x2.jpg"

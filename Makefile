@@ -116,7 +116,7 @@ ds4_prompt_prefix.o: ds4_prompt_prefix.h
 ds4_tp.o: ds4_tp.h ds4_gpu.h ds4.h
 ds4_distributed.o: ds4_distributed.h ds4.h
 ds4_ssd.o: ds4_ssd.h
-ds4_image.o: ds4_image.h
+ds4_image.o: ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
 ds4_layer_pack.o: ds4_layer_pack.h
 ds4_test.o: tests/ds4_test.c ds4_server.c ds4.c ds4.h ds4_help.h ds4_kvstore.h ds4_prompt_prefix.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ $<
