@@ -138,8 +138,16 @@ prompt.
 - **Unfinished turns.** A thinking turn that the model ends with its stop
   token before `</think>` returns its text as `content` (and as reasoning);
   a stream sends it as a final content delta after the reasoning. A length
-  cut or a client stop sequence inside the reasoning stays reasoning-only. A tool call cut off by the end token goes through the
-  invalid-tool-call recovery instead of `finish_reason: "error"`.
+  cut or a client stop sequence inside the reasoning stays reasoning-only.
+  A stop token the model selects inside an open `<tool_call>` (not between
+  calls, not in reasoning) does not end the turn: decoding continues with the
+  most likely non-stop token, so the call can close and reach the client
+  whole. The log then has one "stop token(s) inside an open tool call
+  suppressed" warning with the count. After 24 suppressions in one decode
+  pass the stop is accepted, and a tool call cut off by the end token goes
+  through the invalid-tool-call recovery instead of `finish_reason: "error"`.
+  Stray text inside a call's structure no longer hides its `</tool_call>`
+  from the tool-syntax tracker.
 - **Text encoding.** JSON output is valid UTF-8: an ill-formed byte sequence,
   such as a character split by `max_tokens`, becomes one U+FFFD. The text kept
   by the server and the KV are unchanged.

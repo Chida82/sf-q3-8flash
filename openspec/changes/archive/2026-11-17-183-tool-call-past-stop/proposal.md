@@ -39,8 +39,8 @@ it (design D2).
 
 - In `generate_job_inner`, a stop token selected while the tool-syntax
   tracker is inside a call (not between calls, not in reasoning) is replaced
-  by `ds4_session_argmax_ignoring_eos()`, at most 24 times per turn. The
-  first override logs a warning and a trace event.
+  by `ds4_session_argmax_ignoring_eos()`, at most 24 times per turn. A turn
+  with overrides logs one warning and a trace event with their count.
 - A drafted stop token inside an open call ends the block with
   `resample = true`. The decision is made per token from the tracker's state
   at that token, not once per block (design D1).

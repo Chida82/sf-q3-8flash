@@ -6806,13 +6806,25 @@ static dsml_decode_state dsml_decode_state_for_text(const char *raw, size_t raw_
             return json_state;
         }
 
-        return DSML_DECODE_STRUCTURAL;
+        pos++;
     }
 }
 #endif
 
 static bool dsml_decode_state_is_tool(dsml_decode_state state) {
     return state != DSML_DECODE_OUTSIDE;
+}
+
+/* A stop token inside an open tool call (not between calls, not in reasoning)
+ * is invalid output: the call means nothing until </tool_call>.  Decoding
+ * overrides it, bounded so a model that insists still ends the turn and the
+ * unterminated-call recovery runs. */
+#define DS4_TOOL_CALL_STOP_SUPPRESS_LIMIT 24
+
+static bool tool_call_stop_override(dsml_decode_state state, bool thinking,
+                                    int suppressed) {
+    return dsml_decode_state_is_tool(state) && !thinking &&
+           suppressed < DS4_TOOL_CALL_STOP_SUPPRESS_LIMIT;
 }
 
 static bool dsml_decode_state_uses_payload_sampling(dsml_decode_state state) {
@@ -6989,8 +7001,10 @@ structural:
                 return;
             }
 
+            /* dt->pos persists across calls, so the loop must always advance:
+             * parking here would hide every later byte, </tool_call> included. */
             dt->decode = DSML_DECODE_STRUCTURAL;
-            return;
+            dt->pos++;
         }
     }
 }
@@ -12690,6 +12704,7 @@ decode_again:
     bool saw_tool_end = false;
     bool saw_orphan_tool_end = false;
     bool client_stop = false;
+    int tool_stop_suppressed = 0;
     j->req.stop_sequence = NULL;
     size_t tool_scan_from = 0;
     int next_tool_progress = 128;
@@ -12752,10 +12767,17 @@ decode_again:
         if (ds4_token_is_stop_for_think_mode(s->engine,
                                              token,
                                              j->req.think_mode)) {
-            finish = "stop";
-            stop_detail = "stop token";
-            stop_token = token;
-            break;
+            const int forced = tool_call_stop_override(dsml_state, thinking.inside,
+                                                       tool_stop_suppressed) ?
+                ds4_session_argmax_ignoring_eos(slot->session, j->req.think_mode) : -1;
+            if (forced < 0) {
+                finish = "stop";
+                stop_detail = "stop token";
+                stop_token = token;
+                break;
+            }
+            tool_stop_suppressed++;
+            token = forced;
         }
 
         int toks[17];
@@ -12817,6 +12839,15 @@ decode_again:
             if (ds4_token_is_stop_for_think_mode(s->engine,
                                                  token,
                                                  j->req.think_mode)) {
+                /* a drafted stop inside an open call: drop it and what
+                 * follows; the rewind replays the last kept token, so the
+                 * next sample sees this position's logits */
+                if (ti > 0 && tool_call_stop_override(dsml_tracker.decode, thinking.inside,
+                                                      tool_stop_suppressed)) {
+                    tool_stop_suppressed++;
+                    resample = true;
+                    break;
+                }
                 finish = "stop";
                 stop_detail = "stop token";
                 stop_token = token;
@@ -13048,6 +13079,14 @@ decode_again:
         if (stop_decode) break;
     }
     server_generation_leave(s);
+    if (tool_stop_suppressed) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: chat ctx=%s%s%s %d stop token(s) inside an open tool call suppressed",
+                   ctx_span, req_flags[0] ? " " : "", req_flags,
+                   tool_stop_suppressed);
+        trace_event(s, trace_id, "suppressed %d stop token(s) inside an open tool call",
+                    tool_stop_suppressed);
+    }
 
     /* Each Qwen call has its own wrapper, so decoding ran on past the last
      * closed call.  Keep the closed calls and drop what followed (a cut-off
@@ -13108,9 +13147,10 @@ decode_again:
         saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0)
     {
         server_log(DS4_LOG_WARNING,
-                   "ds4-server: incomplete %s tool call: stop=%s token=%d generated=%d limit=%d room=%d",
+                   "ds4-server: incomplete %s tool call: stop=%s token=%d generated=%d limit=%d room=%d suppressed=%d",
                    "Qwen",
-                   stop_detail, stop_token, completion, max_tokens, room);
+                   stop_detail, stop_token, completion, max_tokens, room,
+                   tool_stop_suppressed);
         trace_event(s, trace_id, "incomplete tool call: stop=%s token=%d generated=%d limit=%d room=%d",
                     stop_detail, stop_token, completion, max_tokens, room);
     }
@@ -18637,6 +18677,83 @@ static void test_qwen_decode_tracker_markers(void) {
     TEST_ASSERT(tracker.mode == DSML_TRACK_DONE && tracker.calls_end == len2);
 }
 
+/* Production feeds the whole accumulated text on every token and relies on the
+ * persisted dt->pos, so feed growing prefixes: a one-shot feed cannot show a
+ * parked cursor.  Up to the first close the reference must agree. */
+static void test_tracker_feed_prefixes(dsml_decode_tracker *dt, const char *text,
+                                       size_t step) {
+    const size_t n = strlen(text);
+    bool closed = false;
+    for (size_t end = 0; end < n; ) {
+        end = end + step < n ? end + step : n;
+        dsml_decode_tracker_update(dt, text, end);
+        if (dt->mode == DSML_TRACK_BETWEEN || dt->mode == DSML_TRACK_DONE) closed = true;
+        if (!closed) TEST_ASSERT(dt->decode == dsml_decode_state_for_text(text, end));
+    }
+}
+
+static void test_decode_tracker_advances_past_stray_bytes(void) {
+    const char *fixtures[] = {
+        /* Hermes-style JSON right after the wrapper */
+        "<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}\n</tool_call>",
+        /* prose between parameters */
+        "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n"
+        "that should do it\n<parameter=cwd>\n/tmp\n</parameter>\n</function>\n</tool_call>",
+        /* stray code fence before the close */
+        "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n"
+        "</function>\n```\n</tool_call>",
+    };
+    for (size_t i = 0; i < sizeof(fixtures) / sizeof(fixtures[0]); i++) {
+        for (size_t step = 1; step <= 7; step += 6) {
+            dsml_decode_tracker tracker;
+            dsml_decode_tracker_init(&tracker);
+            test_tracker_feed_prefixes(&tracker, fixtures[i], step);
+            TEST_ASSERT(tracker.mode == DSML_TRACK_BETWEEN);
+            TEST_ASSERT(tracker.decode == DSML_DECODE_OUTSIDE);
+            TEST_ASSERT(tracker.calls_end == strlen(fixtures[i]));
+        }
+    }
+
+    /* a long run of stray text: recovery must not depend on its length */
+    buf big = {0};
+    buf_puts(&big, "<tool_call>\noops ");
+    for (int i = 0; i < 2000; i++) buf_puts(&big, "loop ");
+    buf_puts(&big, "</tool_call>");
+    dsml_decode_tracker tracker;
+    dsml_decode_tracker_init(&tracker);
+    test_tracker_feed_prefixes(&tracker, big.ptr, 7);
+    TEST_ASSERT(tracker.mode == DSML_TRACK_BETWEEN && tracker.calls_end == big.len);
+    buf_free(&big);
+}
+
+static void test_tool_call_stop_override_follows_tracker(void) {
+    /* inside call 1, between the calls, inside call 2, after the calls */
+    const char *raw = "<tool_call>\n<function=bash>\n<parameter=command>\nls\n"
+                      "</parameter>\n</function>\n</tool_call>\n"
+                      "<tool_call>\n<function=read>\n</function>\n</tool_call>\nok";
+    const char *marks[] = {"<tool_call>", "<function=bash>", "\nls", "</parameter>",
+                           "</tool_call>\n", "<tool_call>\n<function=read>", "ok"};
+    const bool open[] = {true, true, true, true, false, true, false};
+    const char *from = raw;
+    dsml_decode_tracker tracker;
+    dsml_decode_tracker_init(&tracker);
+    for (size_t i = 0; i < sizeof(marks) / sizeof(marks[0]); i++) {
+        const char *at = strstr(from, marks[i]);
+        TEST_ASSERT(at != NULL);
+        if (!at) return;
+        from = at + strlen(marks[i]);
+        dsml_decode_tracker_update(&tracker, raw, (size_t)(from - raw));
+        TEST_ASSERT(tool_call_stop_override(tracker.decode, false, 0) == open[i]);
+        /* reasoning and the bound always let the stop end the turn */
+        TEST_ASSERT(!tool_call_stop_override(tracker.decode, true, 0));
+        TEST_ASSERT(tool_call_stop_override(tracker.decode, false,
+                    DS4_TOOL_CALL_STOP_SUPPRESS_LIMIT - 1) == open[i]);
+        TEST_ASSERT(!tool_call_stop_override(tracker.decode, false,
+                    DS4_TOOL_CALL_STOP_SUPPRESS_LIMIT));
+    }
+    TEST_ASSERT(!tool_call_stop_override(DSML_DECODE_OUTSIDE, false, 0));
+}
+
 static void test_stop_list_parses_all_sequences(void) {
     stop_list stops = {0};
     const char *json = "[\"END\",\"STOP\"]";
@@ -21088,6 +21205,9 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_tool_visible_checkpoint_boundary();
     test_qwen_tool_turn_disk_key();
     test_qwen_decode_tracker_markers();
+    test_decode_tracker_split_parameter_close();
+    test_decode_tracker_advances_past_stray_bytes();
+    test_tool_call_stop_override_follows_tracker();
     test_parse_qwen_tool_call_message();
     test_qwen_literal_tool_end_in_argument();
     test_qwen_string_arguments_follow_schema();

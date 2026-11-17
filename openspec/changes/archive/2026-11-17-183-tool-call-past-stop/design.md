@@ -39,8 +39,24 @@ it, up to 24 times, and decode past the turn's end. The child uses
   token keeps the stop, while upstream's once-per-block predicate would
   resample it.
 
-The decision is one helper, `tool_call_stop_override(in_call, thinking,
-suppressed)`, so a unit test can pin it.
+The decision is one helper, `tool_call_stop_override(state, thinking,
+suppressed)`, so a unit test can pin it. It takes the tracker's decode state
+rather than a precomputed flag, so its test feeds the tracker itself
+(implementation correction).
+
+- **Counting (implementation correction):** a suppressed drafted stop counts
+  toward the bound, as a sampled one does, so 24 bounds every suppression of
+  the decode pass. Upstream counts only the sampled site. A tool-error
+  continuation (`decode_again`) is a new pass with its own count.
+- **Log (implementation correction):** one warning per decode pass, after
+  the loop, with the count, instead of upstream's warning at the first
+  suppression. It is still one line per turn and it also reports how many
+  stops were suppressed. It carries no finish reason: the loop's reason at
+  that point (`stop`) is not the turn's (`tool_calls`), which the request's
+  own log line reports next.
+- **MTP:** a forced token differs from the parent the cycle drafted from. The
+  Qwen spec cycle (`first_token != glm_mtp_parent`) and the batched path
+  (`glm_mtp_parent == items[i].token`) already drop that draft.
 
 ### D2. Take #997's structural advance with it
 
@@ -51,8 +67,13 @@ and the turn would keep greedy sampling to the end. #997's fix ends the
 structural loop with `dt->pos++` instead of `return`.
 - Its byte-by-byte prefix tests, rewritten for Qwen's syntax, go into the
   `--server` group.
-- Its differential reference recognizer is not taken: it is test-only code for
-  a syntax the child no longer has.
+- Correction: the child has a Qwen reference recognizer,
+  `dsml_decode_state_for_text`, with the same parked `return`. #997 fixes
+  both, so the child does too, and the prefix tests compare the tracker with
+  it up to the first close. The child's test that compares the two,
+  `test_decode_tracker_split_parameter_close`, was never registered; it now
+  runs. #997's random-split differential test is not taken: the byte-by-byte
+  feeds cover the same agreement.
 - Its lone-`<` fix is already in the child (`ds4_server.c:6886`, "Keep even a
   lone '<'"), so it is not ported.
 
@@ -93,9 +114,9 @@ token in `BETWEEN`, or the accepted stop after the bound.
 
 ### D6. Proof
 
-- **Model-less:** `./ds4_test --server`. It names the helper test and the
-  stray-byte tracker tests. Each fix is reverted alone once, to see its test
-  fail.
+- **Model-less:** `./ds4_test --server`. Its output does not name unit
+  tests (it prints `server: OK`), so the proof is the revert: each fix is
+  reverted alone once and its test must fail.
 - **Live, Q4, scratch-only fault injection:** a throwaway patch, never
   committed, replaces the first sampled token after `<function=` with
   `<|im_end|>` once per turn. With it:
