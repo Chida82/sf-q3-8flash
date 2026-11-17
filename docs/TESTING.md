@@ -18,6 +18,22 @@ make test-q8-prefill-variants
 make test-qwen4-ngrams
 ```
 
+Tokenizer changes are checked against the reference copy of the previous
+implementation that `tests/test_tokenizer.c` carries. `make test` runs it on a
+synthetic vocabulary; with a vocabulary and a corpus it compares every piece
+of every file, and all token texts:
+
+```sh
+tests/test_tokenizer VOCAB [FILE...]           # "tokenizer tests: ok (N BPE pieces compared)"
+tests/test_tokenizer --bench VOCAB FILE...     # throughput, new against reference
+tests/test_tokenizer --export-vocab MODEL.gguf VOCAB.txt
+```
+
+`VOCAB` is a text export or a GGUF. Reading a GGUF, even for its vocabulary
+alone, is a model run: the test takes the instance lock first, so it refuses
+to start beside a model process. Export the vocabulary once and use the text
+file for everything else.
+
 Renderer changes can be checked without a model by rendering the same request
 before and after the change and diffing the output:
 

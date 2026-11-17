@@ -103,7 +103,7 @@ DS4_CORE_HDRS := ds4.h ds4_tool_text.h ds4_distributed.h ds4_image.h ds4_tp.h \
                  ds4_layer_pack.h ds4_gpu_mgpu.h ds4_gpu.h ds4_gpu_tp.h ds4_qwen4_vision.h \
                  ds4_qwen4_unicode.inc
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: $(DS4_CORE_HDRS)
-tests/test_session_state.o tests/test_qwen4_ngrams.o tests/test_qwen4_ngram_state.o: $(DS4_CORE_HDRS)
+tests/test_session_state.o tests/test_tokenizer.o tests/test_qwen4_ngrams.o tests/test_qwen4_ngram_state.o: $(DS4_CORE_HDRS)
 ds4_metal.o: $(DS4_CORE_HDRS)
 ds4_cli.o ds4_cli_cpu.o: ds4.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_prompt_prefix.h linenoise.h
 ds4_server.o ds4_server_cpu.o: ds4.h ds4_tool_text.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds4_tp.h rax.h
@@ -148,6 +148,12 @@ tests/test_session_state.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4
 tests/test_session_state: tests/test_session_state.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+tests/test_tokenizer.o: tests/test_tokenizer.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
+	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
+
+tests/test_tokenizer: tests/test_tokenizer.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 tests/test_tp_commands: tests/test_tp_commands.c $(filter-out ds4_tp.o,$(CPU_CORE_OBJS))
 	$(CC) $(CFLAGS) -I. -o $@ $^ $(LDLIBS)
 
@@ -160,8 +166,9 @@ tests/test_tp_tcp: tests/test_tp_tcp.c $(filter-out ds4_tp.o,$(CPU_CORE_OBJS))
 tests/test_tp_link: tests/test_tp_link.c ds4_tp.h ds4.h $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -I. -o $@ $< $(CPU_CORE_OBJS) $(LDLIBS)
 
-test-session-state: tests/test_session_state tests/test_tp_commands tests/test_tp_rdma tests/test_tp_tcp
+test-session-state: tests/test_session_state tests/test_tokenizer tests/test_tp_commands tests/test_tp_rdma tests/test_tp_tcp
 	./tests/test_session_state
+	./tests/test_tokenizer
 	./tests/test_tp_commands
 	./tests/test_tp_rdma
 	./tests/test_tp_tcp
@@ -373,7 +380,7 @@ session-concurrency-bench: speed-bench/session_concurrency_bench
 clean:
 	rm -f $(BIN) $(BIN)-server $(BIN)-bench $(BIN)-eval ds4_test *.o tests/*.o speed-bench/*.o
 	rm -f $(BIN)-cpu $(BIN)-cpu-server $(BIN)-cpu-bench $(BIN)-cpu-eval
-	rm -f tests/test_q4k_dot tests/test_mxfp4_dot tests/test_session_state tests/test_tp_commands tests/test_tp_rdma tests/test_tp_tcp
+	rm -f tests/test_q4k_dot tests/test_mxfp4_dot tests/test_session_state tests/test_tokenizer tests/test_tp_commands tests/test_tp_rdma tests/test_tp_tcp
 	rm -f tests/test_layer_pack tests/test_prompt_prefix tests/test_sampling tests/test_qwen4_ngrams tests/test_qwen4_ngram_state
 	rm -f tests/test_image_decode
 	rm -f tests/test_qwen4_kernels tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_qwen4_vision
