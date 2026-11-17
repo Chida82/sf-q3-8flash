@@ -95,7 +95,7 @@ activation quantization, and any route that changes greedy output, is `drop`.
 | #1149 | Metal: run Qwen3.8 QSA prefill attention on the tensor units | open | `c97a1a9` | 2 | 2026-09-29 | 2026-11-13 | drop: changes logits (max \|dlogit\| up to 1.68 at 64K; top-1 identical) for +3..+7% prefill |
 | #1150 | Metal: defer hyper-connection residual writes into the next stream norm | open | `04dbebe` | 2 | 2026-10-02 | 2026-11-13 | open, adopted in `140-deferred-hc-residual` (`ce6d991`; `04dbebe` dropped, CUDA): bitwise logits on every harness kind; GPU time of the HC/MoE groups -12.6% at prefill +2048, -5.9% at +512 (M5 Max Q4); MTP prefill 2048 +2.8..+3.0% |
 | #1185 | Qwen3.8 exact MTP: draft from the sampled token, defer the residual, allow depth 3 | open | `777f4e3` | 1 | 2026-10-17 | 2026-11-13 | adopt -> `150-exact-sampling-mtp`: exact-sampling MTP decode +4.9% code, +2.7% prose at the default depth (CIs above zero); greedy bitwise unchanged |
-| #1328 | Overlap streamed Qwen decode layers with their expert loads on Metal | open | `2d48e3b` | 6 | 2026-11-13 | 2026-11-13 | open, planned in `170-ssd-decode-handshake` (after 90; built on `b3f5018`): bit-identical claimed, steady streamed decode +8-12% (M4 Pro 48 GB, Q2) |
+| #1328 | Overlap streamed Qwen decode layers with their expert loads on Metal | open | `2d48e3b` | 6 | 2026-11-13 | 2026-11-13 | drop (`170-ssd-decode-handshake`, 2026-11-18): ported and correct (unit tests with the handshake cases, streamed tokens equal to resident on Q2 and Q4, resident bitwise, same peak footprint), but by the change's rule the target metric loses. Q2 streamed at emulated 48 GB, `main` against the port, 8 pairs per kind: plain decode -2.7% (95% CI -2.9..-2.1%) at the harness's 10.8K context, where the plan holds 3.35 GiB of experts; mtp-code +4.0% (+3.5..+4.3%), mtp-prose +3.5% (-2.8..+5.0%); plain at a 2K context (9.5 GiB of experts) +3.9% (+3.3..+5.3%); prefill unchanged. The likely reason (by reading, not profiled): the handshake cannot run cached experts while the missing ones load, which the ordinary path does, so it loses when most layers miss. Upstream's head against its base in the same configuration: -2.2% (-2.7..-1.8%); head against the port: the port +2.1%. The author's +8-12% (M4 Pro 48 GB, 13.3 GiB cache) is the large-cache case. Reopen with a handshake taken only when the layer's experts are cached. Note: upstream's Qwen admission ignores `--simulate-used-memory` |
 | #1184 | Enable measured M4 Metal choices | open | `62ba62c` | 3 | 2026-11-02 | 2026-11-13 | drop: adds M4 to device gates only; no effect on M5 |
 | #1125 | Metal: fix SSD-streaming expert cache slot leaks, in-flight recycling and prune hang | open | `6c41f9b` | 4 | 2026-10-25 | 2026-11-13 | 2 of 4 commits reach the Qwen SSD path, `a0fe413` only in part; planned in `120-correctness-batch` |
 | #1126 | Metal: resolve keep-alive pipeline before starting keep-alive threads | open | `242da6b` | 1 | 2026-09-25 | 2026-11-13 | correctness: `NSMutableDictionary` race at startup, present in the child; planned in `120-correctness-batch` |
@@ -380,17 +380,17 @@ tests a Q8_0-expert GGUF.
 
 ### #1328 (head `2d48e3b`)
 
-All six commits form one change, built on `b3f5018`; planned in
-`170-ssd-decode-handshake`, after 90.
+All six commits form one change, built on `b3f5018`; ported and measured in
+`170-ssd-decode-handshake`, then dropped (figures in the #1328 row above).
 
 | Commit | Subject | Verdict | Reason |
 |---|---|---|---|
-| `43d4bb9` | Overlap streamed Qwen decode layers with their expert loads on Metal | open | encodes the layer before its experts are known; the CPU loads them between two `MTLSharedEvent`s. Bit-identical claimed (full-vocab frontier logits, 64-token greedy). M4 Pro 48 GB Q2 streamed decode 17.4-18.2 -> 19.5-19.7 t/s at 4K; MTP neutral. Allocates the whole expert-cache budget's slabs on first use |
-| `d1f6d00` | Block on the handshake's arrival event; match the ordinary path on failure | open | part of the same change |
-| `9b7b1da` | Drop the early-commit switch | open | part of the same change |
-| `e11a04e` | Harden the handshake's failure exits and mark released experts in flight | open | part of the same change |
-| `fcbd38f` | Retire in-flight marks by sequence at arrival | open | part of the same change |
-| `2d48e3b` | Return a failed load's reservations everywhere; retire marks on completion | open | part of the same change; overlaps #1125's slot-leak fixes |
+| `43d4bb9` | Overlap streamed Qwen decode layers with their expert loads on Metal | drop | measured in `170-ssd-decode-handshake`: streamed plain decode -2.7% at emulated 48 GB on Q2 with a 3.35 GiB cache, +3.9% with 9.5 GiB. Encodes the layer before its experts are known; the CPU loads them between two `MTLSharedEvent`s. Bit-identical claimed (full-vocab frontier logits, 64-token greedy). M4 Pro 48 GB Q2 streamed decode 17.4-18.2 -> 19.5-19.7 t/s at 4K; MTP neutral. Allocates the whole expert-cache budget's slabs on first use |
+| `d1f6d00` | Block on the handshake's arrival event; match the ordinary path on failure | drop | part of the same change |
+| `9b7b1da` | Drop the early-commit switch | drop | part of the same change |
+| `e11a04e` | Harden the handshake's failure exits and mark released experts in flight | drop | part of the same change. One exit still skips the release (the experts failing to encode after the wait is encoded), which parks the buffer; fixed in the port |
+| `fcbd38f` | Retire in-flight marks by sequence at arrival | drop | part of the same change |
+| `2d48e3b` | Return a failed load's reservations everywhere; retire marks on completion | drop | part of the same change; overlaps #1125's slot-leak fixes (`120` keeps its own) |
 
 ### #1184 (head `62ba62c`)
 

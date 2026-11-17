@@ -18,8 +18,9 @@ removes most of that idle time. From its first commit's message:
   - the CPU encodes the next layer, waits for the ids, loads the missing
     experts, writes their addresses and releases the GPU.
 
-  The handshake is on by default when MTP is off; with MTP it is opt-in
-  (`DS4_QWEN4_STREAM_HANDSHAKE`). The whole cache budget's slabs are
+  The handshake is on by default for every single-token layer, the
+  single-token steps of `--mtp` included (`d1f6d00` dropped the MTP opt-in);
+  `DS4_QWEN4_STREAM_HANDSHAKE=0` turns it off. The whole cache budget's slabs are
   allocated up front, so the kernels see every slab when they are encoded.
 
 The author's figures (M4 Pro 48 GB, Q2, `ds4-bench --ssd-streaming`, 4K
@@ -81,5 +82,5 @@ behaviour. If D3 finds that admission must change, a spec delta for
   `docs/upstream-prs.md`.
 - Resident runs: no change by construction. The handshake runs only for
   streamed single-token decode layers.
-- Q2 is the author's pack and is not on this machine. The change measures Q4
-  at emulated memory; Q2 waits for the owner's approval of its download.
+- Q2 is the author's pack. Its GGUF is now on disk, and the handshake only
+  engages there (Q4's Q4_K gate/up rows keep the ordinary path, design D4).
