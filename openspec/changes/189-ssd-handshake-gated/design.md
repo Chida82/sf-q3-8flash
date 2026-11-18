@@ -31,9 +31,12 @@ of file cache, a condition that models neither of the owner's uses.
 
 - Capped, RAM taken: no memory lock, the expert cache fixed with
   `--ssd-streaming-cache-experts` (the same slot count on both sides),
-  uncached expert reads on both sides.
-- Q4, at the development footprint (54 GiB) first; then 48 and 60 GiB. The
-  kinds are `capped-mtp-code`, `capped-mtp-prose` and `capped-plain`.
+  uncached expert reads on both sides (`ab_bench.py` evicts the GGUF before
+  such a series; an `F_NOCACHE` read is still served from resident pages).
+- Q4, at the development footprint (54 GiB, 9,701 slots) first; then 48 and
+  60 GiB (7,326 and 12,076; `190`'s table, or the counts `193` sets if it
+  lands first). The kinds are `capped-mtp-code`, `capped-mtp-prose` and
+  `capped-plain`.
 - One smaller cache as well, 10% of the experts, where `170` saw the
   handshake lose on plain decode: it says whether the gate of D4 needs the
   cache-coverage term.

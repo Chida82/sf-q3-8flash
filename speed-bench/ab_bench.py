@@ -41,6 +41,14 @@ KINDS = {
     # an edit that repeats most of a file from the prompt; runs only when --kinds names it
     'mtp-copy': {'prompt': 'speed-bench/copy_edit.txt', 'frontiers': (2048,), 'gen': 128, 'mtp': True,
                  'on_request': True},
+    # SSD streaming at a fixed footprint (change 190): long decodes past the cache's warm-up; the
+    # cache size and DS4_METAL_STREAM_EXPERT_UNCACHED_READS=1 come from --bench-arg and --env
+    'capped-mtp-code': {'prompt': 'rax.c', 'frontiers': (8192,), 'gen': 512, 'mtp': True,
+                        'on_request': True},
+    'capped-mtp-prose': {'prompt': 'speed-bench/promessi_sposi.txt', 'frontiers': (8192,), 'gen': 512,
+                         'mtp': True, 'on_request': True},
+    'capped-plain': {'prompt': 'rax.c', 'frontiers': (8192,), 'gen': 512, 'mtp': False,
+                     'on_request': True},
 }
 DEFAULT_KINDS = [k for k in KINDS if not KINDS[k].get('on_request')]
 # Headline metrics: they carry the verdict, decide "inconclusive" and fill the record row.
@@ -85,6 +93,29 @@ def child_env(pairs, environ=None):
             raise Stop(2, f'--env {pair}: expected KEY=VALUE')
         env[key] = value
     return env
+
+
+def evict_pages(path):
+    """Drop the file's clean pages from the page cache. F_NOCACHE reads are still served from pages
+    already resident, so an uncached series starts from an evicted GGUF; its runs leave none behind."""
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mmap.restype, libc.mmap.argtypes = ctypes.c_void_p, [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+                                                               ctypes.c_int, ctypes.c_int, ctypes.c_longlong]
+    libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    libc.msync.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    size = os.path.getsize(path)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        p = libc.mmap(None, size, 1, 1, fd, 0)  # PROT_READ, MAP_SHARED
+        if p in (None, ctypes.c_void_p(-1).value):
+            raise Stop(2, f'{path}: mmap failed for eviction')
+        rc = libc.msync(p, size, 0x2 | 0x1)  # MS_INVALIDATE | MS_ASYNC
+        libc.munmap(p, size)
+    finally:
+        os.close(fd)
+    if rc != 0:
+        raise Stop(2, f'{path}: msync failed for eviction (errno {ctypes.get_errno()})')
 
 
 def model_label(path):
@@ -466,7 +497,8 @@ def verdict(runs, kinds):
             both = [(a['metrics'][name], b['metrics'][name]) for a, b in valid
                     if a['metrics'][name] and b['metrics'][name] is not None]
             ratios = [b / a for a, b in both]
-            table.append({'kind': kind, 'metric': name, 'headline': (kind, name) in RECORD,
+            headline = (kind, name) in RECORD or (kind.startswith('capped-') and name == 'decode')
+            table.append({'kind': kind, 'metric': name, 'headline': headline,
                           'a': statistics.median([a for a, _ in both]) if both else None,
                           'b': statistics.median([b for _, b in both]) if both else None,
                           'ratio': statistics.median(ratios) if ratios else None,
@@ -691,6 +723,8 @@ def main(argv=None):
         model = Path(os.path.abspath(args.model))
         if not model.is_file():
             raise Stop(2, f'{args.model}: model not found')
+        if env.get('DS4_METAL_STREAM_EXPERT_UNCACHED_READS') == '1':
+            evict_pages(model)
         trees = {'A': prepare_tree(args.a), 'B': prepare_tree(args.b)}
         now = datetime.now(timezone.utc)
         out = Path(args.out) if args.out else (Path(os.environ.get('TMPDIR', '/tmp')) / 'sf-q3-8flash-ab'

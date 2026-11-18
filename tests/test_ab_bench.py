@@ -369,6 +369,16 @@ class EnvironmentTest(unittest.TestCase):
         env = ab.child_env(["DS4_QWEN4_MTP_DEPTH=3"], {"DS4_METAL_QWEN4_SOURCE": "x.metal", "PATH": "/bin"})
         self.assertEqual(env, {"PATH": "/bin", "DS4_QWEN4_MTP_DEPTH": "3"})
 
+    def test_evict_pages_drops_a_file_and_refuses_an_empty_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "m.gguf"
+            f.write_bytes(b"x" * 65536)
+            f.read_bytes()
+            ab.evict_pages(f)
+            (Path(d) / "e.gguf").write_bytes(b"")
+            with self.assertRaises(ab.Stop):
+                ab.evict_pages(Path(d) / "e.gguf")
+
 
 if __name__ == "__main__":
     unittest.main()

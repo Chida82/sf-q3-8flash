@@ -94,11 +94,124 @@ Decode loses little down to half the cache and then falls; a prefill that
 resumes after decode gets faster as the cache shrinks. The prefill figures
 are medians of 4 pairs, without intervals.
 
-## Measured figures
+## Capped RAM: the development condition
 
-M5 Max 128 GiB. The smaller machines are emulated with
-`sf-q3-8flash-bench --simulate-used-memory <GiB>`, which locks that much RAM
-before the model loads. The plan then uses the RAM left, Metal's
+Streaming serves two uses: a smaller Mac, and this one with the model held to
+a fixed share of its RAM (Q4 at a footprint of 48 to 60 GiB, the request's KV
+included) while other work holds the rest. Streaming work is developed for
+the second, with the rest of the RAM taken, so that an expert the cache does
+not hold is read from the SSD:
+
+- no memory lock;
+- the expert cache fixed with `--ssd-streaming-cache-experts`, from the
+  footprint;
+- `DS4_METAL_STREAM_EXPERT_UNCACHED_READS=1`, which reads routed experts
+  through a second descriptor with `F_NOCACHE`, whole pages into a
+  page-aligned buffer (on APFS an unaligned `F_NOCACHE` read still leaves
+  pages cached). The default stays buffered. A run with the switch leaves
+  only the static weights of the GGUF in the file cache, but an `F_NOCACHE`
+  read is still served from pages that are already there: a series starts
+  from an evicted GGUF, which `ab_bench.py` does when `--env` sets the switch;
+- `ab_bench.py --kinds capped-mtp-code,capped-mtp-prose,capped-plain`: an
+  8192-token context and 512 generated tokens, so the cache is past its
+  warm-up. Decode is the headline metric.
+
+The same runs with buffered reads, the GGUF's pages evicted before each run,
+give the RAM-free figures. They are reported and decide nothing.
+
+Footprint is the engine's planned total at the service's configuration
+(`--ctx 262144 --mtp`, the 0.57 GiB vision projector added): 28.92 GiB before
+the cache on Q4, of which the KV and graph buffers of the 262144-token
+context are 20.01. A process at 2048 tokens of that context peaks about
+12 GiB under the plan.
+
+| Footprint | Cache slots | Expert cache | Share of Q4's routed experts |
+|---|---|---|---|
+| 48 GiB | 7,326 | 18.5 GiB | 30% |
+| 54 GiB (development) | 9,701 | 24.5 GiB | 39% |
+| 60 GiB | 12,076 | 30.5 GiB | 49% |
+
+Q4, 3 runs per cell, medians (the runs of a cell agree within 1% with the
+RAM taken). Misses and miss layers (layer calls that miss at least one
+expert) per generated token come from one counted run per cell; all-cached
+is the share of layer calls over the second half of the run that found every
+expert cached (change `190`):
+
+| Footprint | Kind | Decode, RAM taken | Decode, RAM free | Prefill 8192, taken / free | Misses / token | Miss layers / token | All-cached calls |
+|---|---|---|---|---|---|---|---|
+| 48 GiB | mtp-code | 24.5 | 44.4 | 798 / 804 | 80.6 | 21.01 | 22.5% |
+| 48 GiB | mtp-prose | 31.5 | 41.8 | 841 / 846 | 29.0 | 16.13 | 53.3% |
+| 48 GiB | plain | 19.7 | 31.6 | 807 / 811 | 72.2 | 30.67 | 41.5% |
+| 54 GiB | mtp-code | 29.8 | 48.0 | 781 / 785 | 54.2 | 18.05 | 35.1% |
+| 54 GiB | mtp-prose | 36.2 | 42.7 | 822 / 813 | 14.7 | 9.60 | 74.2% |
+| 54 GiB | plain | 22.9 | 33.0 | 788 / 788 | 47.0 | 24.31 | 54.1% |
+| 60 GiB | mtp-code | 36.0 | 49.8 | 764 / 764 | 32.6 | 13.97 | 52.9% |
+| 60 GiB | mtp-prose | 39.3 | 43.6 | 803 / 802 | 8.5 | 5.99 | 84.3% |
+| 60 GiB | plain | 26.4 | 34.3 | 773 / 776 | 28.0 | 17.29 | 68.9% |
+
+The first prefill reads every expert once in both conditions, since both
+start evicted, and slows a little as the cache grows (locking the cache's
+slabs). Resident on this Mac is about 47-49 t/s plain and 65 (code) and 50
+(prose) with MTP.
+
+What the table says:
+
+- **The footprint is worth about 1 t/s of decode per GiB** on code with the
+  RAM taken (MTP 24.5 -> 29.8 -> 36.0 t/s, plain 19.7 -> 22.9 -> 26.4), with
+  no knee in the range. MTP prose flattens above 54 GiB.
+- **Code misses three to four times as often as prose** at the same cache.
+- **With the RAM free the file cache does the work of the cache**: MTP code
+  runs at 44-50 t/s at every footprint.
+- **A cache that misses little still stops at every layer**: at 60 GiB MTP
+  prose finds every expert cached in 84% of the layer calls and runs at 39.3
+  t/s against 50 resident.
+
+Resolution: an A/A at 54 GiB (one 600 s invocation per kind, 4 to 6 pairs)
+gives decode -0.45% [-3.19%, +0.17%] on MTP code and +0.15% [-3.92%, +4.39%]
+plain (bootstrap 95% CI of the median pair ratio). A single pair can move
+4%; a change is judged on at least 8 pairs, two invocations per kind.
+
+### A 48 GB Mac
+
+A 48 GB Mac is bracketed, not emulated. Assumed: a budget of 36 GiB (Metal's
+recommendation on this Mac is 84% of RAM, 40 GiB at 48 GB, less what the
+system and other apps hold), an 8192-token context with MTP, no projector.
+The plan then gives the cache 17.0 GiB on Q4 (6,727 slots, 27% of the routed
+experts) and 18.2 GiB on Q2 (13,086, 53%). The hard end runs that cache with
+uncached reads and no lock: no file cache at all. The other end is the old
+emulation (`--simulate-used-memory 80GB`): the plan's own 2-3 GiB cache and
+about 25 GiB of file cache. One run per cell, 512 generated tokens, decode and
+first prefill in t/s:
+
+| Pack | Kind | Hard end: plan's cache, uncached | Emulated: lock, small cache, file cache |
+|---|---|---|---|
+| Q4 | mtp-code | 23.4 / 803 | 16.6 / 845 (809 slots) |
+| Q4 | mtp-prose | 29.8 / 851 | 21.7 / 879 |
+| Q4 | plain | 19.1 / 815 | 16.4 / 768 |
+| Q2 | mtp-code | 44.0 / 1004 | 34.3 / 1052 (2,369 slots) |
+| Q2 | mtp-prose | 38.2 / 1030 | 33.7 / 1093 |
+| Q2 | plain | 30.2 / 1014 | 24.9 / 1071 |
+
+The emulation is not the generous end for decode: its cache is too small for
+the file cache to make up, and it runs 14-29% slower than a real-sized cache
+reading every miss from the SSD. A 48 GB Mac with this SSD should decode at
+least at the hard end, a little faster with whatever file cache it keeps; on
+prefill the two ends are within 8%. Older emulated figures understate decode
+on such a machine.
+
+## Emulated 48 GB (earlier changes)
+
+The figures below and those of `185` and `188` above were taken with
+`--simulate-used-memory`, which models neither use. For an emulated size X
+the lock takes most of the host's user wire limit (108.8 GiB) and the plan
+stays inside what is left: about 0.84 x (X - 24) GiB, 19.5 GiB at 48 GB,
+where a 48 GB Mac would plan about 36 to 40. The expert cache then holds 4%
+(Q4) to 10% (Q2) of the routed experts, and the RAM the plan leaves, about
+25 GiB, becomes file cache holding the experts the small cache evicts. Those
+figures measured that file cache, not a small machine.
+
+`sf-q3-8flash-bench --simulate-used-memory <GiB>` locks that much RAM before
+the model loads. The plan then uses the RAM left, Metal's
 recommendation scaled by the same fraction, and what the kernel still lets the
 process wire. The emulation keeps this machine's SSD, so a real smaller Mac
 with a slower disk reads slower. 40 GB is the smallest size this host can
@@ -126,7 +239,7 @@ larger graph reserve than the MTP runs' 2K context. At 40 GB the plain kind is
 refused (19.10 GiB fixed against 14.76), which is the admission working as
 designed.
 
-Expert reads are buffered on purpose. At these sizes the plan does not take
+Expert reads are buffered by default. At these sizes the plan does not take
 all the RAM that is left: at 48 GB it plans 19.4 GiB and the Q2 process holds
 about 10.6. The kernel fills the rest with the pack's pages, about 25 GiB
 after one prefill, and an expert evicted from the cache is read back from

@@ -85,16 +85,16 @@ table. Measured so far, at an 8192-token context and MTP:
 The vision projector adds 0.57 GiB. At the service's configuration the
 three targets therefore leave the cache about:
 
-| Footprint | Expert cache | Slots | Share of Q4's experts |
-|---|---|---|---|
-| 48 GiB | 18.5 GiB | about 7,330 | 30% |
-| 54 GiB | 24.5 GiB | about 9,700 | 39% |
-| 60 GiB | 30.5 GiB | about 12,080 | 49% |
+| Footprint | Slots | Expert cache | Share of Q4's experts | Engine's plan + projector | Peak at 2048 tokens |
+|---|---|---|---|---|---|
+| 48 GiB | 7,326 | 18.51 GiB | 30% | 47.44 + 0.57 GiB | 35.1 GiB |
+| 54 GiB | 9,701 | 24.52 GiB | 39% | 53.44 + 0.57 GiB | 41.1 GiB |
+| 60 GiB | 12,076 | 30.52 GiB | 49% | 59.45 + 0.57 GiB | 47.1 GiB |
 
-Task 3.2 replaces the estimates with the slot counts of real opens. Two
-things follow already. The planned total is the worst case: a run that uses
-little of its context held about 10 GiB less than planned (50.2 GiB at a
-60.5 GiB plan). And the context is the largest fixed term: 262144 tokens
+Measured by task 3.2 (one open each, `--ctx-alloc 262144 --mtp`; the
+bench takes no projector, so its file size is added). The planned total is
+the worst case: at 2048 tokens of a 262144-token allocation the process
+peaked about 12 GiB under it, the KV and graph pages it never touched. And the context is the largest fixed term: 262144 tokens
 reserve 12 GiB more than 8192, which at this footprint is a fifth of the
 experts.
 
@@ -107,9 +107,12 @@ experts.
   both sides; no other option is needed.
 - A B B A pairs, at least 8 per kind, the harness's token gate on every
   pair.
-- Uncached runs leave nothing in the file cache, so every run starts from
-  the same state without an eviction step. The buffered condition evicts the
-  GGUF's pages before each run, as in `185`.
+- Uncached runs leave nothing in the file cache, but an `F_NOCACHE` read is
+  still served from pages that are already resident: the first A/A of task
+  3.3 ran after earlier buffered runs had left 71 GiB of the GGUF cached and
+  measured close to the RAM-free rates. `ab_bench.py` therefore evicts the
+  GGUF's pages once before a series that sets the switch; the series then
+  stays evicted. The buffered condition evicts before each run, as in `185`.
 - Every model run stays under the one-second memory guard. Without a lock
   the guard watches the compressor against its value at the start of the run
   (growth over 5 GiB), free plus inactive under 3 GiB, and wired plus

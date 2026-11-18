@@ -230,6 +230,7 @@ tests/test_qwen4_ssd_experts: tests/test_qwen4_ssd_experts.o $(filter-out ds4_me
 .PHONY: test-qwen4-ssd-experts
 test-qwen4-ssd-experts: tests/test_qwen4_ssd_experts
 	./tests/test_qwen4_ssd_experts
+	DS4_METAL_STREAM_EXPERT_UNCACHED_READS=1 ./tests/test_qwen4_ssd_experts
 
 tests/test_qwen4_memory.o: tests/test_qwen4_memory.c ds4.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<

@@ -117,6 +117,22 @@ Parity means greedy output is token-identical to upstream at the merge-base and
 throughput stays within 2%. Do not download a 137+ GiB model merely to run a
 routine unit test; use an existing local GGUF or ask first.
 
+SSD streaming changes are developed and kept or dropped in the capped-RAM
+condition (`docs/SSD_STREAMING.md`, "Capped RAM"): Q4, no memory lock, the
+expert cache fixed at the 54 GiB footprint, uncached expert reads, and the
+`capped-*` kinds, then confirmed at 48 and 60 GiB before landing:
+
+```sh
+python3 speed-bench/ab_bench.py --a <A tree> --b <B tree> -m /absolute/path/Q4.gguf \
+    --kinds capped-mtp-code,capped-mtp-prose,capped-plain \
+    --env DS4_METAL_STREAM_EXPERT_UNCACHED_READS=1 \
+    --bench-arg=--ssd-streaming --bench-arg=--ssd-streaming-cache-experts --bench-arg=9701
+```
+
+The same runs with buffered reads and the GGUF's pages evicted (RAM free)
+are reported and decide nothing. `--simulate-used-memory` is not a
+development bench for streaming.
+
 ## Correctness rules
 
 - Preserve Qwen's GDN/GQA cadence, recurrent state, block-sparse index state,

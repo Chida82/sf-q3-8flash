@@ -17,6 +17,8 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/param.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
@@ -620,6 +622,7 @@ static id<MTLBuffer> g_moe_q4_up_slots_buffer;
 static id<MTLBuffer> g_moe_q4_down_slots_buffer;
 static id<MTLBuffer> g_attn_out_group_ids_buffer;
 static int g_model_fd = -1;
+static int g_model_uncached_fd = -1;
 static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
 static uint64_t g_model_mapped_offset;
@@ -756,6 +759,7 @@ static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void);
 static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats);
 static void ds4_gpu_stream_expert_pending_load_clear(void);
 static void ds4_gpu_stream_expert_pread_pool_shutdown(void);
+static void ds4_gpu_stream_expert_uncached_fd_reset(void);
 static int ds4_gpu_stream_expert_timing_summary_enabled(void);
 static int ds4_gpu_stream_expert_cache_entry_protected(
         uint32_t       layer,
@@ -4557,6 +4561,7 @@ void ds4_gpu_set_quality(bool quality) {
 void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
     ds4_gpu_stream_expert_cache_clear_all(1);
+    ds4_gpu_stream_expert_uncached_fd_reset();
     if (g_ssd_streaming_mode) {
         fprintf(stderr,
                 "ds4: Metal SSD streaming mode enabled; full model residency and warmup are skipped\n");
@@ -11041,6 +11046,7 @@ void ds4_gpu_cleanup(void) {
         g_moe_q4_down_slots_buffer = nil;
         g_attn_out_group_ids_buffer = nil;
         g_model_fd = -1;
+        ds4_gpu_stream_expert_uncached_fd_reset();
         g_model_map_ptr = NULL;
         g_model_map_size = 0;
         g_model_mapped_offset = 0;
@@ -11544,6 +11550,7 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
 
 int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
+    ds4_gpu_stream_expert_uncached_fd_reset();
     return 1;
 }
 
@@ -11977,8 +11984,9 @@ static void ds4_gpu_stream_expert_timing_note_cache_class(
     g_stream_expert_timing_cache_missing_experts += missing;
 }
 
+/* F_RDADVISE fills the page cache, which uncached reads exist to avoid. */
 static int ds4_gpu_stream_expert_readahead_enabled(void) {
-    return g_ssd_streaming_mode &&
+    return g_ssd_streaming_mode && g_model_uncached_fd < 0 &&
            getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD") == NULL;
 }
 
@@ -12123,6 +12131,87 @@ static uint32_t ds4_gpu_stream_expert_pread_thread_count(uint32_t n_tasks) {
     return threads;
 }
 
+/* Measurement switch (change 190): DS4_METAL_STREAM_EXPERT_UNCACHED_READS=1
+ * reads routed experts through a second descriptor with F_NOCACHE, so a miss
+ * costs an SSD read as on a machine whose RAM other work holds. Off by
+ * default: with RAM to spare the file cache serves evicted experts (185).
+ * If the second open fails, reads stay buffered. */
+static void ds4_gpu_stream_expert_uncached_fd_reset(void) {
+    if (g_model_uncached_fd >= 0) close(g_model_uncached_fd);
+    g_model_uncached_fd = -1;
+    char path[MAXPATHLEN];
+    struct stat model_st, st;
+    const char *env = getenv("DS4_METAL_STREAM_EXPERT_UNCACHED_READS");
+    if (!g_ssd_streaming_mode || g_model_fd < 0 || !env || strcmp(env, "1") != 0 ||
+        fcntl(g_model_fd, F_GETPATH, path) != 0) {
+        return;
+    }
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    if (fstat(fd, &st) != 0 || fstat(g_model_fd, &model_st) != 0 ||
+        st.st_dev != model_st.st_dev || st.st_ino != model_st.st_ino ||
+        fcntl(fd, F_NOCACHE, 1) != 0 || fcntl(fd, F_RDAHEAD, 0) != 0) {
+        close(fd);
+        return;
+    }
+    g_model_uncached_fd = fd;
+    static int reported;
+    if (!reported++) fprintf(stderr, "ds4: Metal SSD expert reads bypass the file cache\n");
+}
+
+#define DS4_METAL_STREAM_EXPERT_BOUNCE_BYTES (1u << 20)
+static pthread_key_t g_stream_expert_bounce_key;
+static pthread_once_t g_stream_expert_bounce_once = PTHREAD_ONCE_INIT;
+
+static void ds4_gpu_stream_expert_bounce_key_init(void) {
+    (void)pthread_key_create(&g_stream_expert_bounce_key, free);
+}
+
+/* The kernel reads past the page cache only for a page-aligned file offset,
+ * length and destination. Expert rows are 32-byte aligned in the GGUF, so the
+ * enclosing pages go to a per-thread aligned buffer and the rows are copied
+ * out. Returns the bytes of [offset, offset + len) that reached dst. */
+static uint64_t ds4_gpu_stream_expert_pread_uncached(
+        uint64_t offset,
+        uint64_t len,
+        uint8_t *dst) {
+    const uint64_t page = (uint64_t)getpagesize();
+    (void)pthread_once(&g_stream_expert_bounce_once,
+                       ds4_gpu_stream_expert_bounce_key_init);
+    uint8_t *bounce = pthread_getspecific(g_stream_expert_bounce_key);
+    if (!bounce) {
+        void *p = NULL;
+        if (page == 0 || DS4_METAL_STREAM_EXPERT_BOUNCE_BYTES % page != 0 ||
+            posix_memalign(&p, (size_t)page, DS4_METAL_STREAM_EXPERT_BOUNCE_BYTES) != 0) {
+            return 0;
+        }
+        if (pthread_setspecific(g_stream_expert_bounce_key, p) != 0) {
+            free(p);
+            return 0;
+        }
+        bounce = p;
+    }
+    uint64_t pos = 0;
+    while (pos < len) {
+        const uint64_t head = (offset + pos) % page;
+        uint64_t want = round_up_u64(head + (len - pos), page);
+        if (want > DS4_METAL_STREAM_EXPERT_BOUNCE_BYTES) {
+            want = DS4_METAL_STREAM_EXPERT_BOUNCE_BYTES;
+        }
+        ssize_t nread;
+        do {
+            nread = pread(g_model_uncached_fd, bounce, (size_t)want,
+                          (off_t)(offset + pos - head));
+        } while (nread < 0 && errno == EINTR);
+        if (nread <= (ssize_t)head) break;
+        uint64_t got = (uint64_t)nread - head;
+        if (got > len - pos) got = len - pos;
+        memcpy(dst + pos, bounce + head, (size_t)got);
+        pos += got;
+    }
+    return pos;
+}
+
 static int ds4_gpu_stream_expert_pread_into(
         uint64_t  offset,
         uint64_t  len,
@@ -12142,7 +12231,11 @@ static int ds4_gpu_stream_expert_pread_into(
     const double t0 = ds4_gpu_now_ms();
     uint64_t pos = 0;
     int ok = 1;
-    while (pos < len) {
+    if (g_model_uncached_fd >= 0) {
+        pos = ds4_gpu_stream_expert_pread_uncached(offset, len, dst);
+        ok = pos == len;
+    }
+    while (ok && pos < len) {
         const uint64_t rem = len - pos;
         const size_t want = rem > (uint64_t)SSIZE_MAX ? (size_t)SSIZE_MAX : (size_t)rem;
         ssize_t nread;

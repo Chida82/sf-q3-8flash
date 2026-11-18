@@ -132,10 +132,15 @@ static void probe_begin(const weights *w, const int32_t *ids, uint64_t n, int fd
     }
     pthread_mutex_unlock(&probe_mutex);
 }
+/* With DS4_METAL_STREAM_EXPERT_UNCACHED_READS=1 the model descriptor's reads
+ * go through a second, page-widened descriptor the probe does not observe:
+ * the request accounting below is buffered-only, the outputs stay exact. */
+static int uncached_reads;
 static read_stats probe_end(int all_selected, int no_reads) {
     pthread_mutex_lock(&probe_mutex);
     need(probe.enabled && !probe.inflight, "read workers retired");
     need(!probe.violation, "pread never accesses an unselected expert");
+    if (uncached_reads) all_selected = no_reads = 0;
     if (no_reads) need(!probe.calls && !probe.bytes, "resident/cache-hit path performs no pread");
     for (unsigned p = 0; p < 3; p++) for (unsigned e = 0; e < E; e++) {
         const uint64_t expected = probe.selected[e] ? probe.stride[p] : 0;
@@ -762,6 +767,9 @@ static void check_recency(const weights *w, int fd, int empty_fd) {
     puts("PASS Qwen SSD victim order: last pass kept, hotness beyond it, budget held, routed ids protected");
 }
 
+static char fixture_path[1024];
+static void remove_fixture(void) { unlink(fixture_path); }
+
 int main(void) {
     weights formats[] = {{.gate_type=16, .down_type=10, .shared_down_type=8},
                          {.gate_type=12, .down_type=39, .shared_down_type=39},
@@ -780,7 +788,14 @@ int main(void) {
         w->shared_up = bytes; bytes = align_up(bytes + row_bytes(8, D) * F, page);
         w->shared_down = bytes; bytes = align_up(bytes + row_bytes(w->shared_down_type, F) * D, page);
     }
-    FILE *file = tmpfile(), *empty = tmpfile();
+    /* A named file, so DS4_METAL_STREAM_EXPERT_UNCACHED_READS=1 can open its
+     * second descriptor; the unlinked empty file keeps reads buffered. */
+    const char *tmp = getenv("TMPDIR");
+    snprintf(fixture_path, sizeof(fixture_path), "%s/qwen4-ssd-experts-XXXXXX", tmp && *tmp ? tmp : "/tmp");
+    const int fixture_fd = mkstemp(fixture_path);
+    need(fixture_fd >= 0 && atexit(remove_fixture) == 0, "named expert file");
+    FILE *file = fdopen(fixture_fd, "w+b"), *empty = tmpfile();
+    uncached_reads = getenv("DS4_METAL_STREAM_EXPERT_UNCACHED_READS") != NULL;
     need(file && empty && ftruncate(fileno(file), (off_t)bytes) == 0, "temporary sparse expert file");
     uint8_t *map = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fileno(file), 0);
     need(map != MAP_FAILED, "expert file mapping");
@@ -824,6 +839,12 @@ int main(void) {
             check_case(w, T, 2, fileno(file), fileno(empty), 1, 0);
             check_case(w, T, 3, fileno(file), fileno(empty), 0, 0);
         }
+    }
+    if (uncached_reads) {
+        /* The rest injects failures through the probe, which cannot see the
+         * uncached descriptor. */
+        puts("PASS Qwen SSD uncached expert reads: Q2/Q4/Q8 decode and MM shapes exact, cold and warm, retry after a failed read");
+        return 0;
     }
     check_case_impl(formats, 128, 2, fileno(file), fileno(empty), 0, 1, 24);
     puts("PASS Qwen SSD full-cache reuse: 24 disjoint victims, missing-only reads, warm0");
