@@ -1,5 +1,13 @@
 # Proposal
 
+**Closed on 2026-11-18, no code landed.** S1 (uncached expert reads) was
+dropped by its measurement: streamed plain decode at emulated 48 GB fell by
+33.3% [-34.0%, -31.3%] on Q2, because the kernel's page cache is the
+second-level expert cache at that size. S2 stopped after step 0: the
+next-layer router predicts 32-38% of the misses with fewer wasted reads than
+saved ones, but read-ahead into cache slots was not built. Figures and
+tables: design D5.
+
 ## Why
 
 Streamed decode is the slow side of `--ssd-streaming`: at emulated 48 GB the

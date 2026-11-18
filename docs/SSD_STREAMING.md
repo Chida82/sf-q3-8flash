@@ -77,6 +77,15 @@ larger graph reserve than the MTP runs' 2K context. At 40 GB the plain kind is
 refused (19.10 GiB fixed against 14.76), which is the admission working as
 designed.
 
+Expert reads are buffered on purpose. At these sizes the plan does not take
+all the RAM that is left: at 48 GB it plans 19.4 GiB and the Q2 process holds
+about 10.6. The kernel fills the rest with the pack's pages, about 25 GiB
+after one prefill, and an expert evicted from the cache is read back from
+there, not from the SSD. With `F_NOCACHE` on the expert reads, plain decode
+fell from 30.2 to 20.3 t/s on Q2 and from 18.9 to 11.2 on Q4, and resumed
+prefill by 8-31% (each run started with the pack's pages dropped from the
+page cache; change `185`).
+
 Minimum RAM follows from the fixed part of the plan: 6.32 GiB static weights,
 the graph for the context, 1.4 (Q2) or 2.6 GiB (Q4) of staging, and 2 GiB of
 runtime headroom. At a 2K context this is about 12-13 GiB, so a 24 GB Mac,
