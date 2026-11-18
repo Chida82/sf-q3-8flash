@@ -26,7 +26,9 @@ saves.
 
 The owner's service runs with `--mtp`, so a gain on MTP decode is the one
 that reaches real use. This change measures the two variables apart, at a
-fixed cache size, and enables the handshake only where it wins.
+fixed cache size, and enables the handshake only where it wins. It is
+measured in the capped-RAM bench of `190-ssd-capped-ram-bench`, after
+`191-ssd-decode-layer-round-trip`.
 
 Performance under the intake criteria, on the streaming path the owner named
 as a next focus.
@@ -34,9 +36,9 @@ as a next focus.
 ## What Changes
 
 - **Step 0, measurement only.** The port (`dd8db0d`) brought onto current
-  `main` (which now has `187` and `188`), then measured at a fixed expert
-  cache, the same slot count on both sides, at two or three sizes, plain and
-  MTP kinds, Q4 first (design D2). No gating code yet.
+  `main`, then measured on Q4 at a fixed expert cache, the same slot count on
+  both sides, at the 48, 54 and 60 GiB footprints and at one small cache,
+  plain and MTP kinds (design D2). No gating code yet.
 - **S1, the gate.** From step 0's table, one predicate decides per layer or
   per call whether the handshake runs: by kind (MTP verify rows only), by
   cache coverage (the share of the layer's selected experts already cached),

@@ -24,24 +24,24 @@ measurement: the unit test on Metal, streamed equals resident on Q2 and Q4
 
 ### D2. The measurement protocol
 
-- Emulated 48 GB (`--simulate-used-memory` with the 80 GiB lock), the
-  streamed side only, as before.
-- **The expert cache is fixed** with `--ssd-streaming-cache-experts <slots>`,
-  the same number on both sides, so the plan's dependence on free memory at
-  launch drops out (sf-ds4-1flash measures the same way at a fixed cache).
-- Sizes: on Q4, the plan's own slot count at 48 GB for the plain context
-  (about 780) and for the MTP context, plus one larger size; on Q2 the same
-  three positions. Each size runs the plain and both MTP kinds.
-- **Steady state is the main condition**: the page cache is left as the
-  previous run leaves it, which is the state of a server that has been
-  running. One cold check per pack (the GGUF's pages evicted before every run
-  of both sides, the protocol `185` established) shows the first-request
-  case.
+The bench of `190-ssd-capped-ram-bench` (its design D1 and D5), which
+replaces the emulated 48 GB this change was first written for: under the
+80 GiB lock the plan gives the cache 4-10% of the experts and leaves 25 GiB
+of file cache, a condition that models neither of the owner's uses.
+
+- Capped, RAM taken: no memory lock, the expert cache fixed with
+  `--ssd-streaming-cache-experts` (the same slot count on both sides),
+  uncached expert reads on both sides.
+- Q4, at the development footprint (54 GiB) first; then 48 and 60 GiB. The
+  kinds are `capped-mtp-code`, `capped-mtp-prose` and `capped-plain`.
+- One smaller cache as well, 10% of the experts, where `170` saw the
+  handshake lose on plain decode: it says whether the gate of D4 needs the
+  cache-coverage term.
 - At least 8 pairs per kind and size before a rule is applied. Runs that
-  overlapped a foreign load (a container, an XProtect scan) never ground a
-  drop or a neutral result.
-- Q4 first. Q2 follows only if Q4 shows a gain somewhere in the table or the
-  clock allows both.
+  overlapped a foreign load never ground a drop or a neutral result.
+- The baseline is `main` after `191-ssd-decode-layer-round-trip` has
+  finished or closed (its design D4): both changes shorten the same GPU idle.
+- The RAM-free condition is reported beside the result and decides nothing.
 
 ### D3. Keep rule
 
@@ -51,8 +51,9 @@ For the gated build of S1, against `main`, at every measured size:
 - plain decode must not lose: no pooled CI wholly below zero, at any size;
 - no other metric's CI wholly below zero.
 
-If the table shows the handshake wins only at cache sizes the plan never
-reaches at 48 GB, the change closes as "measured, not needed" with the table.
+If the table shows the handshake wins only at cache sizes outside the
+48-60 GiB footprints, the change closes as "measured, not needed" with the
+table.
 
 ### D4. The gate
 
@@ -67,12 +68,12 @@ switch only if the measurement shows the gain depends on the machine.
 
 ### D5. What is reused from sf-ds4-1flash
 
-Read on 2026-11-18: its `760` lock of the static weights is already in this
-child (Qwen's static spans are locked under streaming, `ds4.c:33121`); its
-`268` alignment fix applies only to `F_NOCACHE` readers, which here is the
-n-gram table alone, outside this change. What this change takes is the
-measurement discipline: a fixed expert cache and a steady-state main
-condition.
+The full reading is `190-ssd-capped-ram-bench` design D9. Two of its rows
+bear on this change. That child measures at a fixed expert cache, which D2
+takes. And it measured twice (`132` D3, `680`) that an expert pass committed
+ahead and released by a CPU-signalled event restarts the GPU no faster than
+a commit, about 100 us: the handshake is such a pass, so its gain can only
+come from the drain and the encoding it removes, which `191` S0 measures.
 
 ## Risks / Trade-offs
 
@@ -83,5 +84,6 @@ condition.
   misses, which helps the ordinary path's overlap and may shrink the space
   where the handshake wins. Step 0 measures on top of it, so the table is the
   current truth.
-- **Emulation keeps this Mac's SSD.** A real 48 GB Mac reads slower; the doc
-  says so beside the figures.
+- **The capped bench reads every miss from this Mac's SSD.** That is the
+  hard end of the owner's condition (`190` design D3); the RAM-free run shows
+  the other end.
