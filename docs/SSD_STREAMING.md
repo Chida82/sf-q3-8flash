@@ -171,6 +171,31 @@ gives decode -0.45% [-3.19%, +0.17%] on MTP code and +0.15% [-3.92%, +4.39%]
 plain (bootstrap 95% CI of the median pair ratio). A single pair can move
 4%; a change is judged on at least 8 pairs, two invocations per kind.
 
+### The layer round trip
+
+A resident decode pass never stops the GPU; a streamed one stops it at every
+layer to read the router's ids. Measured per layer call on Q4 at 54 GiB,
+uncached, medians (change `191`):
+
+| Part of the stop | All experts cached | Some missing |
+|---|---|---|
+| wake: the CPU returns from `waitUntilCompleted` after the GPU ends | 66-68 us | 67-70 us |
+| ids read, cache lookup, loads | 12-13 us | 665-762 us |
+| encoding the expert pass | 8-9 us | 8 us |
+| encoding the rest of the layer and the next router | 12 us | 12-13 us |
+| commit of that batch to its GPU start | 92-94 us | 90-93 us |
+
+A layer that finds every expert cached still leaves the GPU idle about 190
+us. Over decode the wake is 6% (MTP code) to 8% (plain), the commit start 8%
+to 10%. Two ways to shorten it were measured and dropped:
+- committing the expert pass before the rest of the layer is encoded has
+  only 12 us of encoding to hide and adds a commit;
+- polling the command buffer's status instead of blocking cut the wake but
+  ran the GPU at 720 MHz and 7 W instead of 1590 MHz and 27 W: MTP code
+  decode fell from 29.9 to 25.4 t/s. While the CPU blocks on the GPU, the
+  GPU stays at its high clock; while it spins, it does not. Any wait for
+  the GPU on this path must block.
+
 ### A 48 GB Mac
 
 A 48 GB Mac is bracketed, not emulated. Assumed: a budget of 36 GiB (Metal's
