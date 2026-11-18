@@ -397,7 +397,56 @@ static void test_text_observations(void) {
 }
 
 /* sf-ablate(glm): GLM-only cache and rollback tests are outside this child. */
+/* Prompt-lookup index: match, minimum agreement, extension as tokens commit,
+ * rewind, and the choice between the lookup's draft and the predictor's. */
+static void test_lookup(void) {
+    enum { CAP = 4096 };
+    qwen4_lookup lk = {0};
+    int tok[CAP], out[2];
+    /* 100 distinct tokens, then the six from index 10 again */
+    int n = 0;
+    for (int i = 0; i < 100; i++) tok[n++] = 1000 + i;
+    for (int i = 10; i < 16; i++) tok[n++] = 1000 + i;
+    /* committed ...1010..1015, next 1016: seven tokens agree, 1017 1018 follow */
+    assert(qwen4_lk_match(&lk, CAP, tok, (uint32_t)n, 1016, 2u, out) == 2 && out[0] == 1017 && out[1] == 1018);
+    assert(qwen4_lk_match(&lk, CAP, tok, (uint32_t)n, 1016, 1u, out) == 1 && out[0] == 1017);
+    assert(qwen4_lk_match(&lk, CAP, tok, (uint32_t)n, 1099, 2u, out) == 0);   /* 4-gram never seen */
+    assert(lk.upto == (uint32_t)n);
+    /* five tokens of agreement are under the minimum */
+    int m = 100;
+    for (int i = 12; i < 16; i++) tok[m++] = 1000 + i;
+    assert(qwen4_lk_match(&lk, CAP, tok, (uint32_t)m, 1016, 2u, out) == 0);   /* also a rewind: 104 < 106 */
+    assert(lk.upto == (uint32_t)m);
+    /* extension: commit more; the site agreeing furthest back wins over a newer one */
+    n = m;
+    tok[n++] = 1016; tok[n++] = 7; tok[n++] = 8;            /* ...1012..1016 7 8 */
+    for (int i = 11; i < 16; i++) tok[n++] = 1000 + i;      /* 1011..1015 */
+    assert(qwen4_lk_match(&lk, CAP, tok, (uint32_t)n, 1016, 2u, out) == 2 && out[0] == 1017);
+    for (int i = 0; i < 2; i++) tok[n++] = 5;
+    for (int i = 12; i < 16; i++) tok[n++] = 1000 + i;      /* "5 1012..1015": both sites agree 5 back only */
+    assert(qwen4_lk_match(&lk, CAP, tok, (uint32_t)n, 1016, 2u, out) == 0);
+    /* the continuation stops at the committed tokens */
+    for (int i = 0; i < 12; i++) tok[i] = 42;
+    assert(qwen4_lk_match(&lk, CAP, tok, 12u, 42, 2u, out) == 1 && out[0] == 42);
+    /* another context size rebuilds; a context past the cap is refused */
+    assert(qwen4_lk_match(&lk, 16u, tok, 12u, 42, 2u, out) == 1 && lk.cap == 16u);
+    assert(qwen4_lk_match(&lk, 8u, tok, 12u, 42, 2u, out) == 0);
+    qwen4_lk_free(&lk);
+    assert(!lk.pos && !lk.tok && !lk.cap);
+
+    const int two[2] = {7, 8}, other[2] = {9, 8};
+    int d2 = 0;
+    assert(qwen4_lk_choose(5, two, 0u, 0xFFu, 0u, &d2) == 5 && d2 == -1);        /* no match */
+    assert(qwen4_lk_choose(7, two, 2u, 0x1Fu, 0u, &d2) == 7 && d2 == -1);        /* unhealthy: 5 of 8 */
+    assert(qwen4_lk_choose(7, two, 2u, 0x3Fu, 0xFFu, &d2) == 7 && d2 == 8);      /* agree: second rides along */
+    assert(qwen4_lk_choose(7, two, 1u, 0x3Fu, 0xFFu, &d2) == 7 && d2 == -1);
+    assert(qwen4_lk_choose(7, other, 2u, 0x3Fu, 0x3Fu, &d2) == 7 && d2 == -1);   /* differ, tie: predictor */
+    assert(qwen4_lk_choose(7, other, 2u, 0x7Fu, 0x3Fu, &d2) == 9 && d2 == 8);    /* differ, lookup ahead */
+    assert(qwen4_lk_choose(7, other, 2u, 0x17Fu, 0x3Fu, &d2) == 9);              /* only eight verdicts count */
+}
+
 int main(void) {
+    test_lookup();
     test_vision_prefix();
     test_vision_fingerprint_prefix();
     test_rewind();

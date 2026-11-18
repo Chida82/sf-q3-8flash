@@ -26664,6 +26664,121 @@ static const ds4_vision_span *qwen4_fake_spans(size_t *count) {
     *count = n;
     return spans;
 }
+/* Prompt lookup for MTP drafts.  When the last three committed tokens and the
+ * next one occurred earlier in the prompt or output, and the two sites agree
+ * QWEN4_LK_MIN_SUFFIX or more tokens back, the tokens that followed are
+ * candidates for the cycle's draft rows.  The index maps a 4-gram to the
+ * position after its newest occurrence, plus one; prev[p] holds the same for
+ * the occurrence before the one ending at p, so earlier sites stay reachable.
+ * 8 bytes per context token plus a table of two to four 4-byte slots each. */
+#define QWEN4_LK_MIN_SUFFIX 6u     /* the first two looked-up tokens stop getting more precise here */
+#define QWEN4_LK_HEALTHY 6u        /* right first drafts, of the last eight, for the lookup to be heard */
+#define QWEN4_LK_SCAN 64u          /* occurrences compared per match */
+#define QWEN4_LK_SCAN_SUFFIX 64u   /* agreement counted up to this */
+
+typedef struct {
+    uint32_t *pos, *prev, mask, upto, cap;
+    int *tok;
+} qwen4_lookup;
+
+static DS4_MAYBE_UNUSED void qwen4_lk_free(qwen4_lookup *lk) {
+    free(lk->pos);
+    free(lk->prev);
+    free(lk->tok);
+    memset(lk, 0, sizeof(*lk));
+}
+
+static uint64_t qwen4_lk_hash(const int *t) {
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    for (int i = 0; i < 4; i++) {
+        h ^= (uint32_t)t[i];
+        h *= 0xBF58476D1CE4E5B9ull;
+        h ^= h >> 31;
+    }
+    return h;
+}
+
+/* Index the committed tokens tok[0..L), rebuilding when they no longer extend
+ * the indexed ones (a rewind or another prompt). */
+static bool qwen4_lk_index(qwen4_lookup *lk, uint32_t ctx_cap, const int *tok, uint32_t L) {
+    if (L > ctx_cap) return false;
+    if (lk->cap != ctx_cap) {
+        qwen4_lk_free(lk);
+        uint32_t slots = 1024;
+        while (slots < 2u * ctx_cap) slots <<= 1;
+        lk->pos = calloc(slots, sizeof(uint32_t));
+        lk->prev = malloc((size_t)ctx_cap * sizeof(uint32_t));
+        lk->tok = malloc((size_t)ctx_cap * sizeof(int));
+        if (!lk->pos || !lk->prev || !lk->tok) {
+            qwen4_lk_free(lk);
+            return false;
+        }
+        lk->mask = slots - 1u;
+        lk->cap = ctx_cap;
+    }
+    if (lk->upto > L || memcmp(lk->tok, tok, (size_t)lk->upto * sizeof(int)) != 0) {
+        memset(lk->pos, 0, ((size_t)lk->mask + 1u) * sizeof(uint32_t));
+        lk->upto = 0;
+    }
+    memcpy(lk->tok + lk->upto, tok + lk->upto, (size_t)(L - lk->upto) * sizeof(int));
+    for (uint32_t p = lk->upto > 4u ? lk->upto : 4u; p < L; p++) {
+        uint32_t i = (uint32_t)qwen4_lk_hash(tok + p - 4u) & lk->mask;
+        while (lk->pos[i] && memcmp(tok + lk->pos[i] - 5u, tok + p - 4u, 4u * sizeof(int)) != 0) {
+            i = (i + 1u) & lk->mask;
+        }
+        lk->prev[p] = lk->pos[i];
+        lk->pos[i] = p + 1u;
+    }
+    lk->upto = L;
+    return true;
+}
+
+/* Up to max tokens continuing the earlier occurrence of tok[L-3..L) + next
+ * that agrees with the present furthest back (at least QWEN4_LK_MIN_SUFFIX
+ * tokens; the newest QWEN4_LK_SCAN occurrences compared, ties to the newest). */
+static DS4_MAYBE_UNUSED uint32_t qwen4_lk_match(qwen4_lookup *lk, uint32_t ctx_cap, const int *tok, uint32_t L,
+                                                 int next, uint32_t max, int *out) {
+    if (L < 4u || !qwen4_lk_index(lk, ctx_cap, tok, L)) return 0;
+    const int q[4] = { tok[L - 3u], tok[L - 2u], tok[L - 1u], next };
+    uint32_t c = 0;
+    for (uint32_t i = (uint32_t)qwen4_lk_hash(q) & lk->mask; lk->pos[i]; i = (i + 1u) & lk->mask) {
+        if (memcmp(tok + lk->pos[i] - 5u, q, sizeof(q)) == 0) { c = lk->pos[i]; break; }
+    }
+    uint32_t p = 0, best = 0;
+    for (uint32_t n = 0; c && n < QWEN4_LK_SCAN; n++, c = lk->prev[c - 1u]) {
+        uint32_t suffix = 0;
+        for (uint32_t a = c - 1u, b = L + 1u; a > 0 && suffix < QWEN4_LK_SCAN_SUFFIX; a--, b--, suffix++) {
+            if (tok[a - 1u] != (b - 1u == L ? next : tok[b - 1u])) break;
+        }
+        if (suffix > best) { best = suffix; p = c - 1u; }
+    }
+    if (!p || best < QWEN4_LK_MIN_SUFFIX) return 0;
+    const uint32_t k = L - p < max ? L - p : max;
+    memcpy(out, tok + p, (size_t)k * sizeof(int));
+    return k;
+}
+
+static uint32_t qwen4_window_hits(uint32_t window) {
+    return (uint32_t)__builtin_popcount(window & 255u);
+}
+
+/* Which source drafts the cycle.  pd is the predictor's first draft, lk the
+ * n looked-up tokens (0, 1 or 2), and the windows hold each source's last
+ * eight first-draft verdicts.  The lookup is heard only while healthy (six
+ * of its last eight right).  When both name the same token the lookup's
+ * second token rides along; when they differ the source with the better
+ * window drafts, the predictor on a tie.  Returns the first draft, and the
+ * lookup's second token in *d2 when it is to be verified (-1 otherwise). */
+static DS4_MAYBE_UNUSED int qwen4_lk_choose(int pd, const int *lk, uint32_t n, uint32_t lk_window,
+                                            uint32_t pred_window, int *d2) {
+    *d2 = -1;
+    const uint32_t lk_hits = qwen4_window_hits(lk_window);
+    if (n == 0 || lk_hits < QWEN4_LK_HEALTHY) return pd;
+    if (lk[0] != pd && lk_hits <= qwen4_window_hits(pred_window)) return pd;
+    if (n > 1u) *d2 = lk[1];
+    return lk[0];
+}
+
 #ifdef DS4_HAS_QWEN4_GPU
 /* ------------------------------------------------------------------------
  * Qwen3.8-Flash-Next GPU graph.  One command batch per forward; f32
@@ -29050,6 +29165,17 @@ struct ds4_session {
     uint32_t qwen4_depth_cycles;
     uint32_t qwen4_reject2_streak;   /* consecutive 3-row cycles whose second draft rejected */
     bool qwen4_depth3_engaged;
+    /* Prompt-lookup drafts (qwen4_lk_match).  Beside the pending draft: the
+     * predictor's own first draft, the lookup's (-1 when it had none) and
+     * whether the pending second draft is the lookup's, so each source's
+     * window is scored on every cycle, whichever drafted it. */
+    qwen4_lookup qwen4_lk;
+    uint32_t qwen4_lk_window;
+    int qwen4_draft_pred;
+    int qwen4_draft_lk;
+    bool qwen4_draft2_lk;
+    uint64_t qwen4_lk_cycles;        /* verify cycles a lookup drafted */
+    uint64_t qwen4_lk_tokens;        /* drafts those cycles committed */
     /* Exact sampled MTP draws the next token inside the cycle, so the pending
      * draft is conditioned on the token that will be emitted (not on the
      * argmax), and a rejected draft's residual sample enters the next verify
@@ -34177,7 +34303,12 @@ void ds4_session_free(ds4_session *s) {
                         s->qwen4_spec_cycles, s->qwen4_spec_accepted,
                         100.0 * (double)s->qwen4_spec_accepted / (double)s->qwen4_spec_cycles);
             }
+            if (s->engine && s->engine->glm_mtp_timing && s->qwen4_lk_cycles) {
+                fprintf(stderr, "ds4: Qwen3.8 mtp: %" PRIu64 " cycles drafted by prompt lookup, %.2f drafts committed per cycle\n",
+                        s->qwen4_lk_cycles, (double)s->qwen4_lk_tokens / (double)s->qwen4_lk_cycles);
+            }
             free(s->qwen4_verify_logits);
+            qwen4_lk_free(&s->qwen4_lk);
             if (s->qwen4_slot >= 0 && s->engine) {
                 s->engine->qwen4_pool_used &= ~(UINT64_C(1) << s->qwen4_slot);
             }
@@ -34458,15 +34589,39 @@ static bool qwen4_spec_force_accept(void) {
     return getenv("DS4_QWEN4_SPEC_FORCE_ACCEPT") != NULL;
 }
 
+/* DS4_QWEN4_MTP_LOOKUP=0 leaves every draft to the predictor. */
+static bool qwen4_lookup_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_QWEN4_MTP_LOOKUP");
+        on = !(v && !strcmp(v, "0"));
+    }
+    return on != 0;
+}
+
 /* Draft the token after the last of `next`, the T tokens that follow the
- * first T rows of the last forward, at idx; depth 3 chains a second draft. */
+ * first T rows of the last forward, at idx; depth 3 chains a second draft.
+ * The predictor always catches up and drafts, so its state stays current
+ * through cycles a prompt lookup drafts; a healthy two-token lookup only
+ * spares its chained step. */
 static void qwen4_session_drafts(ds4_session *s, const int *next, uint32_t T, uint32_t idx, int depth) {
-    int draft = -1, draft2 = -1;
+    int draft = -1, draft2 = -1, lk[2] = {-1, -1}, lk2 = -1;
     s->glm_mtp_have = 0;
     s->glm_mtp_have2 = false;
+    /* the committed tokens end where the predictor's rows end; next[T - 1] is
+     * the token the coming cycle opens with */
+    const uint32_t n_lk = qwen4_lookup_enabled() && (uint32_t)s->checkpoint.len == idx + T
+        ? qwen4_lk_match(&s->qwen4_lk, s->qwen4_graph.ctx_cap, s->checkpoint.v, idx + T, next[T - 1u], 2u, lk)
+        : 0u;
+    const bool lk_deep = n_lk == 2u && qwen4_window_hits(s->qwen4_lk_window) >= QWEN4_LK_HEALTHY;
     if (qwen4_graph_mtp_steps(&s->qwen4_graph, &s->engine->model, &s->engine->weights, 0, next, T, idx,
-                              true, NULL, &draft, depth == 3 ? &draft2 : NULL)) {
-        s->glm_mtp_draft = draft;
+                              true, NULL, &draft, depth == 3 && !lk_deep ? &draft2 : NULL)) {
+        s->qwen4_draft_pred = draft;
+        s->qwen4_draft_lk = n_lk ? lk[0] : -1;
+        s->glm_mtp_draft = qwen4_lk_choose(draft, lk, n_lk, s->qwen4_lk_window, s->qwen4_depth_window, &lk2);
+        s->qwen4_draft2_lk = lk2 >= 0;
+        if (lk2 >= 0) draft2 = lk2;
+        else if (s->glm_mtp_draft != draft) draft2 = -1;   /* the chain continued the predictor's own draft */
         s->glm_mtp_parent = next[T - 1u];
         s->glm_mtp_have = 1;
         s->glm_mtp_draft2 = draft2;
@@ -34561,11 +34716,14 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     const bool exact = exact_sampling && temperature > 0.0f;
     const int depth = getenv("DS4_QWEN4_NO_MTP_BATCH") != NULL ? 2 : qwen4_spec_depth(s);
     if (s->glm_mtp_have && first_token != s->glm_mtp_parent) s->glm_mtp_have = 0;
-    if (depth == 3 && s->glm_mtp_have && s->glm_mtp_have2 && !g->snap2_ple_hist &&
+    /* a looked-up second draft is verified at either depth: the depth policy
+     * judges the predictor's chained draft only */
+    const bool depth3 = depth == 3 || s->qwen4_draft2_lk;
+    if (depth3 && s->glm_mtp_have && s->glm_mtp_have2 && !g->snap2_ple_hist &&
         accepted_cap >= 3 && pos + 3u <= g->ctx_cap && g->cap_tokens >= 3u) {
         (void)qwen4_graph_ensure_snap2(g);
     }
-    const bool deep = depth == 3 && s->glm_mtp_have && s->glm_mtp_have2 &&
+    const bool deep = depth3 && s->glm_mtp_have && s->glm_mtp_have2 &&
         accepted_cap >= 3 && pos + 3u <= g->ctx_cap && g->cap_tokens >= 3u &&
         g->mtp_R && g->snap2_ple_hist != NULL;
     if (!s->glm_mtp_have || accepted_cap < 2 || pos + 2u > g->ctx_cap ||
@@ -34625,7 +34783,8 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     token_vec_push(&s->checkpoint, first_token);
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
-    bool accept = sample_argmax(rows, V) == d || qwen4_spec_force_accept();
+    const int target = sample_argmax(rows, V);
+    bool accept = target == d || qwen4_spec_force_accept();
     bool accept2 = false;
     if (deep) {
         accept2 = accept && (sample_argmax(rows + V, V) == d2 || qwen4_spec_force_accept());
@@ -34658,14 +34817,28 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
             }
         }
     }
-    qwen4_spec_note_first_draft(s, accept);
-    if (deep) {
+    /* Each source is scored on its own first draft: by this verify's verdict
+     * when it drafted the row, by the row's argmax otherwise. */
+    const bool lk_first = s->qwen4_draft_lk >= 0 && d == s->qwen4_draft_lk;
+    const bool lk_second = deep && s->qwen4_draft2_lk;
+    qwen4_spec_note_first_draft(s, d == s->qwen4_draft_pred ? accept : target == s->qwen4_draft_pred);
+    if (s->qwen4_draft_lk >= 0) {
+        /* a looked-up second draft that missed counts against the lookup too */
+        const bool hit = lk_first ? accept && (!lk_second || accept2) : target == s->qwen4_draft_lk;
+        s->qwen4_lk_window = (s->qwen4_lk_window << 1u) | (hit ? 1u : 0u);
+    }
+    if (deep && !lk_second) {
         if (accept2) s->qwen4_reject2_streak = 0u;
         else if (accept) s->qwen4_reject2_streak++;
     }
+    if (lk_second || (lk_first && d != s->qwen4_draft_pred)) {
+        s->qwen4_lk_cycles++;
+        s->qwen4_lk_tokens += (accept ? 1u : 0u) + (accept2 ? 1u : 0u);
+    }
     if (qwen4_spec_trace()) {
-        fprintf(stderr, "ds4: spec pos %u token %d draft %d %s%s\n", pos, first_token, d,
-                accept ? "accept" : "reject", deep ? (accept2 ? " +accept2" : " +reject2") : "");
+        fprintf(stderr, "ds4: spec pos %u token %d draft %d %s%s%s\n", pos, first_token, d,
+                accept ? "accept" : "reject", deep ? (accept2 ? " +accept2" : " +reject2") : "",
+                lk_second ? " lookup2" : lk_first && d != s->qwen4_draft_pred ? " lookup" : "");
     }
     if (accept && (!deep || accept2)) {
         token_vec_push(&s->checkpoint, d);
@@ -37681,6 +37854,9 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
                 s->glm_mtp_draft = drafts[i];
                 s->glm_mtp_parent = parents[i];
                 s->glm_mtp_have = 1;
+                s->qwen4_draft_pred = drafts[i];
+                s->qwen4_draft_lk = -1;
+                s->qwen4_draft2_lk = false;
             }
         }
         /* a steady cycle, verifying drafts and making the next, or plain

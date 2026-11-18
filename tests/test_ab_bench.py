@@ -204,6 +204,11 @@ class SectionsTest(unittest.TestCase):
             self.assertEqual(cm.exception.code, 1)
             self.assertIn(named, str(cm.exception))
 
+    def test_copy_kind_runs_only_on_request(self):
+        self.assertEqual(ab.parse_args(["--a", ".", "--b", "."]).kinds, ["plain", "mtp-code", "mtp-prose"])
+        self.assertEqual(ab.parse_args(["--a", ".", "--b", ".", "--kinds", "mtp-copy"]).kinds, ["mtp-copy"])
+        self.assertTrue((ab.ROOT / ab.KINDS["mtp-copy"]["prompt"]).is_file())
+
     def test_unknown_group_refused_and_plain_default(self):
         with self.assertRaises(ab.Stop) as cm:
             ab.parse_args(["--a", ".", "--b", ".", "--sections", "moe_mid,nope"])

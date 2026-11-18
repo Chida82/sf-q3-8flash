@@ -49,13 +49,20 @@ One invocation:
    median GPU frequency: an external disturbance. The thermal state never drops
    a run.
 
-Kinds (`--kinds`, default all three):
+Kinds (`--kinds`, default the first three; `mtp-copy` runs only when named):
 
 | Kind | Prompt | Frontiers | Tokens | Metrics |
 |---|---|---|---|---|
 | `plain` | `promessi_sposi.txt` | 8192, 8704, 10752 | 64 per frontier | prefill 8192 from empty, +512 and +2048 resumed; pooled decode |
 | `mtp-code` | `rax.c` | 2048 | 128 | MTP decode, tokens per cycle, prefill with `--mtp`, cycle ms by tokens committed |
 | `mtp-prose` | `promessi_sposi.txt` | 2048 | 128 | as `mtp-code` |
+| `mtp-copy` | `copy_edit.txt` | 2048 | 128 | as `mtp-code`; no record cell |
+
+`copy_edit.txt` is an edit in plain text: 144 lines of `rax.c`, a request to
+rename two variables, and the edited file. The frontier falls inside the
+edited copy, so the model goes on copying with the renames applied. It is the
+workload where prompt-lookup drafts act, and where their absence elsewhere is
+checked against.
 
 `--env KEY=VALUE` sets a variable for both builds (inherited `DS4_*` variables
 are dropped), for example `--env DS4_QWEN4_MTP_DEPTH=3` to force the MTP depth.
@@ -122,3 +129,16 @@ Two references, two tools:
 
 The summary ends with a row for [perf-record.md](perf-record.md), which keeps
 where the performance work started and where it has got to.
+
+## Prompt-lookup oracle
+
+`lookup_oracle.py VOCAB.txt [--kv DIR]... [--ids FILE]...` counts, on recorded
+conversations and without a model, how often the tokens that followed the
+last earlier occurrence of the current suffix are the tokens the model
+produced: per kind of assistant turn (file edits, tool calls, prose), per
+suffix length 2 to 8, with the run-length histogram. It reads conversations
+as token-id lines, or the token lists of server disk-KV checkpoints (read
+only; it prints counts, never content). `VOCAB.txt` is the export of
+`tests/test_tokenizer --export-vocab`. `--self-test` needs neither. It sized
+the prompt-lookup drafts of `docs/SPECULATIVE_DECODING.md`, on chat turns and
+a synthetic tool loop; real edit transcripts have not been measured.

@@ -1,0 +1,295 @@
+The file rax_remove.c before the change:
+
+raxNode **raxFindParentLink(raxNode *parent, raxNode *child) {
+    raxNode **cp = raxNodeFirstChildPtr(parent);
+    raxNode *c;
+    while(1) {
+        memcpy(&c,cp,sizeof(c));
+        if (c == child) break;
+        cp++;
+    }
+    return cp;
+}
+
+/* Low level child removal from node. 'childptr' must point to the child
+ * pointer stored inside the parent node, and is used directly instead of
+ * searching by child value. The new node pointer (after the child
+ * removal) is returned. Note that this function does not fix the pointer
+ * of the parent node in its parent, so this task is up to the caller.
+ * The function never fails for out of memory. */
+static inline raxNode *raxRemoveChildAtPtr(raxNode *parent, raxNode **childptr) {
+    debugnode("raxRemoveChild before", parent);
+    /* If parent is a compressed node (having a single child, as for definition
+     * of the data structure), the removal of the child consists into turning
+     * it into a normal node without children. */
+    if (parent->iscompr) {
+        void *data = NULL;
+        if (parent->iskey) data = raxGetData(parent);
+        parent->isnull = 0;
+        parent->iscompr = 0;
+        parent->size = 0;
+        parent->leafbitmap = 0;
+        if (parent->iskey) raxSetData(parent,data);
+        debugnode("raxRemoveChild after", parent);
+        return parent;
+    }
+
+    /* Otherwise we need to scan for the child pointer and memmove()
+     * accordingly.
+     *
+     * 1. To start we seek the first element in both the children
+     *    pointers and edge bytes in the node. */
+    raxNode **cp = raxNodeFirstChildPtr(parent);
+    raxNode **c = childptr;
+    unsigned char *e = parent->data + (c - cp);
+
+    /* 3. Remove the edge and the pointer by memmoving the remaining children
+     *    pointer and edge bytes one position before. */
+    int taillen = parent->size - (e - parent->data) - 1;
+    debugf("raxRemoveChild tail len: %d\n", taillen);
+    memmove(e,e+1,taillen);
+
+    /* Compute the shift, that is the amount of bytes we should move our
+     * child pointers to the left, since the removal of one edge character
+     * and the corresponding padding change, may change the layout.
+     * We just check if in the old version of the node there was at the
+     * end just a single byte and all padding: in that case removing one char
+     * will remove a whole sizeof(void*) word. */
+    size_t shift = ((parent->size+4) % sizeof(void*)) == 1 ? sizeof(void*) : 0;
+
+    /* Move the children pointers before the deletion point. */
+    if (shift)
+        memmove(((char*)cp)-shift,cp,(parent->size-taillen-1)*sizeof(raxNode**));
+
+    /* Move the remaining "tail" pointers at the right position as well. */
+    size_t valuelen = (parent->iskey && !parent->isnull) ? sizeof(void*) : 0;
+    memmove(((char*)c)-shift,c+1,taillen*sizeof(raxNode**)+valuelen);
+
+    /* 4. Update size and shift the leaf bitmap accordingly. Bits above
+     *    the removed position shift down by one. */
+    int pos = (int)(e - parent->data);
+    parent->size--;
+    if (parent->leafbitmap && pos < 13) {
+        uint16_t above = parent->leafbitmap & ~((1u << (pos+1)) - 1);
+        uint16_t below = pos ? (parent->leafbitmap & ((1u << pos) - 1)) : 0;
+        parent->leafbitmap = below | (above >> 1);
+    }
+
+    /* We don't realloc the node to its new size: the node is already
+     * consistent with the updated size, and shrinking reallocs rarely
+     * release memory due to allocator bucketing. Skipping the realloc
+     * avoids the overhead of a system call that almost never helps. */
+    debugnode("raxRemoveChild after", parent);
+    return parent;
+}
+
+/* Low level child removal from node. The new node pointer (after the child
+ * removal) is returned. Note that this function does not fix the pointer
+ * of the parent node in its parent, so this task is up to the caller.
+ * The function never fails for out of memory. */
+raxNode *raxRemoveChild(raxNode *parent, raxNode *child) {
+    raxNode **cp = raxNodeFirstChildPtr(parent);
+    while(1) {
+        raxNode *aux;
+        memcpy(&aux,cp,sizeof(aux));
+        if (aux == child) break;
+        cp++;
+    }
+    return raxRemoveChildAtPtr(parent,cp);
+}
+
+/* Free the useless node 'h' that was left after a deletion, and keep moving
+ * upward while the parent would also become a non-key single-child node.
+ * The returned node is the first one that remains in the tree and may
+ * require recompression. */
+static inline raxNode *raxRemoveCleanup(rax *rax, raxNode *h, raxStack *ts,
+                                        int *trycompress)
+{
+    raxNode *child = NULL;
+
+    while(h != rax->head) {
+        child = h;
+        debugf("Freeing child %p [%.*s] key:%d\n", (void*)child,
+            (int)child->size, (char*)child->data, child->iskey);
+        rax_free(child);
+        rax->numnodes--;
+        h = raxStackPop(ts);
+         /* If this node has more then one child, or actually holds
+          * a key, stop here. */
+        if (h->iskey || (!h->iscompr && h->size != 1)) break;
+    }
+    if (child) {
+        debugf("Unlinking child %p from parent %p\n",
+            (void*)child, (void*)h);
+        raxNode *new = raxRemoveChild(h,child);
+        if (new != h) {
+            raxNode *parent = raxStackPeek(ts);
+            raxNode **parentlink;
+            if (parent == NULL) {
+                parentlink = &rax->head;
+            } else {
+                parentlink = raxFindParentLink(parent,h);
+            }
+            memcpy(parentlink,&new,sizeof(new));
+        }
+
+        /* If after the removal the node has just a single child
+         * and is not a key, we need to try to compress it. */
+        if (new->size == 1 && new->iskey == 0) {
+            *trycompress = 1;
+            h = new;
+        }
+    }
+    return h;
+}
+
+/* Remove the specified item. Returns 1 if the item was found and
+
+Change requested: rename the local variable `taillen` to `tail_len` and the child-pointer cursor `cp` to `children`, wherever they appear. Leave everything else as it is.
+
+The complete file rax_remove.c after the change:
+
+raxNode **raxFindParentLink(raxNode *parent, raxNode *child) {
+    raxNode **children = raxNodeFirstChildPtr(parent);
+    raxNode *c;
+    while(1) {
+        memcpy(&c,children,sizeof(c));
+        if (c == child) break;
+        children++;
+    }
+    return children;
+}
+
+/* Low level child removal from node. 'childptr' must point to the child
+ * pointer stored inside the parent node, and is used directly instead of
+ * searching by child value. The new node pointer (after the child
+ * removal) is returned. Note that this function does not fix the pointer
+ * of the parent node in its parent, so this task is up to the caller.
+ * The function never fails for out of memory. */
+static inline raxNode *raxRemoveChildAtPtr(raxNode *parent, raxNode **childptr) {
+    debugnode("raxRemoveChild before", parent);
+    /* If parent is a compressed node (having a single child, as for definition
+     * of the data structure), the removal of the child consists into turning
+     * it into a normal node without children. */
+    if (parent->iscompr) {
+        void *data = NULL;
+        if (parent->iskey) data = raxGetData(parent);
+        parent->isnull = 0;
+        parent->iscompr = 0;
+        parent->size = 0;
+        parent->leafbitmap = 0;
+        if (parent->iskey) raxSetData(parent,data);
+        debugnode("raxRemoveChild after", parent);
+        return parent;
+    }
+
+    /* Otherwise we need to scan for the child pointer and memmove()
+     * accordingly.
+     *
+     * 1. To start we seek the first element in both the children
+     *    pointers and edge bytes in the node. */
+    raxNode **children = raxNodeFirstChildPtr(parent);
+    raxNode **c = childptr;
+    unsigned char *e = parent->data + (c - children);
+
+    /* 3. Remove the edge and the pointer by memmoving the remaining children
+     *    pointer and edge bytes one position before. */
+    int tail_len = parent->size - (e - parent->data) - 1;
+    debugf("raxRemoveChild tail len: %d\n", tail_len);
+    memmove(e,e+1,tail_len);
+
+    /* Compute the shift, that is the amount of bytes we should move our
+     * child pointers to the left, since the removal of one edge character
+     * and the corresponding padding change, may change the layout.
+     * We just check if in the old version of the node there was at the
+     * end just a single byte and all padding: in that case removing one char
+     * will remove a whole sizeof(void*) word. */
+    size_t shift = ((parent->size+4) % sizeof(void*)) == 1 ? sizeof(void*) : 0;
+
+    /* Move the children pointers before the deletion point. */
+    if (shift)
+        memmove(((char*)children)-shift,children,(parent->size-tail_len-1)*sizeof(raxNode**));
+
+    /* Move the remaining "tail" pointers at the right position as well. */
+    size_t valuelen = (parent->iskey && !parent->isnull) ? sizeof(void*) : 0;
+    memmove(((char*)c)-shift,c+1,tail_len*sizeof(raxNode**)+valuelen);
+
+    /* 4. Update size and shift the leaf bitmap accordingly. Bits above
+     *    the removed position shift down by one. */
+    int pos = (int)(e - parent->data);
+    parent->size--;
+    if (parent->leafbitmap && pos < 13) {
+        uint16_t above = parent->leafbitmap & ~((1u << (pos+1)) - 1);
+        uint16_t below = pos ? (parent->leafbitmap & ((1u << pos) - 1)) : 0;
+        parent->leafbitmap = below | (above >> 1);
+    }
+
+    /* We don't realloc the node to its new size: the node is already
+     * consistent with the updated size, and shrinking reallocs rarely
+     * release memory due to allocator bucketing. Skipping the realloc
+     * avoids the overhead of a system call that almost never helps. */
+    debugnode("raxRemoveChild after", parent);
+    return parent;
+}
+
+/* Low level child removal from node. The new node pointer (after the child
+ * removal) is returned. Note that this function does not fix the pointer
+ * of the parent node in its parent, so this task is up to the caller.
+ * The function never fails for out of memory. */
+raxNode *raxRemoveChild(raxNode *parent, raxNode *child) {
+    raxNode **children = raxNodeFirstChildPtr(parent);
+    while(1) {
+        raxNode *aux;
+        memcpy(&aux,children,sizeof(aux));
+        if (aux == child) break;
+        children++;
+    }
+    return raxRemoveChildAtPtr(parent,children);
+}
+
+/* Free the useless node 'h' that was left after a deletion, and keep moving
+ * upward while the parent would also become a non-key single-child node.
+ * The returned node is the first one that remains in the tree and may
+ * require recompression. */
+static inline raxNode *raxRemoveCleanup(rax *rax, raxNode *h, raxStack *ts,
+                                        int *trycompress)
+{
+    raxNode *child = NULL;
+
+    while(h != rax->head) {
+        child = h;
+        debugf("Freeing child %p [%.*s] key:%d\n", (void*)child,
+            (int)child->size, (char*)child->data, child->iskey);
+        rax_free(child);
+        rax->numnodes--;
+        h = raxStackPop(ts);
+         /* If this node has more then one child, or actually holds
+          * a key, stop here. */
+        if (h->iskey || (!h->iscompr && h->size != 1)) break;
+    }
+    if (child) {
+        debugf("Unlinking child %p from parent %p\n",
+            (void*)child, (void*)h);
+        raxNode *new = raxRemoveChild(h,child);
+        if (new != h) {
+            raxNode *parent = raxStackPeek(ts);
+            raxNode **parentlink;
+            if (parent == NULL) {
+                parentlink = &rax->head;
+            } else {
+                parentlink = raxFindParentLink(parent,h);
+            }
+            memcpy(parentlink,&new,sizeof(new));
+        }
+
+        /* If after the removal the node has just a single child
+         * and is not a key, we need to try to compress it. */
+        if (new->size == 1 && new->iskey == 0) {
+            *trycompress = 1;
+            h = new;
+        }
+    }
+    return h;
+}
+
+/* Remove the specified item. Returns 1 if the item was found and

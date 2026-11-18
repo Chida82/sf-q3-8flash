@@ -38,7 +38,11 @@ KINDS = {
     'plain': {'prompt': 'speed-bench/promessi_sposi.txt', 'frontiers': (8192, 8704, 10752), 'gen': 64, 'mtp': False},
     'mtp-code': {'prompt': 'rax.c', 'frontiers': (2048,), 'gen': 128, 'mtp': True},
     'mtp-prose': {'prompt': 'speed-bench/promessi_sposi.txt', 'frontiers': (2048,), 'gen': 128, 'mtp': True},
+    # an edit that repeats most of a file from the prompt; runs only when --kinds names it
+    'mtp-copy': {'prompt': 'speed-bench/copy_edit.txt', 'frontiers': (2048,), 'gen': 128, 'mtp': True,
+                 'on_request': True},
 }
+DEFAULT_KINDS = [k for k in KINDS if not KINDS[k].get('on_request')]
 # Headline metrics: they carry the verdict, decide "inconclusive" and fill the record row.
 # The per-cycle times (k1..k3 ms) are reported as detail only.
 RECORD = [('plain', 'decode'), ('plain', 'prefill 8192'), ('plain', 'prefill +512'),
@@ -642,7 +646,7 @@ def parse_args(argv):
     p.add_argument('--a', required=True, help='baseline build tree')
     p.add_argument('--b', required=True, help='candidate build tree (may equal --a for an A/A run)')
     p.add_argument('-m', '--model', default=str(ROOT / 'qwen3.8-flash-next.gguf'))
-    p.add_argument('--kinds', help=f'comma list of {", ".join(KINDS)} (default all; plain with --sections)')
+    p.add_argument('--kinds', help=f'comma list of {", ".join(KINDS)} (default {", ".join(DEFAULT_KINDS)}; plain with --sections)')
     p.add_argument('--budget', type=int, default=480, help=f'wall-clock seconds, at most {MAX_BUDGET}')
     p.add_argument('--bitwise', action='store_true', help='also require bit-identical logits')
     p.add_argument('--env', action='append', default=[], metavar='KEY=VALUE', help='set for both builds')
@@ -669,7 +673,7 @@ def parse_args(argv):
             raise Stop(2, f'--sections {g}: not a profiler group; choose from {", ".join(GROUPS)}')
     if args.sections and set(args.sections) == set(GROUPS):
         raise Stop(2, '--sections: leave at least one group untouched to normalize by')
-    kinds = args.kinds or ('plain' if args.sections else ','.join(KINDS))
+    kinds = args.kinds or ('plain' if args.sections else ','.join(DEFAULT_KINDS))
     args.kinds = [k for k in kinds.split(',') if k]
     if not args.kinds or any(k not in KINDS for k in args.kinds):
         raise Stop(2, f'--kinds {",".join(args.kinds)}: choose from {", ".join(KINDS)}')
