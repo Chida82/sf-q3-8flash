@@ -95,20 +95,30 @@ static void streaming_staging(void) {
     const uint64_t trunk = UINT64_C(1489920) * 512u;
     const uint64_t predictor = UINT64_C(2713600) * 512u;
     uint64_t bytes = 0;
-    assert(qwen4_streaming_staging_bytes(&w, true, &bytes));
+    assert(qwen4_streaming_staging_bytes(&w, true, false, &bytes));
     assert(bytes == 2u * trunk && bytes == UINT64_C(1525678080));
     assert(bytes >= predictor);  /* even no-address full-layer fallback fits */
     assert(2u * predictor - bytes == UINT64_C(1253048320));
-    assert(qwen4_streaming_staging_bytes(&w, false, &bytes) && bytes == 2u * trunk);
+    assert(qwen4_streaming_staging_bytes(&w, false, false, &bytes) && bytes == 2u * trunk);
+    /* A cache that holds a layer's experts: the trunk needs no window, the
+     * off-size predictor keeps its own (Q2); a uniform pack (Q4) keeps none. */
+    assert(qwen4_streaming_staging_bytes(&w, true, true, &bytes) && bytes == predictor);
+    assert(qwen4_streaming_staging_bytes(&w, false, true, &bytes) && bytes == 0);
+    w.layer[48].ffn_gate_exps = w.layer[48].ffn_up_exps = &gate;
+    w.layer[48].ffn_down_exps = &down;
+    assert(qwen4_streaming_staging_bytes(&w, true, true, &bytes) && bytes == 0);
+    assert(qwen4_streaming_staging_bytes(&w, true, false, &bytes) && bytes == 2u * trunk);
+    w.layer[48].ffn_gate_exps = w.layer[48].ffn_up_exps = &mtp_gate;
+    w.layer[48].ffn_down_exps = &mtp_down;
 
     /* Disabled MTP must not inspect absent predictor tensors. A main-only
      * file has the same reserve with no predictor layer in its shape. */
     w.layer[48].ffn_down_exps = NULL;
-    assert(qwen4_streaming_staging_bytes(&w, false, &bytes) && bytes == 2u * trunk);
-    assert(!qwen4_streaming_staging_bytes(&w, true, &bytes) && bytes == 0);
+    assert(qwen4_streaming_staging_bytes(&w, false, false, &bytes) && bytes == 2u * trunk);
+    assert(!qwen4_streaming_staging_bytes(&w, true, false, &bytes) && bytes == 0);
     g_ds4_shape.n_layer = 48;
     g_ds4_shape.n_nextn_predict = 0;
-    assert(qwen4_streaming_staging_bytes(&w, true, &bytes) && bytes == 2u * trunk);
+    assert(qwen4_streaming_staging_bytes(&w, true, false, &bytes) && bytes == 2u * trunk);
     g_ds4_shape = DS4_SHAPE_QWEN4_EXP;
     w.layer[48].ffn_down_exps = &mtp_down;
 
@@ -116,8 +126,8 @@ static void streaming_staging(void) {
      * dominate. It remains reserved even though normal MTP selects only ten. */
     mtp_gate.dim[1] *= 2u;
     mtp_down.dim[1] *= 2u;
-    assert(qwen4_streaming_staging_bytes(&w, true, &bytes) && bytes == 2u * predictor);
-    assert(qwen4_streaming_staging_bytes(&w, false, &bytes) && bytes == 2u * trunk);
+    assert(qwen4_streaming_staging_bytes(&w, true, false, &bytes) && bytes == 2u * predictor);
+    assert(qwen4_streaming_staging_bytes(&w, false, false, &bytes) && bytes == 2u * trunk);
     mtp_gate.dim[1] /= 2u;
     mtp_down.dim[1] /= 2u;
 
@@ -125,11 +135,11 @@ static void streaming_staging(void) {
      * include all three address tables for both in-flight lifetimes. */
     g_ds4_shape.n_expert = 16;
     g_ds4_shape.n_expert_used = 10;
-    assert(qwen4_streaming_staging_bytes(&w, true, &bytes));
+    assert(qwen4_streaming_staging_bytes(&w, true, false, &bytes));
     assert(bytes == 2u * (UINT64_C(2713600) * 10u + 3u * 16u * sizeof(uint64_t)));
     assert(bytes > UINT64_C(2713600) * 16u);
     g_ds4_shape.n_expert_used = 17;
-    assert(!qwen4_streaming_staging_bytes(&w, true, &bytes) && bytes == 0);
+    assert(!qwen4_streaming_staging_bytes(&w, true, false, &bytes) && bytes == 0);
     g_ds4_shape = DS4_SHAPE_QWEN4_EXP;
 
     /* Saturated totals cannot wrap into a small admissible cache reserve;
@@ -137,11 +147,11 @@ static void streaming_staging(void) {
     ds4_tensor huge = { .type = DS4_TENSOR_Q8_0, .ndim = 3,
                        .dim = {32, UINT64_MAX / 102u, 512} };
     w.layer[0].ffn_gate_exps = w.layer[0].ffn_up_exps = w.layer[0].ffn_down_exps = &huge;
-    assert(qwen4_streaming_staging_bytes(&w, true, &bytes) && bytes == UINT64_MAX);
+    assert(qwen4_streaming_staging_bytes(&w, true, false, &bytes) && bytes == UINT64_MAX);
     huge.dim[1] = UINT64_MAX;
-    assert(!qwen4_streaming_staging_bytes(&w, true, &bytes) && bytes == 0);
-    assert(!qwen4_streaming_staging_bytes(NULL, true, &bytes) && bytes == 0);
-    assert(!qwen4_streaming_staging_bytes(&w, true, NULL));
+    assert(!qwen4_streaming_staging_bytes(&w, true, false, &bytes) && bytes == 0);
+    assert(!qwen4_streaming_staging_bytes(NULL, true, false, &bytes) && bytes == 0);
+    assert(!qwen4_streaming_staging_bytes(&w, true, false, NULL));
     g_ds4_shape = saved;
 }
 

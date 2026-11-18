@@ -43,6 +43,12 @@ has a pooled CI above zero and no metric's CI lies wholly below zero;
 confirmed at 48 and 60 GiB. The planned total and the peak footprint are
 recorded on both sides: the planned total must not grow.
 
+**Owner's rule (2026-11-18):** a cost paid only at process start, such as the
+slab locking of a larger cache during the first prefill of a fresh process,
+does not drop a change; a loss in later prefills or in decode still does.
+Here the first 8192-token prefill loses about 0.9% (the same at the larger
+slot count on `main`) while the appends after it gain 6-11%.
+
 ## Risks / Trade-offs
 
 - A future caller that streams a layer of another size on Q4 would find no

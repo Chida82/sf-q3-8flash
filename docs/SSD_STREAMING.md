@@ -21,11 +21,17 @@ At engine open the budget is the smaller of 87.5% of physical RAM and Metal's
 recommended working set. From it the engine reserves:
 - the mapped static weights;
 - the graph for the context and prefill chunk;
-- the staging windows: two full trunk layers, or two compact predictor
-  payloads with MTP;
+- staging windows for the calls the cache cannot take: a layer whose experts
+  have another size (Q2's MTP layer: one full predictor layer), and, when
+  the cache left would hold fewer experts than one layer has (512), two full
+  trunk layers;
 - another 2 GiB for the runtime.
 
-What is left becomes the expert cache, capped at every routed expert. If the
+What is left becomes the expert cache, capped at every routed expert. The
+plan line names which staging case applied. On Q4 at the footprints of
+"Capped RAM" no call takes the owned path, so no staging is planned and the
+same footprint holds 1,024 more experts (2.59 GiB); on Q2 with MTP the
+reserve falls from 1.42 to 1.29 GiB (change `193`). If the
 fixed part does not fit, the engine refuses to open and names both figures:
 
 ```
@@ -120,18 +126,19 @@ The same runs with buffered reads, the GGUF's pages evicted before each run,
 give the RAM-free figures. They are reported and decide nothing.
 
 Footprint is the engine's planned total at the service's configuration
-(`--ctx 262144 --mtp`, the 0.57 GiB vision projector added): 28.92 GiB before
+(`--ctx 262144 --mtp`, the 0.57 GiB vision projector added): 26.33 GiB before
 the cache on Q4, of which the KV and graph buffers of the 262144-token
 context are 20.01. A process at 2048 tokens of that context peaks about
-12 GiB under the plan.
+12 GiB under the plan. Until change `193` the plan also reserved 2.59 GiB of
+staging, and the table below was measured at those smaller caches.
 
-| Footprint | Cache slots | Expert cache | Share of Q4's routed experts |
-|---|---|---|---|
-| 48 GiB | 7,326 | 18.5 GiB | 30% |
-| 54 GiB (development) | 9,701 | 24.5 GiB | 39% |
-| 60 GiB | 12,076 | 30.5 GiB | 49% |
+| Footprint | Cache slots | Expert cache | Share of Q4's routed experts | Slots before `193` |
+|---|---|---|---|---|
+| 48 GiB | 8,350 | 21.1 GiB | 34% | 7,326 |
+| 54 GiB (development) | 10,725 | 27.1 GiB | 44% | 9,701 |
+| 60 GiB | 13,100 | 33.1 GiB | 53% | 12,076 |
 
-Q4, 3 runs per cell, medians (the runs of a cell agree within 1% with the
+Q4, at the slots before `193`, 3 runs per cell, medians (the runs of a cell agree within 1% with the
 RAM taken). Misses and miss layers (layer calls that miss at least one
 expert) per generated token come from one counted run per cell; all-cached
 is the share of layer calls over the second half of the run that found every
@@ -274,8 +281,8 @@ prefill by 8-31% (each run started with the pack's pages dropped from the
 page cache; change `185`).
 
 Minimum RAM follows from the fixed part of the plan: 6.32 GiB static weights,
-the graph for the context, 1.4 (Q2) or 2.6 GiB (Q4) of staging, and 2 GiB of
-runtime headroom. At a 2K context this is about 12-13 GiB, so a 24 GB Mac,
+the graph for the context, 1.4 (Q2) or 2.6 GiB (Q4) of staging while the
+cache is smaller than a layer, and 2 GiB of runtime headroom. At a 2K context this is about 12-13 GiB, so a 24 GB Mac,
 whose Metal recommendation is about 16 GiB, has room for a small cache. This
 is derived from the plan, not measured on such a machine.
 

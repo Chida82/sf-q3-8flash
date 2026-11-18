@@ -32579,7 +32579,10 @@ static bool engine_warm_full_model(const ds4_engine_options *opt) {
            opt->distributed.role == DS4_DISTRIBUTED_NONE;
 }
 
-/* Keep two full trunk windows for prefill. Predictor prefix catch-up only
+/* Keep two full trunk windows for prefill, unless cache_holds_layer: then a
+ * layer of the trunk's expert size never takes the owned path (a call selects
+ * at most every expert of a layer, and the cache holds them), and only layers
+ * of another size keep a window. Predictor prefix catch-up only
  * builds KV; draft and chain MoE consume one row (N_EXPERT_USED experts).
  * Compact staging also owns three full expert-ID address tables.
  *
@@ -32589,7 +32592,7 @@ static bool engine_warm_full_model(const ds4_engine_options *opt) {
  * the address fallback releases compact payloads before allocating the full
  * layer. Thus a full predictor fallback cannot overlap earlier staging. */
 static DS4_MAYBE_UNUSED bool qwen4_streaming_staging_bytes(
-        const ds4_weights *weights, bool mtp, uint64_t *bytes_out) {
+        const ds4_weights *weights, bool mtp, bool cache_holds_layer, uint64_t *bytes_out) {
     if (!bytes_out) return false;
     *bytes_out = 0;
     if (!weights || DS4_N_LAYER == 0 || DS4_N_LAYER > DS4_MAX_LAYER ||
@@ -32598,10 +32601,13 @@ static DS4_MAYBE_UNUSED bool qwen4_streaming_staging_bytes(
     const uint32_t trunk_layers = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     const uint32_t layers = mtp ? DS4_N_LAYER : trunk_layers;
     const uint64_t addresses = ds4_mul_sat_u64(DS4_N_EXPERT, 3u * sizeof(uint64_t));
-    uint64_t staging = 0;
+    uint64_t staging = 0, trunk_expert = 0;
     for (uint32_t il = 0; il < layers; il++) {
         uint64_t expert = 0;
         if (!streaming_layer_routed_expert_bytes(&weights->layer[il], &expert)) return false;
+        if (il == 0) trunk_expert = expert;
+        /* a layer of the trunk's size goes through a cache that holds all of its experts */
+        if (cache_holds_layer && expert == trunk_expert) continue;
         const uint64_t full = ds4_mul_sat_u64(expert, DS4_N_EXPERT);
         uint64_t window = ds4_mul_sat_u64(full, 2u);
         if (il >= trunk_layers) {
@@ -32673,37 +32679,48 @@ static bool qwen4_streaming_memory_admit(ds4_engine *e, uint64_t graph_bytes, bo
     }
     const uint64_t budget = qwen4_streaming_memory_budget(left,
         used ? (uint64_t)((double)recommended * ((double)left / (double)host)) : recommended);
-    uint64_t statics = 0, expert_bytes = 0, max_experts = 0, staging = 0;
+    uint64_t statics = 0, expert_bytes = 0, max_experts = 0, staging = 0, count = 0, requested = 0;
     if (!weights_streaming_non_routed_bytes(&e->weights, &statics) ||
         !ds4_streaming_routed_expert_bytes(&e->weights, &expert_bytes) ||
-        !ds4_streaming_cacheable_expert_count(&e->weights, &max_experts, NULL) ||
-        !qwen4_streaming_staging_bytes(&e->weights, e->glm_mtp, &staging)) return false;
-    const uint64_t fixed = ds4_add_sat_u64(ds4_add_sat_u64(statics, e->vision_model.size),
-        ds4_add_sat_u64(graph_bytes, ds4_add_sat_u64(staging, 2u * gib)));
-    if (fixed >= budget || budget - fixed < expert_bytes) {
-        fprintf(stderr, "ds4: Qwen SSD needs %.2f GiB before the expert cache; safe budget %.2f GiB. "
-                        "Reduce context or prefill chunk.\n",
-                ds4_bytes_to_gib(fixed), ds4_bytes_to_gib(budget));
-        return false;
-    }
-    uint64_t count = (budget - fixed) / expert_bytes;
-    if (count > max_experts) count = max_experts;
-    if (!fit_cache) {
-        if (e->ssd_streaming_cache_experts > count) {
-            fprintf(stderr, "ds4: no room for another Qwen SSD session; reduce context or expert cache\n");
+        !ds4_streaming_cacheable_expert_count(&e->weights, &max_experts, NULL)) return false;
+    /* Staging serves only the calls the cache cannot take: a layer of another
+     * expert size, or a selection larger than the cache. Plan without the
+     * trunk's windows first, and keep them when the cache that leaves cannot
+     * hold every expert of one layer. A later session is checked against the
+     * reserve its engine planned. */
+    bool trunk_staged = !fit_cache && e->ssd_streaming_cache_experts < DS4_N_EXPERT;
+    for (;;) {
+        if (!qwen4_streaming_staging_bytes(&e->weights, e->glm_mtp, !trunk_staged, &staging)) return false;
+        const uint64_t fixed = ds4_add_sat_u64(ds4_add_sat_u64(statics, e->vision_model.size),
+            ds4_add_sat_u64(graph_bytes, ds4_add_sat_u64(staging, 2u * gib)));
+        if (fixed >= budget || budget - fixed < expert_bytes) {
+            fprintf(stderr, "ds4: Qwen SSD needs %.2f GiB before the expert cache; safe budget %.2f GiB. "
+                            "Reduce context or prefill chunk.\n",
+                    ds4_bytes_to_gib(fixed), ds4_bytes_to_gib(budget));
             return false;
         }
-        return true;
-    }
-    uint64_t requested = e->ssd_streaming_cache_experts;
-    if (e->ssd_streaming_cache_bytes) {
-        if (e->ssd_streaming_cache_bytes <= staging ||
-            e->ssd_streaming_cache_bytes - staging < expert_bytes) {
-            fprintf(stderr, "ds4: Qwen SSD cache target must exceed %.2f GiB for prefill staging\n",
-                    ds4_bytes_to_gib(staging + expert_bytes));
-            return false;
+        count = (budget - fixed) / expert_bytes;
+        if (count > max_experts) count = max_experts;
+        if (!fit_cache) {
+            if (e->ssd_streaming_cache_experts > count) {
+                fprintf(stderr, "ds4: no room for another Qwen SSD session; reduce context or expert cache\n");
+                return false;
+            }
+            return true;
         }
-        requested = (e->ssd_streaming_cache_bytes - staging) / expert_bytes;
+        requested = e->ssd_streaming_cache_experts;
+        if (e->ssd_streaming_cache_bytes) {
+            if (e->ssd_streaming_cache_bytes <= staging ||
+                e->ssd_streaming_cache_bytes - staging < expert_bytes) {
+                fprintf(stderr, "ds4: Qwen SSD cache target must exceed %.2f GiB for prefill staging\n",
+                        ds4_bytes_to_gib(staging + expert_bytes));
+                return false;
+            }
+            requested = (e->ssd_streaming_cache_bytes - staging) / expert_bytes;
+        }
+        const uint64_t planned = requested && requested < count ? requested : count;
+        if (trunk_staged || planned >= DS4_N_EXPERT) break;
+        trunk_staged = true;
     }
     if (requested && requested < count) count = requested;
     if (requested > count) fprintf(stderr, "ds4: Qwen SSD cache capped from %llu to %llu experts\n",
@@ -32714,8 +32731,10 @@ static bool qwen4_streaming_memory_admit(ds4_engine *e, uint64_t graph_bytes, bo
     e->ssd_streaming_static_decode_map = true;
     e->ssd_streaming_decode_map_bytes = statics;
     fprintf(stderr, "ds4: Qwen SSD: %.2f GiB static weights, %.2f GiB graph reserve, "
-                    "%.2f GiB staging, %u cached experts (%.2f GiB)\n",
+                    "%.2f GiB staging (%s), %u cached experts (%.2f GiB)\n",
             ds4_bytes_to_gib(statics), ds4_bytes_to_gib(graph_bytes), ds4_bytes_to_gib(staging),
+            trunk_staged ? "trunk layers: the cache holds less than a layer" :
+                staging ? "off-size layers only" : "none: the cache holds a layer",
             e->ssd_streaming_cache_experts, ds4_bytes_to_gib(e->ssd_streaming_cache_bytes));
     return true;
 }
