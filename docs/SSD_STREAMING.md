@@ -45,6 +45,55 @@ owned buffers. Cached experts compute while the missing ones load: gate/up
 first, then down once its rows arrive, for decode, MTP verification and
 prefill.
 
+## Eviction order
+
+When the cache is full, a load takes the slot of another cached expert, of
+any layer; the experts routed for the layer being computed are never taken.
+The victim is the entry with the lowest route hotness (one count per
+selection, hit or miss, halved every 16 passes), then the least recently
+used.
+
+Decode and MTP verification put one rule ahead of that order: an expert used
+within the last full pass over the layers is not taken while an older entry
+exists. That covers this pass's layers and the previous pass's layers that
+this pass has not reached again. Hotness alone evicts an expert loaded for
+the current token, which has one selection, before one that was hot a while
+ago, and a layer often routes the same expert again one token later.
+
+At emulated 48 GB, against the hotness order alone (each run started with
+the pack's pages dropped from the page cache, tokens identical, bootstrap
+95% CI of the median pair ratio; change `188`):
+
+| Pack | Misses per decode token, of 480 (prose / code) | Plain decode | MTP decode, code / prose |
+|---|---|---|---|
+| Q2 | 120 -> 99 / 267 -> 226 | 30.4 -> 30.9 t/s, +1.6% [+1.4%, +2.0%] | -0.1% [-0.5%, +0.2%] / -0.1% [-0.3%, +0.3%] |
+| Q4 | 234 -> 181 / 349 -> 291 | 18.8 -> 19.5 t/s, +3.5% [+2.6%, +4.2%] | -0.2% [-1.3%, +0.8%] / +1.8% [+1.6%, +2.4%] |
+
+Prefill is unchanged (every prefill metric's interval includes zero). The
+gain is small beside the misses saved because a missed expert usually comes
+back from the page cache, not from the SSD (see below).
+
+The window is one pass and no more, on purpose. A longer one saves more
+misses where the cache is large, but it fills the cache with recent experts
+and evicts the hot ones, and a prefill that resumes after decode computes
+its cached experts while the rest load: with a window of eight tokens the
+next 512-token prefill lost 3.2% on Q2, with two tokens 1.3% on Q4. A
+prefill chunk itself evicts by hotness alone.
+
+Cache size against rate, with this order, on Q2 at emulated 48 GB (same
+protocol, 2200 slots against fewer with `--ssd-streaming-cache-experts`,
+4 pairs each):
+
+| Cache slots | Plain decode | Prefill 8192 / +512 / +2048 |
+|---|---|---|
+| 1650 (3/4) | -1.9% [-3.5%, -1.6%] | +0.3% / -0.2% / +3.1% |
+| 1100 (1/2) | -3.1% [-4.4%, -1.3%] | +2.8% / +1.8% / +4.6% |
+| 550 (1/4) | 30.7 -> 28.2 t/s, -8.5% [-9.2%, -7.3%] | +1.5% / +3.4% / +9.4% |
+
+Decode loses little down to half the cache and then falls; a prefill that
+resumes after decode gets faster as the cache shrinks. The prefill figures
+are medians of 4 pairs, without intervals.
+
 ## Measured figures
 
 M5 Max 128 GiB. The smaller machines are emulated with

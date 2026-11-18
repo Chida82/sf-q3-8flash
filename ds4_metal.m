@@ -654,6 +654,8 @@ static double g_stream_expert_cache_pread_ms;
 static uint64_t g_stream_expert_cache_buffer_allocs;
 static uint64_t g_stream_expert_cache_buffer_reuses;
 static uint64_t g_stream_expert_cache_decode_tokens;
+static uint32_t g_stream_expert_cache_row_layer;  /* 1 + layer of the row call in progress */
+static uint64_t g_stream_expert_cache_recent_victims;
 static uint32_t g_stream_expert_cache_first_decode_layer = UINT32_MAX;
 static uint64_t g_stream_expert_cache_hotness_decay_token;
 static uint64_t g_stream_expert_timing_selected_calls;
@@ -902,6 +904,7 @@ typedef struct {
     uint64_t down_expert_bytes;
     uint64_t logical_bytes;
     uint64_t last_used;
+    uint64_t used_token;
     uint64_t use_count;
     NSUInteger gate_inner;
     NSUInteger up_inner;
@@ -4370,10 +4373,11 @@ void ds4_gpu_print_memory_report(const char *label) {
         }
         if (ds4_gpu_stream_expert_timing_summary_enabled()) {
             fprintf(stderr,
-                    "ds4:   streaming cache aging tokens=%llu first_layer=%u decay_token=%llu\n",
+                    "ds4:   streaming cache aging tokens=%llu first_layer=%u decay_token=%llu recent_victims=%llu\n",
                     (unsigned long long)g_stream_expert_cache_decode_tokens,
                     g_stream_expert_cache_first_decode_layer,
-                    (unsigned long long)g_stream_expert_cache_hotness_decay_token);
+                    (unsigned long long)g_stream_expert_cache_hotness_decay_token,
+                    (unsigned long long)g_stream_expert_cache_recent_victims);
             const ds4_gpu_stream_expert_timing_snapshot total =
                 ds4_gpu_stream_expert_timing_current();
             if (ds4_gpu_stream_expert_timing_has_data(total)) {
@@ -14025,6 +14029,7 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
         g_stream_expert_cache_hits = 0;
         g_stream_expert_cache_misses = 0;
         g_stream_expert_cache_evictions = 0;
+        g_stream_expert_cache_recent_victims = 0;
         g_stream_expert_cache_wraps = 0;
         g_stream_expert_cache_clock = 0;
         g_stream_expert_cache_evict_advise_bytes = 0;
@@ -14190,6 +14195,25 @@ static int ds4_gpu_stream_expert_cache_entry_reusable(
            e->down_expert_bytes == down_expert_bytes;
 }
 
+/* Victim order of the Qwen row path (its batch plan and the scalar scan the
+ * plan falls back to): lowest rank, then oldest use. Hotness alone evicts an
+ * expert loaded for this token, selected once, before one that was hot a
+ * while ago, and decode often routes it again one token later. During a row
+ * call an entry used within the last full pass over the layers (by this pass,
+ * or by the previous one in a layer this pass has not reached yet) ranks
+ * after every older entry. A longer window evicts the hot experts that a
+ * resumed prefill computes while the rest load. Outside a row call the order
+ * is hotness alone. */
+static uint64_t ds4_gpu_stream_expert_cache_victim_rank(
+        uint32_t layer,
+        uint32_t expert,
+        const ds4_gpu_stream_expert_cache_entry *e) {
+    const uint64_t age = g_stream_expert_cache_decode_tokens - e->used_token;
+    const uint64_t recent = g_stream_expert_cache_row_layer &&
+        (age == 0 || (age == 1 && layer >= g_stream_expert_cache_row_layer));
+    return recent << 32 | g_stream_expert_cache_route_hotness[layer][expert];
+}
+
 static int ds4_gpu_stream_expert_cache_take_reusable(
         int                                     force_reuse,
         uint32_t                                protect_layer,
@@ -14217,7 +14241,7 @@ retry:
     ;
     uint32_t victim_layer = UINT32_MAX;
     uint32_t victim_expert = UINT32_MAX;
-    uint32_t lowest_hotness = UINT32_MAX;
+    uint64_t lowest_hotness = UINT64_MAX;
     uint64_t oldest = UINT64_MAX;
     int skipped_inflight = 0;
     const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
@@ -14249,8 +14273,8 @@ retry:
                                                             n_protect)) {
                 continue;
             }
-            const uint32_t hotness =
-                g_stream_expert_cache_route_hotness[layer][expert];
+            const uint64_t hotness =
+                ds4_gpu_stream_expert_cache_victim_rank(layer, expert, e);
             if (hotness < lowest_hotness ||
                 (hotness == lowest_hotness && e->last_used < oldest)) {
                 lowest_hotness = hotness;
@@ -14278,6 +14302,7 @@ retry:
         return 0;
     }
     const double clear_t0 = timing ? ds4_gpu_now_ms() : 0.0;
+    g_stream_expert_cache_recent_victims += lowest_hotness >> 32 != 0;
     ds4_gpu_stream_expert_cache_clear_entry_internal(victim_layer,
                                                      victim_expert,
                                                      1,
@@ -14304,8 +14329,8 @@ retry:
 }
 
 typedef struct {
-    uint32_t layer, expert, hotness;
-    uint64_t last_used;
+    uint32_t layer, expert;
+    uint64_t hotness, last_used;  /* hotness holds the victim rank */
 } ds4_gpu_stream_expert_reuse_candidate;
 
 typedef struct {
@@ -14358,10 +14383,10 @@ static int ds4_gpu_stream_expert_cache_plan_reuse(
             if (ds4_gpu_stream_expert_cache_entry_protected(layer, expert,
                     protect_layer, protect_ids, n_protect)) continue;
             const ds4_gpu_stream_expert_reuse_candidate c = {
-                layer, expert, g_stream_expert_cache_route_hotness[layer][expert], e->last_used,
+                layer, expert, ds4_gpu_stream_expert_cache_victim_rank(layer, expert, e), e->last_used,
             };
-            /* Match the old scan's initial (UINT32_MAX, UINT64_MAX) bounds. */
-            if (c.hotness == UINT32_MAX && c.last_used == UINT64_MAX) continue;
+            /* Match the old scan's initial (UINT64_MAX, UINT64_MAX) bounds. */
+            if (c.hotness == UINT64_MAX && c.last_used == UINT64_MAX) continue;
             if (p->count < n_needed) {
                 uint32_t at = p->count++;
                 p->candidates[at] = c;
@@ -14398,13 +14423,14 @@ static int ds4_gpu_stream_expert_cache_take_planned_reuse(
     const ds4_gpu_stream_expert_reuse_candidate *c = &p->candidates[p->next];
     const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[c->layer][c->expert];
     if (!ds4_gpu_stream_expert_cache_entry_reusable(e, gate_expert_bytes, down_expert_bytes) ||
-        e->last_used != c->last_used || g_stream_expert_cache_route_hotness[c->layer][c->expert] != c->hotness ||
+        e->last_used != c->last_used || ds4_gpu_stream_expert_cache_victim_rank(c->layer, c->expert, e) != c->hotness ||
         ds4_gpu_stream_expert_cache_entry_protected(c->layer, c->expert, protect_layer, protect_ids, n_protect)) {
         p->count = p->next;
         return 0;
     }
     const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
     const double t0 = timing ? ds4_gpu_now_ms() : 0.0;
+    g_stream_expert_cache_recent_victims += c->hotness >> 32 != 0;
     ds4_gpu_stream_expert_cache_clear_entry_internal(c->layer, c->expert, 1, 1, reuse);
     if (timing) ds4_gpu_stream_expert_timing_note_reuse_clear(ds4_gpu_now_ms() - t0);
     p->next++;
@@ -14987,6 +15013,7 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_peek(
     }
 
     e->last_used = ++g_stream_expert_cache_clock;
+    e->used_token = g_stream_expert_cache_decode_tokens;
     e->use_count++;
     g_stream_expert_cache_hits++;
     g_stream_expert_cache_layer_hits[layer]++;
@@ -15061,6 +15088,7 @@ ds4_gpu_stream_expert_cache_install_loaded(
     e->down_expert_bytes = down_expert_bytes;
     e->logical_bytes = logical_bytes;
     e->last_used = ++g_stream_expert_cache_clock;
+    e->used_token = g_stream_expert_cache_decode_tokens;
     e->use_count = 1;
     e->gate_inner = gate_inner;
     e->up_inner = up_inner;
@@ -15131,6 +15159,7 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
                                                   gate_expert_bytes,
                                                   down_expert_bytes)) {
         e->last_used = ++g_stream_expert_cache_clock;
+        e->used_token = g_stream_expert_cache_decode_tokens;
         e->use_count++;
         g_stream_expert_cache_hits++;
         g_stream_expert_cache_layer_hits[layer]++;
@@ -40197,6 +40226,9 @@ int ds4_gpu_qwen4_moe_stream_tensor(
         /* Run cached experts while missing payloads load, then submit their
          * gate/up work before reading down weights on every Metal device. */
         g_stream_prefill_batch_selected_addr_building++;
+        /* Decode and verify rows spare the last pass's experts; a prefill
+         * chunk selects most of a layer at once and keeps the hotness order. */
+        g_stream_expert_cache_row_layer = !mm && n_tokens <= 3u ? table->layer + 1u : 0;
         ok = ds4_gpu_stream_expert_cache_prepare_selected_batch(
                 table->model_map, table->model_size, table->layer, selected, n_tokens,
                 table->n_total_expert, n_slots, table->gate_offset, table->up_offset, table->down_offset,
@@ -40206,6 +40238,7 @@ int ds4_gpu_qwen4_moe_stream_tensor(
                 (n_tokens <= 3u || mm) ?
                     qwen4_stream_mid_before_read : NULL, &overlap,
                 mm ? qwen4_stream_missing_gate_up_ready : NULL);
+        g_stream_expert_cache_row_layer = 0;
         g_stream_prefill_batch_selected_addr_building--;
         stream.gate = gate;
         stream.up = up;

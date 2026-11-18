@@ -699,6 +699,69 @@ static void check_half_split(const weights *w, uint32_t T, uint32_t nt,
             need(mm_probe.calls[stream][down] != 0, "resident and streamed MM dispatch observed");
 }
 
+/* One decode row routing ids; exactly the experts in reads come from the file. */
+static void route_row(const weights *w, ds4_gpu_tensor **t, const int32_t *ids,
+                      const int32_t *reads, uint32_t n_reads, int fd, int empty_fd, const char *what) {
+    need(ds4_gpu_tensor_write(t[3], 0, ids, S * sizeof(*ids)) && ds4_gpu_begin_commands(), what);
+    probe_begin(w, reads, n_reads, fd, empty_fd);
+    need(project_rows(w, 1, S, 0, 1, t[0], t[1], t[2], t[3]) && ds4_gpu_end_commands(), what);
+    (void)probe_end(1, n_reads == 0);
+}
+
+/* Decode's victim order over three layers of one format. An expert used
+ * within the last full pass (this pass, or the previous one in a layer not
+ * reached again) outlives every older entry, whatever its hotness; older
+ * entries go by hotness; when every candidate is that recent the budget still
+ * holds; routed ids never go. */
+static void check_recency(const weights *w, int fd, int empty_fd) {
+    weights a = *w, b = *w, c = *w;  /* a is the pass's first layer */
+    b.table.layer = 6; c.table.layer = 7;
+    int32_t row[6][S], mixed[S], back[S];
+    for (int k = 0; k < 6; k++) for (int j = 0; j < S; j++) row[k][j] = 100 + k * S + j;
+    for (int j = 0; j < S / 2; j++) {
+        mixed[j] = 300 + j; mixed[S / 2 + j] = row[1][j];
+        back[j] = row[1][j]; back[S / 2 + j] = 300 + j;
+    }
+    float zero[D] = {0};
+    ds4_gpu_tensor *t[] = {upload(NULL, S * F * sizeof(float)), upload(NULL, S * D * sizeof(float)),
+                           upload(zero, sizeof(zero)), upload(NULL, S * sizeof(int32_t))};
+    const uint64_t expert_bytes = 2 * w->table.gate_expert_bytes + w->table.down_expert_bytes;
+    need(ds4_gpu_set_model_fd(fd), "recency source fd");
+
+    ds4_gpu_set_streaming_expert_cache_budget(3 * S);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(expert_bytes);
+    route_row(&a, t, row[0], row[0], S, fd, empty_fd, "recency: a0 loads");
+    route_row(&b, t, row[1], row[1], S, fd, empty_fd, "recency: b1 loads");
+    for (int pass = 0; pass < 2; pass++) {
+        route_row(&a, t, row[0], NULL, 0, fd, empty_fd, "recency: a0 hits");
+        route_row(&b, t, row[1], NULL, 0, fd, empty_fd, "recency: b1 hits");
+    }
+    route_row(&a, t, row[2], row[2], S, fd, empty_fd, "recency: fresh a2 fills the cache");
+    route_row(&b, t, row[3], row[3], S, fd, empty_fd, "recency: b3 evicts a row");
+    route_row(&a, t, row[2], NULL, 0, fd, empty_fd, "recency: this pass's fresh row outlives older hot ones");
+    route_row(&b, t, row[4], row[4], S, fd, empty_fd, "recency: b4 evicts a row");
+    route_row(&a, t, row[5], row[5], S, fd, empty_fd, "recency: a5 evicts a row");
+    route_row(&b, t, row[4], NULL, 0, fd, empty_fd, "recency: the previous pass's row of a later layer is kept");
+    route_row(&a, t, row[5], NULL, 0, fd, empty_fd, "recency: a5 hits");
+    route_row(&b, t, row[1], NULL, 0, fd, empty_fd, "recency: older rows went by hotness, not by age");
+    need(ds4_gpu_stream_expert_cache_current_count() == 3 * S, "recency: three rows cached");
+
+    ds4_gpu_set_streaming_expert_cache_budget(2 * S);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(expert_bytes);
+    route_row(&a, t, row[0], row[0], S, fd, empty_fd, "recency: a0 loads again");
+    route_row(&c, t, row[2], row[2], S, fd, empty_fd, "recency: c2 loads");
+    route_row(&a, t, row[0], NULL, 0, fd, empty_fd, "recency: a0 hits again");
+    route_row(&b, t, row[1], row[1], S, fd, empty_fd, "recency: a load with every candidate recent");
+    need(ds4_gpu_stream_expert_cache_current_count() == 2 * S, "recency: budget holds when every candidate is recent");
+    route_row(&a, t, row[0], NULL, 0, fd, empty_fd, "recency: the hotter of two recent rows stayed");
+    route_row(&b, t, mixed, mixed, S / 2, fd, empty_fd, "recency: half a row loads beside routed residents");
+    route_row(&a, t, row[0], NULL, 0, fd, empty_fd, "recency: a0 still cached");
+    route_row(&b, t, back, NULL, 0, fd, empty_fd, "recency: routed ids are never victims");
+    need(ds4_gpu_stream_expert_cache_current_count() == 2 * S, "recency: two rows cached");
+    for (unsigned i = 0; i < 4; i++) ds4_gpu_tensor_free(t[i]);
+    puts("PASS Qwen SSD victim order: last pass kept, hotness beyond it, budget held, routed ids protected");
+}
+
 int main(void) {
     weights formats[] = {{.gate_type=16, .down_type=10, .shared_down_type=8},
                          {.gate_type=12, .down_type=39, .shared_down_type=39},
@@ -846,6 +909,7 @@ int main(void) {
              "restore MM policy override");
         free(saved_policy[i]);
     }
+    check_recency(formats, fileno(file), fileno(empty));
     ds4_gpu_cleanup(); munmap(map, bytes); fclose(empty); fclose(file);
     puts("PASS Qwen SSD: cache, exact selected-only reads, full-selection fallback and retry");
     return 0;
