@@ -1,5 +1,15 @@
 # Proposal
 
+**Closed on 2026-11-19, not adopted.** S1 with the top 3 predicted experts
+per row: at 54 GiB, capped, MTP code +1.99% [+1.08%, +2.77%], MTP prose
+-2.57% [-5.67%, +0.96%], plain +0.75% [-0.87%, +3.13%]; 48 GiB MTP code
++4.73%, 60 GiB -1.36% (2 pairs each). Top 10 lost 3.5-4.6%: the CPU work of
+issuing the reads delayed the next batch, and about 15,000 wasted reads per
+512-token run raised misses from 46k to 61k. Kept by D4's letter, not landed
+by the owner's decision: a mixed result for about 300 lines on the hot path.
+A retry needs more pairs per size and a reason the prose loss goes away.
+Code: `6671e3e` (the branch was deleted). Figures: tasks.md.
+
 ## Why
 
 `185` S2 found a predictor of the next layer's experts that passes: the
