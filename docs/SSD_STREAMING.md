@@ -300,9 +300,17 @@ once, with the GPU idle unless a gate/up pass already runs:
 - **From 256 tokens up the gap is the read wait**: the GPU does the same
   work as resident and sits idle for 40-55% of the append, about as long as
   the reads take (the reads can exceed the idle time where the down read
-  overlaps the gate/up pass). A chunk routes most of a layer's experts, so
-  the next layer's missing experts are known to be needed with little
-  doubt; reading them while this layer computes is change `202`.
+  overlaps the gate/up pass).
+- **The next layer's misses cannot be read early by elimination.** A chunk
+  routes far fewer of a layer's 512 experts than its rows suggest, and the
+  cache holds most of those: per layer, an append routes about 112 experts
+  at 64 tokens (misses 10), 190 at 256 (32-38), 260-300 at 1024 (87-93) and
+  375 at 4096 (160-205), while 290-340 experts of the next layer are
+  uncached. Reading all of those while this layer computes wastes more
+  read time than it hides up to 1024 tokens and saves about 3% at 4096.
+  A perfect prediction of the next layer's misses would hide 26-37% of an
+  append, since a layer's GPU time (5 ms at 64 tokens, 36-38 ms at 4096)
+  covers most of the next layer's reads (change `202`).
 - **At 64 tokens the reads are a quarter of the append** and two other
   parts are as large: 67-85 ms more GPU time than resident (the streamed
   expert kernels at a small row count) and about 80-90 ms of GPU idle that
