@@ -1,5 +1,14 @@
 # Proposal
 
+**Closed on 2026-11-19 after step 0, owner's decision.** At 54 GiB, capped,
+decode t/s with the default policy / forced depth 2 / forced depth 3 (3 runs
+per cell, by hand): MTP code 34.62 / 33.96 / 35.12 (depth 3 +1.4%), MTP
+prose 37.17 / 37.45 / 34.13 (depth 3 -8.2%), copy 33.69 / 33.66 / 34.03
+(depth 3 +1.0%). The default already takes most of what a fixed depth gives
+on code and none of its loss on prose; a streaming-aware rule could recover
+at most about 1-1.5% on code. Not worth a second depth policy. 48 and 60
+GiB not run.
+
 ## Why
 
 The MTP cycle drafts one token, or two when a rolling window of first-draft
