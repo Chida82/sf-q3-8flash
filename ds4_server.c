@@ -5901,6 +5901,35 @@ static bool qwen_param_value_is_json(const char *s) {
     return *p == '\0';
 }
 
+/* A value the model wrote as JSON can still hold raw control characters
+ * inside its strings (a literal newline in "first<LF>second"): the scanner
+ * accepts them, JSON does not. Escape them so the arguments stay valid JSON
+ * and the value keeps its type. */
+static char *qwen_param_json_escape_controls(const char *s) {
+    buf b = {0};
+    bool in_string = false, escape = false;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (in_string && !escape && c < 0x20) {
+            char tmp[8];
+            if (c == '\n') buf_puts(&b, "\\n");
+            else if (c == '\r') buf_puts(&b, "\\r");
+            else if (c == '\t') buf_puts(&b, "\\t");
+            else { snprintf(tmp, sizeof(tmp), "\\u%04x", c); buf_puts(&b, tmp); }
+            continue;
+        }
+        buf_putc(&b, (char)c);
+        if (in_string) {
+            if (escape) escape = false;
+            else if (c == '\\') escape = true;
+            else if (c == '"') in_string = false;
+        } else if (c == '"') {
+            in_string = true;
+        }
+    }
+    return buf_take(&b);
+}
+
 static char *qwen_strip_value_newlines(const char *start, const char *end) {
     if (start < end && *start == '\n') start++;
     if (end > start && end[-1] == '\n') end--;
@@ -6044,7 +6073,13 @@ static bool parse_qwen_generated_message_ex(const char *text,
             char *value = qwen_strip_value_newlines(value_start, value_end);
             const bool is_string = qwen_param_declared_string(orders, name, key) ||
                                    !qwen_param_value_is_json(value);
-            if (is_string) ds4_tool_text_unescape(value, param_end);
+            if (is_string) {
+                ds4_tool_text_unescape(value, param_end);
+            } else {
+                char *escaped = qwen_param_json_escape_controls(value);
+                free(value);
+                value = escaped;
+            }
             tool_call_json_args_add(&args, key, value, is_string ? "true" : "false");
             free(key);
             free(value);
@@ -16750,6 +16785,26 @@ static void test_qwen_tool_stream_issue_2_3(void) {
     }
 }
 
+/* A JSON value with a raw newline inside one of its strings keeps its type
+ * and becomes valid JSON (seen on Q4 with an object parameter). */
+static void test_qwen_tool_arg_raw_control_in_json(void) {
+    const char *raw =
+        "<tool_call>\n<function=set>\n<parameter=count>\n3\n</parameter>\n"
+        "<parameter=extra>\n{\"text\":\"first\nsecond\",\"t\":\"a\tb\"}\n</parameter>\n"
+        "</function>\n</tool_call>";
+    tool_calls calls = {0};
+    char *content = NULL, *reasoning = NULL;
+    TEST_ASSERT(parse_generated_message_ex(raw, false, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    if (calls.len == 1) {
+        TEST_ASSERT(!strcmp(calls.v[0].arguments,
+            "{\"count\": 3, \"extra\": {\"text\":\"first\\nsecond\",\"t\":\"a\\tb\"}}"));
+    }
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
 static void test_streaming_holds_partial_utf8(void) {
     const char partial[] = {'A', ' ', (char)0xf0, (char)0x9f, 0};
     const char complete[] = {'A', ' ', (char)0xf0, (char)0x9f,
@@ -21322,6 +21377,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_sends_closed_call_whole();
     test_qwen_tool_stream_two_calls();
     test_qwen_tool_stream_issue_2_3();
+    test_qwen_tool_arg_raw_control_in_json();
     test_streaming_holds_partial_utf8();
     /* sf-ablate(glm): legacy DSML/GLM protocol tests removed; Qwen tool syntax remains below. */
     test_tool_recovery_output_budget();
