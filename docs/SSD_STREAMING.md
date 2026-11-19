@@ -195,6 +195,57 @@ gives decode -0.45% [-3.19%, +0.17%] on MTP code and +0.15% [-3.92%, +4.39%]
 plain (bootstrap 95% CI of the median pair ratio). A single pair can move
 4%; a change is judged on at least 8 pairs, two invocations per kind.
 
+### Appends on a long context
+
+An agent's request is an append: a tool result or a turn of a few hundred
+to a few thousand tokens on top of a long context, then a short answer.
+Time to first token of appends in sequence on one session, Q4, prose, MTP
+off, 16 tokens decoded after each, 3 runs per cell, medians, ms (change
+`198`; streamed runs capped and uncached):
+
+| Context | Cell | First prefill | +64 | +256 | +1024 | +4096 |
+|---|---|---|---|---|---|---|
+| 8K | resident | 6675 | 201 | 360 | 934 | 3287 |
+| 8K | 48 GiB | 9869 | 515 | 968 | 1979 | 4802 |
+| 8K | 54 GiB | 10123 | 558 | 709 | 1597 | 4434 |
+| 8K | 60 GiB | 10246 | 351 | 511 | 1275 | 3869 |
+| 32K | resident | 20910 | 210 | 352 | 890 | 3040 |
+| 32K | 48 GiB | 29302 | 530 | 858 | 2116 | 4426 |
+| 32K | 54 GiB | 28185 | 443 | 637 | 1678 | 3941 |
+| 32K | 60 GiB | 26990 | 394 | 489 | 1293 | 3501 |
+
+At 54 GiB an append takes 2.1-2.8 times the resident time at 64 tokens,
+1.8-2.0 at 256, 1.7-1.9 at 1024 and 1.3 at 4096.
+
+Where the time goes, one run per cell at 54 GiB against resident: the
+append's wall time, the GPU's busy time over it (command buffer spans),
+and the sum of the per-layer expert read walls (stream timing summary).
+Every append is one chunk; each of its 48 layers loads its missing experts
+once, with the GPU idle unless a gate/up pass already runs:
+
+| Context | Append | Wall, resident / streamed | GPU busy, resident / streamed | Streamed GPU idle | Reads |
+|---|---|---|---|---|---|
+| 8K | +64 | 165 / 437 | 156 / 241 | 196 | 105 |
+| 8K | +256 | 324 / 673 | 298 / 320 | 353 | 402 |
+| 8K | +1024 | 818 / 1585 | 720 / 743 | 843 | 886 |
+| 8K | +4096 | 2803 / 4315 | 2415 / 2453 | 1862 | 2068 |
+| 32K | +64 | 189 / 435 | 170 / 237 | 198 | 122 |
+| 32K | +256 | 365 / 612 | 336 / 318 | 293 | 345 |
+| 32K | +1024 | 910 / 1658 | 807 / 761 | 897 | 950 |
+| 32K | +4096 | 3123 / 3957 | 2716 / 2520 | 1437 | 1633 |
+
+- **From 256 tokens up the gap is the read wait**: the GPU does the same
+  work as resident and sits idle for 40-55% of the append, about as long as
+  the reads take (the reads can exceed the idle time where the down read
+  overlaps the gate/up pass). A chunk routes most of a layer's experts, so
+  the next layer's missing experts are known to be needed with little
+  doubt; reading them while this layer computes is change `202`.
+- **At 64 tokens the reads are a quarter of the append** and two other
+  parts are as large: 67-85 ms more GPU time than resident (the streamed
+  expert kernels at a small row count) and about 80-90 ms of GPU idle that
+  no read explains (the per-layer stop: drain, ids, lists, encode). Change
+  `203` measures and attacks those two.
+
 ### The layer round trip
 
 A resident decode pass never stops the GPU; a streamed one stops it at every
