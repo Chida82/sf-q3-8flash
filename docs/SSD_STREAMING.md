@@ -51,6 +51,45 @@ owned buffers. Cached experts compute while the missing ones load: gate/up
 first, then down once its rows arrive, for decode, MTP verification and
 prefill.
 
+### Memory pressure
+
+The plan is made once, at open, from what is free then. A streamed engine
+also listens to the system's memory-pressure level (a dispatch source for
+warning and critical, and `kern.memorystatus_vm_pressure_level` read at
+open) and gives part of the expert cache back when the machine runs short
+later (change `186`):
+
+- **Warning**: the cache shrinks to three quarters of the plan.
+- **Critical**: the cache shrinks to its floor, one layer's 512 experts, so
+  a prefill chunk still fits and no call needs staging the plan did not
+  reserve. A request in flight always completes.
+- **At open**, a level that is not normal opens the cache at its floor.
+- **Regrowth**: after 30 s at the normal level the cache grows by one slab,
+  and again every 30 s, up to the planned size and never past it. A slab
+  that cannot be allocated ends that step; the next waits another 30 s.
+
+The cache shrinks by whole slabs (`DS4_METAL_STREAMING_EXPERT_SLAB_MB`,
+4 GiB by default: 1,579 Q4 experts), newest first: their entries are
+dropped, their pages unlocked and freed, and a dropped expert is read
+again when a layer routes it. The handler only records the level; the cache
+acts at the next streamed layer call, after that call has drained the GPU,
+so nothing a command buffer reads is released. When an action is due on a
+Q2 decode layer, that one layer takes the ordinary path instead of the
+handshake, which does not drain. With no pressure the cost is one atomic
+load per streamed layer call.
+
+Each change is logged once, with the sizes, and the totals appear in the
+memory report:
+
+```
+ds4: memory pressure warning: expert cache 10725 -> 7895 experts (27.17 -> 20.00 GiB), 5 slabs
+ds4: memory pressure quiet: expert cache 7895 -> 9474 experts (20.00 -> 24.00 GiB), 6 slabs
+ds4:   streaming expert cache memory pressure shrinks=1 regrows=2 size=10725 planned=10725
+```
+
+Output does not change: a smaller cache changes which experts are read
+from disk, never what a layer computes.
+
 ## Eviction order
 
 When the cache is full, a load takes the slot of another cached expert, of

@@ -865,6 +865,101 @@ static void check_recency(const weights *w, int fd, int empty_fd) {
     puts("PASS Qwen SSD victim order: last pass kept, hotness beyond it, budget held, routed ids protected");
 }
 
+/* Memory pressure (186), injected through the test seam: a warning shrinks
+ * the cache by whole slabs to three quarters of the plan, a critical level to
+ * the floor (one layer's 512 experts), and quiet periods regrow it one slab
+ * at a time up to the plan and never past it. Every streamed row, including
+ * the one whose call applies the shrink and rereads what it dropped, stays
+ * exact against the mapped reference. Q2's format also covers the decode
+ * handshake, which a due pressure action skips for one layer. */
+static void pressure_row(const weights *w, ds4_gpu_tensor **t, const int32_t *ids, int streamed, const char *what) {
+    need(ds4_gpu_tensor_write(t[3], 0, ids, S * sizeof(*ids)) && ds4_gpu_begin_commands(), what);
+    need(project_rows(w, 1, S, 0, streamed, t[0], t[1], t[2], t[3]) && ds4_gpu_end_commands(), what);
+}
+static void pressure_exact(const weights *w, ds4_gpu_tensor **t, const int32_t *ids, const char *what) {
+    static float ref[S * D], got[S * D];
+    pressure_row(w, t, ids, 0, what);
+    need(ds4_gpu_tensor_read(t[1], 0, ref, sizeof(ref)), what);
+    pressure_row(w, t, ids, 1, what);
+    need(ds4_gpu_tensor_read(t[1], 0, got, sizeof(got)), what);
+    need(memcmp(ref, got, sizeof(ref)) == 0, what);
+}
+static void check_pressure(const weights *w, int fd) {
+    const uint32_t planned = 1024, floor = 512, warn = planned - planned / 4;
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    const uint64_t slot = align_up(2 * w->table.gate_expert_bytes + w->table.down_expert_bytes, page);
+    /* About six slots per slab: several slabs per step, under the 256-slab limit. */
+    const uint64_t slab_mib = (6 * slot + (1u << 20) - 1) >> 20;
+    const uint32_t per_slab = (uint32_t)((slab_mib << 20) / slot);
+    char mib[16];
+    snprintf(mib, sizeof(mib), "%llu", (unsigned long long)slab_mib);
+    need(per_slab >= 2 && per_slab < floor / 4 && planned / per_slab < 256, "pressure: several slabs per step");
+    need(setenv("DS4_METAL_STREAMING_EXPERT_SLAB_MB", mib, 1) == 0, "pressure: small slabs");
+    float x[D];
+    for (int i = 0; i < D; i++) x[i] = (float)((int)(random_u32() % 17) - 8) / 8.0f;
+    ds4_gpu_tensor *t[] = {upload(NULL, S * F * sizeof(float)), upload(NULL, S * D * sizeof(float)),
+                           upload(x, sizeof(x)), upload(NULL, S * sizeof(int32_t))};
+    need(ds4_gpu_set_model_fd(fd), "pressure source fd");
+    ds4_gpu_set_streaming_expert_cache_budget(planned);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(2 * w->table.gate_expert_bytes + w->table.down_expert_bytes);
+    weights lw = *w;
+    int32_t row[S];
+    /* Fills planned slots: rows of ten new experts over layers 20..23. */
+    uint32_t n_rows = 0;
+    for (uint32_t layer = 20; layer < 24 && ds4_gpu_stream_expert_cache_current_count() < planned; layer++) {
+        lw.table.layer = layer;
+        for (uint32_t e0 = 0; e0 + S <= E && ds4_gpu_stream_expert_cache_current_count() < planned; e0 += S) {
+            for (int j = 0; j < S; j++) row[j] = (int32_t)(e0 + j);
+            pressure_row(&lw, t, row, 1, "pressure: fill");
+            n_rows++;
+        }
+    }
+    need(ds4_gpu_stream_expert_cache_current_count() == planned &&
+         ds4_gpu_stream_expert_cache_configured_count() == planned, "pressure: cache full at the plan");
+    weights hot = *w; hot.table.layer = 30;
+    const int32_t *active_row = active;   /* ten experts with data, three above 383 */
+    pressure_exact(&hot, t, active_row, "pressure: warm row exact");
+
+    ds4_gpu_stream_expert_cache_test_pressure(2u, 3600u * 1000u);   /* DISPATCH_MEMORYPRESSURE_WARN */
+    pressure_exact(&hot, t, active_row, "pressure: the call that shrinks stays exact");
+    uint32_t size = ds4_gpu_stream_expert_cache_configured_count();
+    need(size <= warn && size + per_slab > warn && ds4_gpu_stream_expert_cache_current_count() <= size,
+         "pressure: warning shrinks to three quarters by whole slabs");
+    for (uint32_t e0 = 100; e0 + S <= 400; e0 += S) {
+        lw.table.layer = 25;
+        for (int j = 0; j < S; j++) row[j] = (int32_t)(e0 + j);
+        pressure_row(&lw, t, row, 1, "pressure: loads after a warning");
+        need(ds4_gpu_stream_expert_cache_current_count() <= size, "pressure: the shrunk size holds");
+    }
+    ds4_gpu_stream_expert_cache_test_pressure(4u, 3600u * 1000u);   /* CRITICAL */
+    pressure_exact(&hot, t, active_row, "pressure: rows reread after a critical shrink are exact");
+    size = ds4_gpu_stream_expert_cache_configured_count();
+    need(size >= floor && size < floor + per_slab && ds4_gpu_stream_expert_cache_current_count() <= size,
+         "pressure: critical shrinks to the floor");
+    ds4_gpu_stream_expert_cache_test_pressure(2u, 3600u * 1000u);
+    pressure_exact(&hot, t, active_row, "pressure: a warning at the floor");
+    need(ds4_gpu_stream_expert_cache_configured_count() == size, "pressure: a warning never grows the cache");
+
+    ds4_gpu_stream_expert_cache_test_pressure(1u, 0);   /* NORMAL, no quiet period */
+    uint32_t last = size, steps = 0;
+    for (uint32_t i = 0; i < 2 * planned / per_slab && last < planned; i++) {
+        lw.table.layer = 26 + i % 8;
+        for (int j = 0; j < S; j++) row[j] = (int32_t)((i * S + (uint32_t)j) % E);
+        pressure_row(&lw, t, row, 1, "pressure: regrowth");
+        const uint32_t now = ds4_gpu_stream_expert_cache_configured_count();
+        need(now >= last && now <= planned && now - last <= per_slab, "pressure: regrowth by one slab at most");
+        steps += now > last; last = now;
+    }
+    need(last == planned && steps >= (planned - size) / per_slab, "pressure: regrowth reaches the plan");
+    pressure_exact(&hot, t, active_row, "pressure: exact after regrowth");
+    need(ds4_gpu_stream_expert_cache_configured_count() == planned, "pressure: never past the plan");
+    ds4_gpu_stream_expert_cache_test_pressure(1u, 30000);
+    need(unsetenv("DS4_METAL_STREAMING_EXPERT_SLAB_MB") == 0, "pressure: default slabs");
+    for (unsigned i = 0; i < 4; i++) ds4_gpu_tensor_free(t[i]);
+    printf("PASS Qwen SSD memory pressure: %u fill rows, warning %u, critical %u, regrowth to %u in %u steps, rows exact\n",
+           n_rows, warn, floor, planned, steps);
+}
+
 static char fixture_path[1024];
 static void remove_fixture(void) { unlink(fixture_path); }
 
@@ -1029,6 +1124,8 @@ int main(void) {
         free(saved_policy[i]);
     }
     check_recency(formats, fileno(file), fileno(empty));
+    check_pressure(formats, fileno(file));
+    check_pressure(formats + 1, fileno(file));
     ds4_gpu_cleanup(); munmap(map, bytes); fclose(empty); fclose(file);
     puts("PASS Qwen SSD: cache, exact selected-only reads, full-selection fallback and retry");
     return 0;

@@ -311,6 +311,10 @@ int ds4_gpu_qwen4_batch_mm_q8_tensor(
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
+/* Test seam (186): record a memory-pressure level as the dispatch source's
+ * handler would (DISPATCH_MEMORYPRESSURE_* bits) and set the quiet period
+ * before regrowth. The cache acts at the next streamed layer call. */
+void ds4_gpu_stream_expert_cache_test_pressure(unsigned level, uint32_t quiet_ms);
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
     uint64_t    model_size;

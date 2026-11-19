@@ -760,6 +760,9 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats);
 static void ds4_gpu_stream_expert_pending_load_clear(void);
 static void ds4_gpu_stream_expert_pread_pool_shutdown(void);
 static void ds4_gpu_stream_expert_uncached_fd_reset(void);
+static void ds4_gpu_stream_pressure_open(uint32_t planned);
+static void ds4_gpu_stream_expert_cache_prune_global(uint32_t protect_layer, const int32_t *protect_ids,
+                                                    uint32_t n_protect);
 static int ds4_gpu_stream_expert_timing_summary_enabled(void);
 static int ds4_gpu_stream_expert_cache_entry_protected(
         uint32_t       layer,
@@ -977,6 +980,20 @@ static uint64_t g_stream_expert_cache_mlock_failures;
 static double g_stream_expert_cache_mlock_ms;
 static int g_stream_expert_cache_mlock_warned;
 static uint64_t g_stream_expert_cache_slab_slot_bytes;
+/* Memory pressure (186). The dispatch source's handler only records the
+ * level and bumps the event count; the encoding thread acts on it at the
+ * next streamed layer call, after that call has drained the GPU. The cap
+ * bounds the configured budget below the plan while the cache is shrunk. */
+static dispatch_source_t g_stream_pressure_source;
+static unsigned g_stream_pressure_events;   /* written by the handler */
+static unsigned g_stream_pressure_level;    /* DISPATCH_MEMORYPRESSURE_* of the last event */
+static unsigned g_stream_pressure_seen;
+static uint32_t g_stream_pressure_planned;
+static uint32_t g_stream_pressure_cap;      /* 0: the plan's size */
+static double g_stream_pressure_quiet_ms = 30000.0;
+static double g_stream_pressure_last_ms;
+static uint64_t g_stream_pressure_shrinks;
+static uint64_t g_stream_pressure_regrows;
 static uint64_t g_stream_expert_cache_cb_seq;
 static uint64_t g_stream_expert_cache_done_seq;
 static uint64_t g_stream_expert_cache_batch_seq;
@@ -4389,6 +4406,13 @@ void ds4_gpu_print_memory_report(const char *label) {
                     (unsigned long long)g_stream_expert_cache_mlock_failures,
                     g_stream_expert_cache_mlock_ms);
         }
+        if (g_stream_pressure_shrinks != 0 || g_stream_pressure_regrows != 0) {
+            fprintf(stderr,
+                    "ds4:   streaming expert cache memory pressure shrinks=%llu regrows=%llu size=%u planned=%u\n",
+                    (unsigned long long)g_stream_pressure_shrinks,
+                    (unsigned long long)g_stream_pressure_regrows,
+                    g_stream_pressure_cap ? g_stream_pressure_cap : g_stream_pressure_planned, g_stream_pressure_planned);
+        }
         if (ds4_gpu_stream_expert_timing_summary_enabled()) {
             fprintf(stderr,
                     "ds4:   streaming cache aging tokens=%llu first_layer=%u decay_token=%llu recent_victims=%llu\n",
@@ -4589,6 +4613,7 @@ void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     }
     g_stream_expert_cache_budget_override = experts;
     ds4_gpu_stream_expert_cache_clear_all(1);
+    ds4_gpu_stream_pressure_open(experts);
 }
 
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
@@ -10867,6 +10892,10 @@ void ds4_gpu_cleanup(void) {
     ds4_gpu_queue_keepalive_stop_thread();
 
     @autoreleasepool {
+        if (g_stream_pressure_source) {
+            dispatch_source_cancel(g_stream_pressure_source);
+            g_stream_pressure_source = nil;
+        }
         qwen4_stream_handshake_reset();
         ds4_gpu_decode_pipeline_fast_cache_reset();
         ds4_gpu_parallel_ffn_reset_state(YES);
@@ -11845,6 +11874,9 @@ static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void) {
         g_stream_expert_cache_mlock_budget_cap != 0 &&
         budget > g_stream_expert_cache_mlock_budget_cap) {
         budget = g_stream_expert_cache_mlock_budget_cap;
+    }
+    if (budget > g_stream_pressure_cap && g_stream_pressure_cap != 0) {
+        budget = g_stream_pressure_cap;
     }
     return budget;
 }
@@ -13004,6 +13036,50 @@ static int ds4_gpu_stream_expert_slab_claim_slot(
     return 0;
 }
 
+/* Appends one slab of at most max_slots slots (fewer when the slab target is
+ * smaller or the allocation only succeeds at a smaller size); returns its
+ * slot count, 0 on failure. The previous newest slab's unused slots go to
+ * the free list first, since loads take unused slots from the newest slab
+ * only. */
+static uint32_t ds4_gpu_stream_expert_slab_append(uint64_t slot_bytes, uint32_t max_slots) {
+    if (slot_bytes == 0 || max_slots == 0 ||
+        g_stream_expert_cache_slab_count >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS) {
+        return 0;
+    }
+    uint64_t slots64 = ds4_gpu_stream_expert_slab_target_bytes() / slot_bytes;
+    if (slots64 == 0) slots64 = 1;
+    if (slots64 > max_slots) slots64 = max_slots;
+    uint32_t slots = (uint32_t)slots64;
+    id<MTLBuffer> slab_buffer = nil;
+    while (slots != 0) {
+        if ((uint64_t)slots <= UINT64_MAX / slot_bytes &&
+            (uint64_t)slots * slot_bytes <= (uint64_t)NSUIntegerMax) {
+            slab_buffer =
+                ds4_gpu_stream_expert_alloc_slab_buffer(
+                        (uint64_t)slots * slot_bytes,
+                        @"ds4_stream_expert_slab");
+            if (slab_buffer) break;
+        }
+        slots /= 2u;
+    }
+    if (!slab_buffer || slots == 0) return 0;
+
+    if (g_stream_expert_cache_slab_count != 0) {
+        const uint32_t last = g_stream_expert_cache_slab_count - 1u;
+        while (g_stream_expert_cache_slab_slots_used[last] < g_stream_expert_cache_slab_slot_count[last])
+            ds4_gpu_stream_expert_slab_push_free_slot(g_stream_expert_cache_slab_start_slot[last] +
+                                                      g_stream_expert_cache_slab_slots_used[last]++);
+    }
+    const uint32_t slab = g_stream_expert_cache_slab_count++;
+    g_stream_expert_cache_slabs[slab] = slab_buffer;
+    g_stream_expert_cache_slab_start_slot[slab] =
+        g_stream_expert_cache_slab_total_slots;
+    g_stream_expert_cache_slab_slot_count[slab] = slots;
+    g_stream_expert_cache_slab_slots_used[slab] = 0;
+    g_stream_expert_cache_slab_total_slots += slots;
+    return slots;
+}
+
 static int ds4_gpu_stream_expert_alloc_slab_slot(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes,
@@ -13062,38 +13138,10 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
         if (budget != 0 && g_stream_expert_cache_slab_total_slots >= budget) {
             return 0;
         }
-        uint64_t target = ds4_gpu_stream_expert_slab_target_bytes();
-        uint64_t slots64 = target / slot_bytes;
-        if (slots64 == 0) slots64 = 1;
-        if (slots64 > UINT32_MAX) slots64 = UINT32_MAX;
-        uint32_t slots = (uint32_t)slots64;
-        if (budget != 0) {
-            const uint32_t remaining =
-                budget - g_stream_expert_cache_slab_total_slots;
-            if (slots > remaining) slots = remaining;
-        }
-        if (slots == 0) return 0;
-        id<MTLBuffer> slab_buffer = nil;
-        while (slots != 0) {
-            if ((uint64_t)slots <= UINT64_MAX / slot_bytes &&
-                (uint64_t)slots * slot_bytes <= (uint64_t)NSUIntegerMax) {
-                slab_buffer =
-                    ds4_gpu_stream_expert_alloc_slab_buffer(
-                            (uint64_t)slots * slot_bytes,
-                            @"ds4_stream_expert_slab");
-                if (slab_buffer) break;
-            }
-            slots /= 2u;
-        }
-        if (!slab_buffer || slots == 0) return 0;
-
-        slab = g_stream_expert_cache_slab_count++;
-        g_stream_expert_cache_slabs[slab] = slab_buffer;
-        g_stream_expert_cache_slab_start_slot[slab] =
-            g_stream_expert_cache_slab_total_slots;
-        g_stream_expert_cache_slab_slot_count[slab] = slots;
-        g_stream_expert_cache_slab_slots_used[slab] = 0;
-        g_stream_expert_cache_slab_total_slots += slots;
+        uint32_t slots = budget != 0 ?
+            budget - g_stream_expert_cache_slab_total_slots : UINT32_MAX;
+        if (!ds4_gpu_stream_expert_slab_append(slot_bytes, slots)) return 0;
+        slab = g_stream_expert_cache_slab_count - 1u;
     }
 
     const uint32_t local_slot = g_stream_expert_cache_slab_slots_used[slab]++;
@@ -14226,6 +14274,194 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
                0,
                sizeof(g_stream_expert_cache_layer_pread_ms));
     }
+}
+
+/* Memory pressure (186): shrink the expert cache by whole slabs, newest
+ * first, on a warning (to three quarters of the plan) or a critical level
+ * (to the floor), and regrow one slab per quiet period. The floor is one
+ * layer's full expert set, so any prefill chunk still fits the cache and a
+ * shrink never sends a call to staging the plan did not reserve. */
+static void ds4_gpu_stream_pressure_note(unsigned level) {
+    __atomic_store_n(&g_stream_pressure_level, level, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_stream_pressure_events, 1u, __ATOMIC_RELEASE);
+}
+
+static uint32_t ds4_gpu_stream_pressure_floor(void) {
+    return g_stream_pressure_planned < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ?
+        g_stream_pressure_planned : DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+}
+
+static uint32_t ds4_gpu_stream_pressure_size(void) {
+    return g_stream_pressure_cap != 0 ? g_stream_pressure_cap : g_stream_pressure_planned;
+}
+
+static void ds4_gpu_stream_pressure_log(const char *why, uint32_t before, uint32_t after) {
+    const uint64_t slot = g_stream_expert_cache_slab_slot_bytes != 0 ?
+        g_stream_expert_cache_slab_slot_bytes : g_stream_expert_cache_expert_bytes;
+    fprintf(stderr, "ds4: memory pressure %s: expert cache %u -> %u experts (%.2f -> %.2f GiB), %u slabs\n",
+            why, before, after, ds4_gpu_gib((uint64_t)before * slot), ds4_gpu_gib((uint64_t)after * slot),
+            g_stream_expert_cache_slab_count);
+}
+
+/* Releases the newest slab: its entries are dropped (they can be read
+ * again), its slots unlocked and its buffer freed. Called only when every
+ * earlier command buffer has completed; an entry still in flight keeps the
+ * slab. */
+static int ds4_gpu_stream_pressure_release_last_slab(void) {
+    if (g_stream_expert_cache_slab_count == 0) return 0;
+    const uint32_t i = g_stream_expert_cache_slab_count - 1u;
+    const uint32_t start = g_stream_expert_cache_slab_start_slot[i];
+    const uint32_t end = start + g_stream_expert_cache_slab_slot_count[i];
+    for (int clear = 0; clear < 2; clear++) {
+        for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+            if (g_stream_expert_cache_layer_count[layer] == 0) continue;
+            for (uint32_t expert = 0; expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
+                const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert];
+                if (!e->valid || !e->slab_backed || e->slab_slot < start || e->slab_slot >= end) continue;
+                if (!clear && ds4_gpu_stream_expert_cache_entry_inflight(e)) return 0;
+                if (clear) ds4_gpu_stream_expert_cache_clear_entry_internal(layer, expert, 1, 0, NULL);
+            }
+        }
+    }
+    for (uint32_t slot = start; slot < end; slot++) (void)ds4_gpu_stream_expert_slab_unlock_slot(slot);
+    uint32_t kept = 0;
+    for (uint32_t k = 0; k < g_stream_expert_cache_free_slot_count; k++) {
+        const uint32_t slot = g_stream_expert_cache_free_slots[k];
+        if (slot < start || slot >= end) g_stream_expert_cache_free_slots[kept++] = slot;
+    }
+    g_stream_expert_cache_free_slot_count = kept;
+    g_stream_expert_cache_slabs[i] = nil;
+    g_stream_expert_cache_slab_start_slot[i] = 0;
+    g_stream_expert_cache_slab_slot_count[i] = 0;
+    g_stream_expert_cache_slab_slots_used[i] = 0;
+    g_stream_expert_cache_slab_count = i;
+    g_stream_expert_cache_slab_total_slots = start;
+    return 1;
+}
+
+static void ds4_gpu_stream_pressure_shrink(uint32_t target, const char *why) {
+    const uint32_t floor = ds4_gpu_stream_pressure_floor();
+    const uint32_t before = ds4_gpu_stream_pressure_size();
+    if (target < floor) target = floor;
+    uint32_t released = 0;
+    while (g_stream_expert_cache_slab_total_slots > target && g_stream_expert_cache_slab_count != 0 &&
+           g_stream_expert_cache_slab_start_slot[g_stream_expert_cache_slab_count - 1u] >= floor &&
+           ds4_gpu_stream_pressure_release_last_slab()) {
+        released++;
+    }
+    /* Released slabs set the size; a cache not yet filled to the target is
+     * only capped. */
+    uint32_t after = released != 0 || g_stream_expert_cache_slab_total_slots > target ?
+        g_stream_expert_cache_slab_total_slots : target;
+    if (after > before) after = before;
+    if (after == before) return;
+    g_stream_pressure_cap = after;
+    /* Entries outside the slabs (explicit buffers) are not counted in slots. */
+    ds4_gpu_stream_expert_cache_prune_global(UINT32_MAX, NULL, 0);
+    g_stream_pressure_shrinks++;
+    ds4_gpu_stream_pressure_log(why, before, after);
+}
+
+/* One slab more. When the cap is full of slabs, the slab is allocated now,
+ * so a failure ends this step instead of surfacing in a load; otherwise the
+ * cap rises by a slab's slots and loads allocate it. */
+static void ds4_gpu_stream_pressure_regrow(void) {
+    const uint32_t before = ds4_gpu_stream_pressure_size();
+    const uint64_t slot_bytes = g_stream_expert_cache_slab_slot_bytes;
+    uint64_t after = g_stream_pressure_planned;
+    if (slot_bytes != 0 && g_stream_expert_cache_slab_total_slots >= before) {
+        if (!ds4_gpu_stream_expert_slab_append(slot_bytes, g_stream_pressure_planned - before)) {
+            fprintf(stderr, "ds4: memory pressure: expert cache slab allocation failed; regrowth waits for the next quiet period\n");
+            return;
+        }
+        after = g_stream_expert_cache_slab_total_slots;
+    } else {
+        /* No slab beyond the cap yet: a slab's worth of slots, sized from the
+         * expert bytes when no slab exists at all. */
+        const uint64_t page = (uint64_t)getpagesize();
+        const uint64_t bytes = slot_bytes != 0 ? slot_bytes : round_up_u64(g_stream_expert_cache_expert_bytes, page);
+        if (bytes != 0) after = (uint64_t)before + ds4_gpu_stream_expert_slab_target_bytes() / bytes;
+    }
+    if (after > g_stream_pressure_planned) after = g_stream_pressure_planned;
+    g_stream_pressure_cap = after >= g_stream_pressure_planned ? 0 : (uint32_t)after;
+    g_stream_pressure_regrows++;
+    ds4_gpu_stream_pressure_log("quiet", before, (uint32_t)after);
+}
+
+/* Whether a pressure action is due at this layer boundary: one atomic load
+ * unless the cache is shrunk, then also the quiet clock. */
+static inline int ds4_gpu_stream_pressure_due(void) {
+    if (__atomic_load_n(&g_stream_pressure_events, __ATOMIC_RELAXED) != g_stream_pressure_seen) return 1;
+    return g_stream_pressure_cap != 0 &&
+           ds4_gpu_now_ms() - g_stream_pressure_last_ms >= g_stream_pressure_quiet_ms;
+}
+
+/* Acts on the recorded level; the caller has drained the GPU and joined any
+ * pending load, and has not yet selected this layer's experts. */
+static void ds4_gpu_stream_pressure_apply(void) {
+    const unsigned events = __atomic_load_n(&g_stream_pressure_events, __ATOMIC_ACQUIRE);
+    const unsigned level = __atomic_load_n(&g_stream_pressure_level, __ATOMIC_RELAXED);
+    const double now = ds4_gpu_now_ms();
+    const int pressed = (level & (DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL)) != 0;
+    if (pressed) g_stream_pressure_last_ms = now;
+    if (events != g_stream_pressure_seen) {
+        g_stream_pressure_seen = events;
+        if (level & DISPATCH_MEMORYPRESSURE_CRITICAL) {
+            ds4_gpu_stream_pressure_shrink(0, "critical");
+        } else if (level & DISPATCH_MEMORYPRESSURE_WARN) {
+            const uint32_t planned = g_stream_pressure_planned;
+            if (ds4_gpu_stream_pressure_size() > planned - planned / 4u)
+                ds4_gpu_stream_pressure_shrink(planned - planned / 4u, "warning");
+        }
+        return;
+    }
+    if (!pressed && g_stream_pressure_cap != 0 && now - g_stream_pressure_last_ms >= g_stream_pressure_quiet_ms) {
+        ds4_gpu_stream_pressure_regrow();
+        g_stream_pressure_last_ms = now;
+    }
+}
+
+/* Engine open: the planned size, the source, and the level now. */
+static void ds4_gpu_stream_pressure_open(uint32_t planned) {
+    g_stream_pressure_planned = planned;
+    g_stream_pressure_cap = 0;
+    g_stream_pressure_seen = __atomic_load_n(&g_stream_pressure_events, __ATOMIC_ACQUIRE);
+    g_stream_pressure_last_ms = ds4_gpu_now_ms();
+    g_stream_pressure_shrinks = 0;
+    g_stream_pressure_regrows = 0;
+    if (!g_ssd_streaming_mode || planned == 0) return;
+    if (!g_stream_pressure_source) {
+        g_stream_pressure_source = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+            DISPATCH_MEMORYPRESSURE_NORMAL | DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        if (g_stream_pressure_source) {
+            __unsafe_unretained dispatch_source_t src = g_stream_pressure_source;
+            dispatch_source_set_event_handler(src, ^{
+                ds4_gpu_stream_pressure_note((unsigned)dispatch_source_get_data(src));
+            });
+            dispatch_resume(src);
+        }
+    }
+    /* kern.memorystatus_vm_pressure_level: 1 normal, 2 warning, 4 critical. */
+    int level = 0;
+    size_t len = sizeof(level);
+    if (sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &len, NULL, 0) != 0) level = 0;
+    __atomic_store_n(&g_stream_pressure_level, (unsigned)level, __ATOMIC_RELAXED);  /* same bits as the source's */
+    if (level > 1) {
+        const uint32_t floor = ds4_gpu_stream_pressure_floor();
+        if (floor < planned) {
+            g_stream_pressure_cap = floor;
+            g_stream_pressure_shrinks++;
+            fprintf(stderr, "ds4: memory pressure %s at open: expert cache opens at its floor of %u experts (planned %u)\n",
+                    level >= 4 ? "critical" : "warning", floor, planned);
+        }
+    }
+}
+
+/* Test seam: what the source's handler does, with the quiet period set. */
+void ds4_gpu_stream_expert_cache_test_pressure(unsigned level, uint32_t quiet_ms) {
+    g_stream_pressure_quiet_ms = (double)quiet_ms;
+    ds4_gpu_stream_pressure_note(level);
 }
 
 static int ds4_gpu_stream_expert_cache_is_protected(
@@ -40455,7 +40691,9 @@ int ds4_gpu_qwen4_moe_stream_tensor(
     }
 
     int handshake_ok = 0;
-    if (!mm && qwen4_stream_handshake_layer(&handshake_ok, g_batch_cb != nil, table, mid, part, x, selected,
+    /* A pressure action needs the drain of the ordinary path. */
+    const int pressure_due = ds4_gpu_stream_pressure_due();
+    if (!mm && !pressure_due && qwen4_stream_handshake_layer(&handshake_ok, g_batch_cb != nil, table, mid, part, x, selected,
             gate_type, down_type, n_tokens, n_slots, in_dim, ff_dim, shared_gate_offset,
             shared_up_offset, shared_down_offset, shared_type, shared_down_type)) return handshake_ok;
     int32_t *ids = malloc((size_t)n_ids * sizeof(*ids));
@@ -40498,6 +40736,7 @@ int ds4_gpu_qwen4_moe_stream_tensor(
      * work completes. Also join a previous explicit-load job before reusing
      * its worker pool or replacing cache entries. */
     ds4_gpu_stream_expert_pending_load_clear();
+    if (pressure_due) ds4_gpu_stream_pressure_apply();
     ok = ds4_gpu_tensor_read(selected, 0, ids, n_ids * sizeof(*ids));
     for (uint64_t i = 0; ok && i < n_ids; i++) {
         if (ids[i] < 0 || (uint32_t)ids[i] >= table->n_total_expert) { ok = 0; break; }
