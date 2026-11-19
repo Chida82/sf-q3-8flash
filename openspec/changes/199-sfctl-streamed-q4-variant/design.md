@@ -33,6 +33,12 @@ reference.
 
 ### D4. Mirroring
 
+Checked in each child before landing: its `sfctl/sf-<model>.conf` is
+unchanged, `sfctl plist <service>` prints the same arguments as before the
+change, and `grep -n ssd sfctl/sfctl sfctl/README.md tests/test_sfctl.sh`
+finds nothing.
+
+
 The other children with `sfctl` get the identical `sfctl/sfctl`,
 `sfctl/README.md` and `tests/test_sfctl.sh` on a branch each, with their
 own `make test`; no other file changes there. Landing in each child follows

@@ -22,6 +22,12 @@ only in the bench.
   child: the change is made identically in each child that has them, as
   their README requires, and a child that sets no `SF_ARGS_<variant>`
   behaves as today.
+- **Opt-in only (owner, 2026-11-19).** Not every current or future child
+  streams experts from SSD. The shared script gains a generic mechanism and
+  nothing else: no streaming flag, default, variant or model name in
+  `sfctl/sfctl`, `sfctl/README.md` or `tests/test_sfctl.sh`. Only this child's
+  `sfctl/sf-q3-8flash.conf` uses it; the other children's configs are not
+  touched, and their services start exactly as before.
 - **The variant**: `q4s` in `sfctl/sf-q3-8flash.conf`, the Q4 weights, with
   `--ssd-streaming --ssd-streaming-cache-experts <slots>` for 54 GiB (9,701
   slots by `190`'s measurement, or the footprint option of `196` if it has
