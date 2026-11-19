@@ -66,6 +66,17 @@ this pass has not reached again. Hotness alone evicts an expert loaded for
 the current token, which has one selection, before one that was hot a while
 ago, and a layer often routes the same expert again one token later.
 
+The victim is found through a per-layer minimum (change `192`): each layer
+keeps its least (rank, last use, expert) among the entries that can be taken,
+recomputed only when the layer changed (a load, a hit, an eviction, an
+in-flight mark, a hotness change), at a new pass, or when the row call moves
+past it. A search visits layers by their minimum and scans only those that
+can still hold a victim. The victims are exactly those of a scan of every
+entry, which `DS4_METAL_STREAM_EXPERT_VICTIM_SCAN=1` restores and `=2` checks
+against the index at every search. At 54 GiB the search took 2-3% of decode
+before (one scan of every entry per layer call that misses) and a third of
+that after: decode +1.9% on MTP code, +0.4% on MTP prose, +2.0% plain at 54 GiB.
+
 At emulated 48 GB, against the hotness order alone (each run started with
 the pack's pages dropped from the page cache, tokens identical, bootstrap
 95% CI of the median pair ratio; change `188`):

@@ -170,6 +170,7 @@ static int qwen4_handshake_service(const ds4_gpu_stream_expert_table *t, uint32_
             if (!e->valid) continue;
             e->last_used = ++g_stream_expert_cache_clock;
             e->used_token = g_stream_expert_cache_decode_tokens;
+            ds4_gpu_stream_victim_touch(t->layer);
         }
         ok = ds4_gpu_stream_expert_cache_begin_selected_load(t, unique, n_unique) &&
              ds4_gpu_stream_expert_pending_load_finish(NULL);
@@ -320,6 +321,7 @@ static int qwen4_stream_handshake_layer(
     if (!g_batch_cb && !ds4_gpu_begin_commands()) *ok = 0;
     /* The released kernels read these slots until their buffer completes. */
     for (uint32_t i = 0; *ok && i < n_entries; i++) entries[i]->inflight_seq = experts_seq;
+    if (*ok && n_entries) ds4_gpu_stream_victim_touch(table->layer);
 #ifdef DS4_TEST_QWEN4_HANDSHAKE
     DS4_TEST_QWEN4_HANDSHAKE(*ok);
 #endif
