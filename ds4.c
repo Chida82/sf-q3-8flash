@@ -32602,11 +32602,13 @@ static DS4_MAYBE_UNUSED bool qwen4_streaming_staging_bytes(
     const uint32_t layers = mtp ? DS4_N_LAYER : trunk_layers;
     const uint64_t addresses = ds4_mul_sat_u64(DS4_N_EXPERT, 3u * sizeof(uint64_t));
     uint64_t staging = 0, trunk_expert = 0;
+    /* The cache's size class, the most common one: a layer of another size
+     * (an outlier quant, even at layer 0) still takes owned staging. */
+    if (!ds4_streaming_routed_expert_bytes(weights, &trunk_expert)) return false;
     for (uint32_t il = 0; il < layers; il++) {
         uint64_t expert = 0;
         if (!streaming_layer_routed_expert_bytes(&weights->layer[il], &expert)) return false;
-        if (il == 0) trunk_expert = expert;
-        /* a layer of the trunk's size goes through a cache that holds all of its experts */
+        /* a layer of the cache's size goes through a cache that holds all of its experts */
         if (cache_holds_layer && expert == trunk_expert) continue;
         const uint64_t full = ds4_mul_sat_u64(expert, DS4_N_EXPERT);
         uint64_t window = ds4_mul_sat_u64(full, 2u);

@@ -317,11 +317,12 @@ static int qwen4_stream_handshake_layer(
         g_qwen4_hs_release.signaledValue = g_qwen4_hs_release_value;
         (void)ds4_gpu_synchronize();
     }
-    /* Like the ordinary path, return with the caller's batch open. */
-    if (!g_batch_cb && !ds4_gpu_begin_commands()) *ok = 0;
-    /* The released kernels read these slots until their buffer completes. */
+    /* The released kernels read these slots until their buffer completes:
+     * mark them before reopening the batch, which can fail. */
     for (uint32_t i = 0; *ok && i < n_entries; i++) entries[i]->inflight_seq = experts_seq;
     if (*ok && n_entries) ds4_gpu_stream_victim_touch(table->layer);
+    /* Like the ordinary path, return with the caller's batch open. */
+    if (!g_batch_cb && !ds4_gpu_begin_commands()) *ok = 0;
 #ifdef DS4_TEST_QWEN4_HANDSHAKE
     DS4_TEST_QWEN4_HANDSHAKE(*ok);
 #endif
