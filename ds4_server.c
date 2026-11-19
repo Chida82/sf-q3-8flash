@@ -16672,6 +16672,84 @@ static void test_qwen_tool_stream_two_calls(void) {
     }
 }
 
+/* Issues #2 and #3 (2026-10-14), both live streams, byte by byte, so every
+ * update boundary is tried, a newline as an update's first byte included:
+ * a multi-line value keeps every newline, and a value of an integer
+ * parameter that is not JSON ("about five") goes out as a quoted string, as
+ * the final parser gives it, never raw. */
+static void test_qwen_tool_stream_issue_2_3(void) {
+    const char *raw =
+        "<tool_call>\n<function=bash>\n<parameter=command>\nls -la\npwd\n\necho done\n</parameter>\n"
+        "</function>\n</tool_call>\n<tool_call>\n<function=set>\n"
+        "<parameter=count>\nabout five\n</parameter>\n<parameter=mode>\n\n</parameter>\n"
+        "</function>\n</tool_call>";
+    for (int anthropic = 0; anthropic < 2; anthropic++) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        int bufsz = 1 << 20;
+        setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
+        setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz));
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = anthropic ? API_ANTHROPIC : API_OPENAI;
+        r.stream = true;
+        r.think_mode = DS4_THINK_NONE;
+        r.has_tools = true;
+        r.tool_orders = make_bash_order();
+        tool_schema_orders_add_json(&r.tool_orders,
+            "{\"name\":\"set\",\"input_schema\":{\"type\":\"object\",\"properties\":{"
+            "\"count\":{\"type\":\"integer\"},\"mode\":{\"type\":\"string\"}}}}");
+        openai_stream ost;
+        anthropic_stream ast;
+        openai_stream_start(&r, &ost);
+        if (anthropic) TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_i23", 10, &ast));
+        const size_t len = strlen(raw);
+        for (size_t n = 1; n <= len; n++) {
+            char *prefix = xstrndup(raw, n);
+            TEST_ASSERT(anthropic ?
+                anthropic_sse_stream_update(sv[0], NULL, &r, "msg_i23", &ast, prefix, n, false) :
+                openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_i23", &ost, prefix, n, false));
+            free(prefix);
+        }
+        tool_calls calls = {0};
+        char *content = NULL, *reasoning = NULL;
+        TEST_ASSERT(parse_generated_message_ex(raw, false, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 2);
+        if (anthropic) {
+            apply_anthropic_stream_tool_ids(&calls, &ast);
+            TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_i23", &ast, raw,
+                                                  len, &calls, "tool_calls", 4));
+        } else {
+            apply_openai_stream_tool_ids(&calls, &ost);
+            TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_i23", &ost, raw,
+                                               len, &calls, "tool_calls", 10, 4));
+        }
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "ls -la\\\\npwd\\\\n\\\\necho done") != NULL);
+        TEST_ASSERT(strstr(out, "\\\"count\\\":\\\"about five\\\"") != NULL);
+        TEST_ASSERT(strstr(out, "\\\"count\\\":about") == NULL);
+        TEST_ASSERT(strstr(out, "\\\"mode\\\":\\\"\\\"") != NULL);
+        if (!anthropic) {
+            char *a0 = test_sse_tool_args(out, 0);
+            char *a1 = test_sse_tool_args(out, 1);
+            TEST_ASSERT(!strcmp(a0, "{\\\"command\\\":\\\"ls -la\\\\npwd\\\\n\\\\necho done\\\"}"));
+            TEST_ASSERT(!strcmp(a1, "{\\\"count\\\":\\\"about five\\\",\\\"mode\\\":\\\"\\\"}"));
+            free(a0);
+            free(a1);
+        }
+        free(out);
+        free(content);
+        free(reasoning);
+        tool_calls_free(&calls);
+        openai_stream_free(&ost);
+        if (anthropic) anthropic_stream_free(&ast);
+        request_free(&r);
+        close(sv[0]);
+        close(sv[1]);
+    }
+}
+
 static void test_streaming_holds_partial_utf8(void) {
     const char partial[] = {'A', ' ', (char)0xf0, (char)0x9f, 0};
     const char complete[] = {'A', ' ', (char)0xf0, (char)0x9f,
@@ -21243,6 +21321,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_closed_call_whole();
     test_qwen_tool_stream_two_calls();
+    test_qwen_tool_stream_issue_2_3();
     test_streaming_holds_partial_utf8();
     /* sf-ablate(glm): legacy DSML/GLM protocol tests removed; Qwen tool syntax remains below. */
     test_tool_recovery_output_budget();
