@@ -71,7 +71,7 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_case
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-ds4_metal.o: ds4_metal.m ds4_metal_device.h ds4_gpu.h ds4_gpu_tp.h $(METAL_SRCS)
+ds4_metal.o: ds4_metal.m ds4_metal_device.h ds4_gpu.h ds4_gpu_tp.h ds4_metal_stream_overlap.inc ds4_metal_stream_handshake.inc $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ $<
 
 ds4_cpu.o: ds4.c
@@ -221,7 +221,7 @@ test-qwen4-moe-mm-compact:
 tests/test_qwen4_ssd_experts.o: tests/test_qwen4_ssd_experts.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
-tests/ds4_metal_qwen_ssd.o: ds4_metal.m ds4_metal_device.h ds4_gpu.h ds4_gpu_tp.h $(METAL_SRCS) tests/qwen4_ssd_pread_probe.h
+tests/ds4_metal_qwen_ssd.o: ds4_metal.m ds4_metal_device.h ds4_gpu.h ds4_gpu_tp.h ds4_metal_stream_overlap.inc ds4_metal_stream_handshake.inc $(METAL_SRCS) tests/qwen4_ssd_pread_probe.h
 	$(CC) $(OBJCFLAGS) -include tests/qwen4_ssd_pread_probe.h -c -o $@ ds4_metal.m
 
 tests/test_qwen4_ssd_experts: tests/test_qwen4_ssd_experts.o $(filter-out ds4_metal.o,$(CORE_OBJS)) tests/ds4_metal_qwen_ssd.o
@@ -242,7 +242,7 @@ tests/test_qwen4_memory: tests/test_qwen4_memory.o $(filter-out ds4_cpu.o,$(CPU_
 test-qwen4-memory: tests/test_qwen4_memory
 	./tests/test_qwen4_memory
 
-tests/test_metal_ssd_reuse.o: tests/test_metal_ssd_reuse.m ds4_metal.m ds4_metal_device.h ds4_gpu.h ds4_gpu_tp.h
+tests/test_metal_ssd_reuse.o: tests/test_metal_ssd_reuse.m ds4_metal.m ds4_metal_device.h ds4_gpu.h ds4_gpu_tp.h ds4_metal_stream_overlap.inc ds4_metal_stream_handshake.inc
 	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
 
 tests/test_metal_ssd_reuse: tests/test_metal_ssd_reuse.o ds4_image.o

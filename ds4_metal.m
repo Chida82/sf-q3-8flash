@@ -8690,11 +8690,8 @@ int ds4_gpu_begin_commands(void) {
 }
 
 
-int ds4_gpu_flush_commands(void) {
-    if (!g_initialized && !ds4_gpu_init()) return 0;
-    ds4_gpu_parallel_ffn_reset_state(YES);
-    if (!g_batch_cb) return 0;
-
+/* Commits the open batch without opening its successor. */
+static void ds4_gpu_commit_batch_commands(void) {
     ds4_gpu_close_batch_encoder();
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
@@ -8702,6 +8699,14 @@ int ds4_gpu_flush_commands(void) {
     [cb commit];
     [g_pending_cbs addObject:cb];
     ds4_gpu_stream_expert_cache_note_batch_committed();
+}
+
+int ds4_gpu_flush_commands(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    ds4_gpu_parallel_ffn_reset_state(YES);
+    if (!g_batch_cb) return 0;
+
+    ds4_gpu_commit_batch_commands();
 
     g_batch_cb = ds4_gpu_new_command_buffer();
     g_batch_has_work = NO;
@@ -10842,11 +10847,13 @@ int ds4_gpu_synchronize(void) {
 static void qwen4_nax_release_scratch(void);
 static void qwen4_batch_release_scratch(void);
 
+static void qwen4_stream_handshake_reset(void);  /* ds4_metal_stream_handshake.inc */
 void ds4_gpu_cleanup(void) {
     if (!g_initialized) return;
     ds4_gpu_queue_keepalive_stop_thread();
 
     @autoreleasepool {
+        qwen4_stream_handshake_reset();
         ds4_gpu_decode_pipeline_fast_cache_reset();
         ds4_gpu_parallel_ffn_reset_state(YES);
         if (g_batch_cb) {
@@ -14564,7 +14571,7 @@ retry:
     ;
     uint32_t victim_layers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
     uint32_t victim_experts[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
-    uint32_t victim_hotness[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+    uint64_t victim_hotness[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
     uint64_t victim_last_used[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
     uint32_t victim_count = 0;
     int skipped_inflight = 0;
@@ -14574,7 +14581,7 @@ retry:
     for (uint32_t i = 0; i < n_needed; i++) {
         victim_layers[i] = UINT32_MAX;
         victim_experts[i] = UINT32_MAX;
-        victim_hotness[i] = UINT32_MAX;
+        victim_hotness[i] = UINT64_MAX;
         victim_last_used[i] = UINT64_MAX;
     }
 
@@ -14605,8 +14612,9 @@ retry:
                 continue;
             }
 
-            const uint32_t hotness =
-                g_stream_expert_cache_route_hotness[layer][expert];
+            /* the row path's rank: the handshake's decode loads come here (189) */
+            const uint64_t hotness =
+                ds4_gpu_stream_expert_cache_victim_rank(layer, expert, e);
             const uint64_t last_used = e->last_used;
             if (victim_count < n_needed) {
                 victim_layers[victim_count] = layer;
@@ -15395,6 +15403,20 @@ static void ds4_gpu_stream_expert_pending_load_release_buffers(
     }
 }
 
+/* After a failed pending load: the loads whose experts did not install give
+ * their reservations back, so a retry finds the same slots again. */
+static void ds4_gpu_stream_expert_pending_load_return_reservations(
+        ds4_gpu_stream_expert_pending_load *p) {
+    for (uint32_t i = 0; i < p->n_loads; i++) {
+        if (!p->gate_bufs[i]) continue;
+        const uint32_t expert = (uint32_t)p->selected_ids[p->load_slots[i]];
+        const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[p->layer][expert];
+        if (e->valid && e->gate_buffer == p->gate_bufs[i] && e->gate_inner == p->gate_inners[i]) continue;
+        ds4_gpu_stream_expert_give_back_buffers(&p->gate_bufs[i], &p->up_bufs[i], &p->down_bufs[i],
+                                                p->gate_inners[i]);
+    }
+}
+
 static int ds4_gpu_stream_expert_pending_load_install(
         ds4_gpu_stream_expert_pending_load *p,
         ds4_gpu_stream_expert_cache_entry *entries[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED],
@@ -15482,6 +15504,7 @@ static int ds4_gpu_stream_expert_pending_load_finish(
 
     const double start_ms = p->start_ms;
     if (!ds4_gpu_stream_expert_pread_pool_wait()) {
+        ds4_gpu_stream_expert_pending_load_return_reservations(p);
         ds4_gpu_stream_expert_pending_load_release_buffers(p);
         p->active = 0;
         return 0;
@@ -15491,6 +15514,7 @@ static int ds4_gpu_stream_expert_pending_load_finish(
     const int ok = ds4_gpu_stream_expert_pending_load_install(p,
                                                               entries,
                                                               elapsed_ms);
+    if (!ok) ds4_gpu_stream_expert_pending_load_return_reservations(p);
     ds4_gpu_stream_expert_pending_load_release_buffers(p);
     p->n_tasks = 0;
     p->n_loads = 0;
@@ -15748,6 +15772,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
                         ds4_gpu_now_ms() - buffer_t0);
             }
             if (!prepared) {
+                ds4_gpu_stream_expert_pending_load_return_reservations(p);
                 ds4_gpu_stream_expert_pending_load_release_buffers(p);
                 return 0;
             }
@@ -15762,6 +15787,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         uint8_t *down_dst = (uint8_t *)[p->down_bufs[load_i] contents] +
                              p->down_inners[load_i];
         if (!gate_dst || !up_dst || !down_dst) {
+            ds4_gpu_stream_expert_pending_load_return_reservations(p);
             ds4_gpu_stream_expert_pending_load_release_buffers(p);
             return 0;
         }
@@ -15815,11 +15841,13 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
                                            p->n_tasks,
                                            &read_bytes,
                                            &read_ms)) {
+        ds4_gpu_stream_expert_pending_load_return_reservations(p);
         ds4_gpu_stream_expert_pending_load_release_buffers(p);
         return 0;
     }
     (void)read_bytes;
     if (!ds4_gpu_stream_expert_pending_load_install(p, NULL, read_ms)) {
+        ds4_gpu_stream_expert_pending_load_return_reservations(p);
         ds4_gpu_stream_expert_pending_load_release_buffers(p);
         return 0;
     }
@@ -16839,13 +16867,10 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         /* clear_layer skips inflight entries. Finish any submitted prefix
          * before releasing payloads or changing counts. */
         if (before_read_called) (void)ds4_gpu_synchronize();
-        if (gate_up_ready) {
-            /* These reservations never became cache entries, so clear_layer
-             * cannot recycle them. No CPU/GPU reader remains after the drain. */
-            for (uint32_t i = n_installed; i < n_loads; i++) {
-                ds4_gpu_stream_expert_give_back_buffers(&gate_bufs[i], &up_bufs[i],
-                                                        &down_bufs[i], gate_inners[i]);
-            }
+        /* sf-keep(ssd): 120's give-back helper serves #1328 too; every uninstalled load returns, n_loads's included. */
+        const uint32_t n_prepared = n_loads < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ? n_loads + 1u : n_loads;
+        for (uint32_t i = n_installed; i < n_prepared; i++) {
+            ds4_gpu_stream_expert_give_back_buffers(&gate_bufs[i], &up_bufs[i], &down_bufs[i], gate_inners[i]);
         }
         ds4_gpu_stream_expert_cache_clear_layer(layer);
         return 0;
@@ -39277,7 +39302,7 @@ int ds4_gpu_qwen4_moe_down_tensor(
     const uint64_t experts_bytes = expert_bytes * n_total_expert;
     const uint64_t shared_bytes = (uint64_t)sh_row_bytes * out_dim;
     qwen4_moe_args args = { n_tokens, n_slots, ff_dim, out_dim, weight_type, row_bytes, expert_bytes,
-                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, 0u,
+                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, n_total_expert,
                             {0}, 0u, 0u, 0u };
     qwen4_bind b[5];
     if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || (ff_dim % 32u) != 0 ||
@@ -40180,6 +40205,9 @@ static int qwen4_stream_missing_gate_up_ready(
     return ok;
 }
 
+#include "ds4_metal_stream_overlap.inc"
+#include "ds4_metal_stream_handshake.inc"
+
 int ds4_gpu_qwen4_moe_stream_tensor(
         ds4_gpu_tensor *mid, ds4_gpu_tensor *part, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
@@ -40240,6 +40268,10 @@ int ds4_gpu_qwen4_moe_stream_tensor(
         }
     }
 
+    int handshake_ok = 0;
+    if (!mm && qwen4_stream_handshake_layer(&handshake_ok, g_batch_cb != nil, table, mid, part, x, selected,
+            gate_type, down_type, n_tokens, n_slots, in_dim, ff_dim, shared_gate_offset,
+            shared_up_offset, shared_down_offset, shared_type, shared_down_type)) return handshake_ok;
     int32_t *ids = malloc((size_t)n_ids * sizeof(*ids));
     if (!ids) return 0;
     qwen4_moe_half_pass half_pass = {0};
@@ -40408,6 +40440,7 @@ done:
     ds4_gpu_tensor_free(overlap.resident_counts);
     ds4_gpu_tensor_free(overlap.missing_counts);
     free(ids);
+    ok = qwen4_stream_early_commit(ok, had_batch, n_tokens);
     if (!had_batch && g_batch_cb && !ds4_gpu_end_commands()) ok = 0;
     if (had_batch && !g_batch_cb && !ds4_gpu_begin_commands()) ok = 0;
     return ok;

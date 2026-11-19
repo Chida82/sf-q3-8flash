@@ -194,14 +194,38 @@ uncached, medians (change `191`):
 
 A layer that finds every expert cached still leaves the GPU idle about 190
 us. Over decode the wake is 6% (MTP code) to 8% (plain), the commit start 8%
-to 10%. Two ways to shorten it were measured and dropped:
-- committing the expert pass before the rest of the layer is encoded has
-  only 12 us of encoding to hide and adds a commit;
-- polling the command buffer's status instead of blocking cut the wake but
-  ran the GPU at 720 MHz and 7 W instead of 1590 MHz and 27 W: MTP code
-  decode fell from 29.9 to 25.4 t/s. While the CPU blocks on the GPU, the
-  GPU stays at its high clock; while it spins, it does not. Any wait for
-  the GPU on this path must block.
+to 10%.
+
+What shortens it is committing the expert pass as soon as it is encoded
+(change `189`, from upstream #1328). The next batch, the rest of the layer
+and the next router, is then committed while the expert pass runs, so its
+commit-to-start time is spent with the GPU busy instead of idle. `191` had
+dropped the same step on a projection that counted only the 12 us of
+encoding it hides; measured, it gains (below). On Q2 a single-row decode
+layer goes further: it is encoded before its experts are known and parks on
+a shared event that the CPU signals once the missing experts are loaded
+(the handshake; Q4's Q4_K gate/up rows take grouped tables and skip it).
+Capped, RAM taken, against the code before, bootstrap 95% CI of the median
+pair ratio:
+
+| Pack, cache | Kind | Decode |
+|---|---|---|
+| Q4, 54 GiB | mtp-code | 32.75 -> 34.06 t/s, +4.0% [+3.6%, +5.2%] |
+| Q4, 54 GiB | mtp-prose | 38.16 -> 40.18, +5.1% [+3.9%, +5.6%] |
+| Q4, 54 GiB | plain | 24.59 -> 25.79, +4.9% [+0.7%, +5.7%] |
+| Q4, 48 GiB | mtp-code | 26.95 -> 27.84, +3.2% [+2.6%, +3.7%] |
+| Q4, 60 GiB | mtp-code | 39.20 -> 40.17, +2.4% [-3.7%, +5.6%] |
+| Q4, 10% (2,458 slots) | mtp-code / plain | +0.1% [-1.2%, +1.3%] / +3.1% [+2.9%, +3.2%] |
+| Q2, 54 GiB (18,563 slots) | plain / mtp-code | +5.6% [+4.7%, +6.9%] / +4.7% [-1.4%, +10.0%] |
+
+Prefill does not change (every interval includes zero). At 10% of the
+experts misses dominate and MTP code gains nothing.
+
+Polling the command buffer's status instead of blocking (`191`) cut the
+wake but ran the GPU at 720 MHz and 7 W instead of 1590 MHz and 27 W: MTP
+code decode fell from 29.9 to 25.4 t/s. While the CPU blocks on the GPU, the
+GPU stays at its high clock; while it spins, it does not. Any wait for the
+GPU on this path must block.
 
 ### A 48 GB Mac
 
