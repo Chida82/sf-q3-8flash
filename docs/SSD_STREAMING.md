@@ -139,8 +139,14 @@ give the RAM-free figures. They are reported and decide nothing.
 Footprint is the engine's planned total at the service's configuration
 (`--ctx 262144 --mtp`, the 0.57 GiB vision projector added): 26.33 GiB before
 the cache on Q4, of which the KV and graph buffers of the 262144-token
-context are 20.01. A process at 2048 tokens of that context peaks about
-12 GiB under the plan. Until change `193` the plan also reserved 2.59 GiB of
+context are 20.01. The process holds about 3 GiB less than the plan, and
+the same at every context length: its footprint (`footprint -p`) is 43.8
+GiB at 2048 tokens and 44.0 GiB from 16K to 254K, plus the 6.3 GiB of locked
+static weights, which macOS counts as clean mapped file rather than
+footprint. The KV and graph buffers are touched in full when they are
+allocated, so a short context leaves nothing to lend the cache; about 3.8
+GiB of the 20.01 GiB graph reserve is never touched at all (change `196`).
+Until change `193` the plan also reserved 2.59 GiB of
 staging, and the table below was measured at those smaller caches.
 
 | Footprint | Cache slots | Expert cache | Share of Q4's routed experts | Slots before `193` |
