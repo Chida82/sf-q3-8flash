@@ -234,6 +234,30 @@ gives decode -0.45% [-3.19%, +0.17%] on MTP code and +0.15% [-3.92%, +4.39%]
 plain (bootstrap 95% CI of the median pair ratio). A single pair can move
 4%; a change is judged on at least 8 pairs, two invocations per kind.
 
+### A neighbour
+
+The uncached switch models a neighbour; a real one shows why it is needed.
+Beside a process holding 60 GiB of anonymous memory that it touches once a
+second (Q4 at 54 GiB, change `195`):
+
+- **Buffered reads compress the neighbour.** They fill the file cache, and
+  the kernel makes room by compressing the neighbour, whose pages are older:
+  in one run the compressor grew from 4 to 47 GiB within seconds of the
+  first prefill and the memory guard stopped it. With the first prefill
+  uncached and decode buffered, the first seconds of decode did the same.
+- **Uncached reads leave it alone.** Nothing of the neighbour was compressed
+  in nine runs, and decode and prefill ran at the RAM-free uncached rates:
+  MTP code 34.1 t/s, plain 26.3, prefill 8192 768-775, cold 32K 1185.
+- **The pressure signal comes too late to choose the mode.** The system's
+  level stayed normal through every uncached run and rose to warning only
+  after the compressor had already taken 10 GiB of the neighbour. Splitting
+  by class instead (prefill uncached, decode buffered) costs 18-20% of
+  decode with the RAM free (MTP code 48.7 -> 40.0 t/s, plain 35.8 -> 28.8).
+
+So the read mode is chosen at launch: on a machine whose RAM other work
+holds, run with `DS4_METAL_STREAM_EXPERT_UNCACHED_READS=1`; with RAM to
+spare, the buffered default decodes 36-42% faster.
+
 ### Appends on a long context
 
 An agent's request is an append: a tool result or a turn of a few hundred
