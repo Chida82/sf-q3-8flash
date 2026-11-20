@@ -32777,6 +32777,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->glm_tp_token_prefill = opt->tp.glm_token_prefill;
     e->ssd_streaming = opt->ssd_streaming;
     e->ssd_streaming_cold = opt->ssd_streaming_cold;
+    if (opt->ssd_streaming_uncached && !opt->ssd_streaming) {
+        fprintf(stderr, "ds4: --ssd-streaming-uncached needs --ssd-streaming\n");
+        free(e);
+        *out = NULL;
+        return 1;
+    }
     e->ssd_streaming_full_layers_set = opt->ssd_streaming_full_layers_set;
     e->distributed = opt->distributed;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
@@ -33119,6 +33125,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         ds4_gpu_set_quality(e->quality);
         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
+        ds4_gpu_set_ssd_streaming_uncached(opt->ssd_streaming_uncached);
 #ifdef DS4_HAS_QWEN4_METAL
         if (qwen4_ssd) {
             const ds4_context_memory memory = ds4_context_memory_estimate_with_prefill_mode(

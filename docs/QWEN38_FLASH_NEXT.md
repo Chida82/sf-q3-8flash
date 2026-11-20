@@ -17,7 +17,9 @@ The Q2 GGUF is about 137.10 GiB with 41.73 GiB of resident weights. Q4 is about
 BF16 n-gram table. The n-grams remain on disk and selected rows are read from
 the GGUF, so use a fast local SSD. With `--ssd-streaming` the routed experts
 stay on disk as well and only 6.32 GiB of weights must be resident, so the
-model runs on smaller Macs; see `docs/SSD_STREAMING.md`.
+model runs on smaller Macs. When other work needs the rest of the RAM, add
+`--ssd-streaming-uncached` so the reads do not fill the file cache; see
+`docs/SSD_STREAMING.md`.
 
 Enable built-in speculation with `--mtp`. `--nothink` disables reasoning. The
 server advertises `qwen3.8-flash-next`, `qwen3.8-flash-next-chat`, and

@@ -623,6 +623,7 @@ static id<MTLBuffer> g_moe_q4_down_slots_buffer;
 static id<MTLBuffer> g_attn_out_group_ids_buffer;
 static int g_model_fd = -1;
 static int g_model_uncached_fd = -1;
+static int g_ssd_streaming_uncached;
 static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
 static uint64_t g_model_mapped_offset;
@@ -4604,6 +4605,11 @@ void ds4_gpu_set_ssd_streaming(bool enabled) {
         fprintf(stderr,
                 "ds4: Metal SSD streaming mode enabled; full model residency and warmup are skipped\n");
     }
+}
+
+void ds4_gpu_set_ssd_streaming_uncached(bool enabled) {
+    g_ssd_streaming_uncached = enabled ? 1 : 0;
+    ds4_gpu_stream_expert_uncached_fd_reset();
 }
 
 
@@ -12184,27 +12190,31 @@ static uint32_t ds4_gpu_stream_expert_pread_thread_count(uint32_t n_tasks) {
     return threads;
 }
 
-/* Measurement switch (change 190): DS4_METAL_STREAM_EXPERT_UNCACHED_READS=1
- * reads routed experts through a second descriptor with F_NOCACHE, so a miss
- * costs an SSD read as on a machine whose RAM other work holds. Off by
+/* --ssd-streaming-uncached (207), or DS4_METAL_STREAM_EXPERT_UNCACHED_READS=1
+ * as in change 190, reads routed experts through a second descriptor with
+ * F_NOCACHE: a miss costs an SSD read and leaves no page in the file cache,
+ * so the footprint stays as planned when other work holds the RAM. Off by
  * default: with RAM to spare the file cache serves evicted experts (185).
- * If the second open fails, reads stay buffered. */
+ * If the second descriptor cannot be set up, reads stay buffered. */
 static void ds4_gpu_stream_expert_uncached_fd_reset(void) {
     if (g_model_uncached_fd >= 0) close(g_model_uncached_fd);
     g_model_uncached_fd = -1;
     char path[MAXPATHLEN];
     struct stat model_st, st;
     const char *env = getenv("DS4_METAL_STREAM_EXPERT_UNCACHED_READS");
-    if (!g_ssd_streaming_mode || g_model_fd < 0 || !env || strcmp(env, "1") != 0 ||
-        fcntl(g_model_fd, F_GETPATH, path) != 0) {
-        return;
-    }
-    const int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return;
-    if (fstat(fd, &st) != 0 || fstat(g_model_fd, &model_st) != 0 ||
+    const bool wanted = g_ssd_streaming_uncached || (env && strcmp(env, "1") == 0);
+    if (!g_ssd_streaming_mode || g_model_fd < 0 || !wanted) return;
+    int fd = -1;
+    if (fcntl(g_model_fd, F_GETPATH, path) == 0) fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0 && (fstat(fd, &st) != 0 || fstat(g_model_fd, &model_st) != 0 ||
         st.st_dev != model_st.st_dev || st.st_ino != model_st.st_ino ||
-        fcntl(fd, F_NOCACHE, 1) != 0 || fcntl(fd, F_RDAHEAD, 0) != 0) {
+        fcntl(fd, F_NOCACHE, 1) != 0 || fcntl(fd, F_RDAHEAD, 0) != 0)) {
         close(fd);
+        fd = -1;
+    }
+    if (fd < 0) {
+        static int warned;
+        if (!warned++) fprintf(stderr, "ds4: Metal SSD expert reads cannot bypass the file cache; they stay buffered\n");
         return;
     }
     g_model_uncached_fd = fd;

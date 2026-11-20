@@ -1005,7 +1005,8 @@ static void check_grouped(const weights *w, int fd) {
 static char fixture_path[1024];
 static void remove_fixture(void) { unlink(fixture_path); }
 
-int main(void) {
+int main(int argc, char **argv) {
+    const bool uncached_option = argc > 1 && strcmp(argv[1], "--uncached") == 0;
     weights formats[] = {{.gate_type=16, .down_type=10, .shared_down_type=8},
                          {.gate_type=12, .down_type=39, .shared_down_type=39},
                          {.gate_type=8, .down_type=8, .shared_down_type=8}};
@@ -1030,7 +1031,7 @@ int main(void) {
     const int fixture_fd = mkstemp(fixture_path);
     need(fixture_fd >= 0 && atexit(remove_fixture) == 0, "named expert file");
     FILE *file = fdopen(fixture_fd, "w+b"), *empty = tmpfile();
-    uncached_reads = getenv("DS4_METAL_STREAM_EXPERT_UNCACHED_READS") != NULL;
+    uncached_reads = uncached_option || getenv("DS4_METAL_STREAM_EXPERT_UNCACHED_READS") != NULL;
     need(file && empty && ftruncate(fileno(file), (off_t)bytes) == 0, "temporary sparse expert file");
     uint8_t *map = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fileno(file), 0);
     need(map != MAP_FAILED, "expert file mapping");
@@ -1050,6 +1051,7 @@ int main(void) {
     }
     need(msync(map, bytes, MS_SYNC) == 0 && ds4_gpu_init(), "fixture initialization");
     ds4_gpu_set_quality(false); ds4_gpu_set_ssd_streaming(true);
+    ds4_gpu_set_ssd_streaming_uncached(uncached_option);
     need(ds4_gpu_set_model_map(map, bytes) && ds4_gpu_set_model_fd(fileno(file)), "model registration");
     const uint32_t shapes[][2] = {{0,1}, {0,2}, {0,3}, {0,9}, {0,128},
                                   {1,1}, {1,17}, {1,128}, {2,2}, {2,9}};

@@ -45,6 +45,36 @@ demand: `--ssd-streaming-cold` changes nothing, and
 `--ssd-streaming-full-layers` and `--ssd-streaming-preload-experts` are
 refused.
 
+### Reads past the file cache
+
+By default a streamed expert read goes through the macOS file cache. With
+RAM to spare that cache acts as a second, larger expert cache: an expert
+the engine evicted comes back from it at memory speed. It is also RAM that
+the process footprint does not show. It grows toward the whole model, and
+when other applications need memory macOS compresses them rather than drop
+those pages (`195`: beside a 60 GiB neighbour, 43 GiB of the neighbour were
+compressed in 18 s while 20 GiB of model pages stayed cached).
+
+`--ssd-streaming-uncached` reads routed experts past the file cache
+(`F_NOCACHE`): every miss is an SSD read, and only the static weights of the
+GGUF stay in the file cache. Use it when other work needs the rest of the
+RAM; leave it off when the machine is free for the model. Output is the
+same in both modes. Q4 at 54 GiB, before `205` (change `195`):
+
+| | Buffered (default) | `--ssd-streaming-uncached` |
+|---|---|---|
+| RAM free, MTP code decode | 48.7 t/s | 34.2 t/s |
+| RAM free, plain decode | 35.8 t/s | 26.3 t/s |
+| Prefill 8192, RAM free | 773 t/s | 768 t/s |
+| Beside a 60 GiB neighbour | run stopped by the memory guard: the neighbour compressed | 34.1 t/s, the neighbour untouched |
+
+The mode is chosen at launch: neither the system pressure level (`195`) nor
+an estimate of spare memory (`206`) tells the engine early enough which
+case it is in. The option needs `--ssd-streaming`. If the second descriptor
+cannot be opened, the engine says so and reads stay buffered.
+`DS4_METAL_STREAM_EXPERT_UNCACHED_READS=1` has the same effect; benches use
+it to compare against trees that predate the option (`207`).
+
 A prefill batch that selects more experts than the cache holds, and the Q2
 pack's differently quantized MTP layer, stage only the selected experts in
 owned buffers. Cached experts compute while the missing ones load: gate/up
@@ -161,13 +191,15 @@ not hold is read from the SSD:
 - no memory lock;
 - the expert cache fixed with `--ssd-streaming-cache-experts`, from the
   footprint;
-- `DS4_METAL_STREAM_EXPERT_UNCACHED_READS=1`, which reads routed experts
-  through a second descriptor with `F_NOCACHE`, whole pages into a
-  page-aligned buffer (on APFS an unaligned `F_NOCACHE` read still leaves
-  pages cached). The default stays buffered. A run with the switch leaves
-  only the static weights of the GGUF in the file cache, but an `F_NOCACHE`
-  read is still served from pages that are already there: a series starts
-  from an evicted GGUF, which `ab_bench.py` does when `--env` sets the switch;
+- uncached reads (`--ssd-streaming-uncached`, or
+  `DS4_METAL_STREAM_EXPERT_UNCACHED_READS=1` for trees that predate it),
+  which read routed experts through a second descriptor with `F_NOCACHE`,
+  whole pages into a page-aligned buffer (on APFS an unaligned `F_NOCACHE`
+  read still leaves pages cached). A run with them leaves only the static
+  weights of the GGUF in the file cache, but an `F_NOCACHE` read is still
+  served from pages that are already there: a series starts from an evicted
+  GGUF, which `ab_bench.py` does when `--env` or `--bench-arg` asks for
+  uncached reads;
 - `ab_bench.py --kinds capped-mtp-code,capped-mtp-prose,capped-plain`: an
   8192-token context and 512 generated tokens, so the cache is past its
   warm-up. Decode is the headline metric.
@@ -261,8 +293,8 @@ second (Q4 at 54 GiB, change `195`):
   decode with the RAM free (MTP code 48.7 -> 40.0 t/s, plain 35.8 -> 28.8).
 
 So the read mode is chosen at launch: on a machine whose RAM other work
-holds, run with `DS4_METAL_STREAM_EXPERT_UNCACHED_READS=1`; with RAM to
-spare, the buffered default decodes 36-42% faster.
+holds, run with `--ssd-streaming-uncached`; with RAM to spare, the buffered
+default decodes 36-42% faster.
 
 ### Appends on a long context
 

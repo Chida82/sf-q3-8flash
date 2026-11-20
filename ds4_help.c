@@ -28,6 +28,14 @@ void ds4_help_print(FILE *fp, ds4_help_tool tool, const char *topic) {
     fprintf(fp, "  --dir-steering-attn F         Attention steering scale\n");
     fprintf(fp, "  --quality                     Prefer numerical quality over speed\n");
     fprintf(fp, "  --warm-weights                Touch model pages before inference\n");
+    fprintf(fp, "\nSSD streaming (routed experts read from the GGUF on demand):\n");
+    fprintf(fp, "  --ssd-streaming               Keep a bounded expert cache in RAM; read the rest from disk\n");
+    fprintf(fp, "  --ssd-streaming-cache-experts N|NGB\n");
+    fprintf(fp, "                                Cache size in experts, or a memory budget in GB\n");
+    fprintf(fp, "  --ssd-streaming-uncached      Read experts past the macOS file cache. Use it when other\n");
+    fprintf(fp, "                                work needs the rest of the RAM: memory use stays as planned\n");
+    fprintf(fp, "                                and other apps are not squeezed. With RAM to spare it is\n");
+    fprintf(fp, "                                slower (about 30%% of decode); the output is the same.\n");
     fprintf(fp, "\nSampling:\n");
     fprintf(fp, "  -n, --tokens N                Maximum generated tokens\n");
     fprintf(fp, "  --temp F --top-p F --min-p F  Sampling controls\n");

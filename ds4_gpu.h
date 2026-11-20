@@ -204,6 +204,7 @@ int ds4_gpu_pro_q4_expert_table_auto_available(void);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_ssd_streaming(bool enabled);
+void ds4_gpu_set_ssd_streaming_uncached(bool enabled);
 #ifdef __APPLE__
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);
 /* M6 shares the M5 dispatch defaults and existing M5 rollback switches. */

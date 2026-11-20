@@ -154,6 +154,7 @@ typedef struct {
     bool dspark_exact_sampling;
     bool ssd_streaming;
     bool ssd_streaming_cold;
+    bool ssd_streaming_uncached;
     bool ssd_streaming_full_layers_set;
     bool inspect_only;
     /* Multi-GPU placement uses this to price per-layer KV storage. */

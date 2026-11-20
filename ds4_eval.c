@@ -1208,6 +1208,7 @@ typedef struct {
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
+    bool ssd_streaming_uncached;
     bool ssd_streaming_full_layers_set;
     bool self_test_extractors;
     bool validate_cases;
@@ -1702,6 +1703,8 @@ static eval_config parse_options(int argc, char **argv) {
             c.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ssd-streaming-uncached")) {
+            c.ssd_streaming_uncached = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
             uint32_t experts = 0;
             uint64_t bytes = 0;
@@ -4765,6 +4768,7 @@ int main(int argc, char **argv) {
         .quality = cfg.quality,
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
+        .ssd_streaming_uncached = cfg.ssd_streaming_uncached,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
         .distributed = cfg.dist,
         .tp = cfg.tp,

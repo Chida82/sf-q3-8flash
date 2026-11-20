@@ -42,7 +42,8 @@ KINDS = {
     'mtp-copy': {'prompt': 'speed-bench/copy_edit.txt', 'frontiers': (2048,), 'gen': 128, 'mtp': True,
                  'on_request': True},
     # SSD streaming at a fixed footprint (change 190): long decodes past the cache's warm-up; the
-    # cache size and DS4_METAL_STREAM_EXPERT_UNCACHED_READS=1 come from --bench-arg and --env
+    # cache size and the uncached reads (--ssd-streaming-uncached, or for trees that predate it
+    # DS4_METAL_STREAM_EXPERT_UNCACHED_READS=1) come from --bench-arg and --env
     'capped-mtp-code': {'prompt': 'rax.c', 'frontiers': (8192,), 'gen': 512, 'mtp': True,
                         'on_request': True},
     'capped-mtp-prose': {'prompt': 'speed-bench/promessi_sposi.txt', 'frontiers': (8192,), 'gen': 512,
@@ -723,7 +724,8 @@ def main(argv=None):
         model = Path(os.path.abspath(args.model))
         if not model.is_file():
             raise Stop(2, f'{args.model}: model not found')
-        if env.get('DS4_METAL_STREAM_EXPERT_UNCACHED_READS') == '1':
+        if (env.get('DS4_METAL_STREAM_EXPERT_UNCACHED_READS') == '1'
+                or '--ssd-streaming-uncached' in args.bench_arg + args.b_bench_arg):
             evict_pages(model)
         trees = {'A': prepare_tree(args.a), 'B': prepare_tree(args.b)}
         now = datetime.now(timezone.utc)

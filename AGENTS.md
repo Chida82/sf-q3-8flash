@@ -129,6 +129,9 @@ python3 speed-bench/ab_bench.py --a <A tree> --b <B tree> -m /absolute/path/Q4.g
     --bench-arg=--ssd-streaming --bench-arg=--ssd-streaming-cache-experts --bench-arg=11831
 ```
 
+The variable is the bench form of `--ssd-streaming-uncached`: it works on
+trees that predate the option.
+
 The same runs with buffered reads and the GGUF's pages evicted (RAM free)
 are reported and decide nothing. `--simulate-used-memory` is not a
 development bench for streaming.
