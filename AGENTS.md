@@ -126,7 +126,7 @@ expert cache fixed at the 54 GiB footprint, uncached expert reads, and the
 python3 speed-bench/ab_bench.py --a <A tree> --b <B tree> -m /absolute/path/Q4.gguf \
     --kinds capped-mtp-code,capped-mtp-prose,capped-plain \
     --env DS4_METAL_STREAM_EXPERT_UNCACHED_READS=1 \
-    --bench-arg=--ssd-streaming --bench-arg=--ssd-streaming-cache-experts --bench-arg=10725
+    --bench-arg=--ssd-streaming --bench-arg=--ssd-streaming-cache-experts --bench-arg=11831
 ```
 
 The same runs with buffered reads and the GGUF's pages evicted (RAM free)

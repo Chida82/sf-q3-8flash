@@ -542,12 +542,11 @@ static ds4_context_memory qwen4_graph_memory_estimate(uint32_t ctx, uint32_t pre
     m.comp_cap = (uint32_t)blocks;
     m.raw_bytes = (uint64_t)n_attn * ctx * kv_row + (uint64_t)ctx * 16u;
     m.compressed_bytes = (uint64_t)n_attn * ((uint64_t)ctx * DS4_N_INDEXER_HEAD_DIM * 4u + blocks * DS4_N_INDEXER_HEAD_DIM * 2u);
-    const uint64_t old_row = 12u * hc_dim + 24u * E + (used + 1u) * (E + 2u * F) + 2u * blocks;
-    /* qwen4_graph_alloc: eight HC chunks; decode attention has 64 splits.
-     * Keep these constants available to the CPU-only memory estimator. */
+    /* qwen4_graph_alloc's rows: eight HC chunks; decode attention has 64
+     * splits. Keep these constants available to the CPU-only estimator. */
     const uint64_t gpu_row = 6u * hc_dim + 2u * DS4_N_HC_LOWRANK + 16u * hc * hc +
         5u * E + conv_dim + 2u * v_dim + 2u * DS4_N_LIN_V_HEAD + 5u * q_dim +
-        2u * kv_dim + 2u * iq_dim + DS4_N_INDEXER_HEAD_DIM + blocks + blocks / 8u +
+        2u * kv_dim + 2u * iq_dim + DS4_N_INDEXER_HEAD_DIM + blocks + blocks / 8u + 1u +
         5u * k_blocks + 7u + 2u * DS4_N_EXPERT + 2u * used + (used + 1u) * (F + E) + 3u * F;
     const uint64_t state = (uint64_t)n_linear *
         (v_dim * DS4_N_LIN_HEAD_DIM + (DS4_N_LIN_CONV - 1u) * conv_dim) +
@@ -560,11 +559,17 @@ static ds4_context_memory qwen4_graph_memory_estimate(uint32_t ctx, uint32_t pre
         (uint64_t)(mtp ? 12u : 4u) * DS4_N_VOCAB;
     if (mtp) fixed += 12u * (hc + 1u) * E + 4u * hc_dim + 1u +
         2u * (((uint64_t)DS4_N_VOCAB + 4095u) / 4096u);
-    /* Reserve optional half copies of x and the routed MoE intermediate.
-     * Units here are float words; the legacy conservative estimate already
-     * covers these copies for the supported Qwen shapes. */
+    /* Plus the half copies of x and the routed MoE intermediate that a large
+     * streamed chunk allocates on demand (float words). Nothing else: an
+     * older conservative row (2 * blocks words) planned 3.3 GiB at 262144
+     * tokens that no path allocates (205). */
     const uint64_t gpu_reserved_row = gpu_row + (E + used * F + 1u) / 2u;
-    m.scratch_bytes = (T * ((gpu_reserved_row > old_row ? gpu_reserved_row : old_row) + hc_dim + 4u) + fixed) * 4u;
+    /* The process holds more than these buffers once 8192-row chunks run
+     * (driver-owned and malloc'd pages): 0.21 GiB over the rest of this plan
+     * at 262144 tokens, 0.43 GiB with MTP's lazy snapshots allocated; plan
+     * 64 KiB per row, 0.5 GiB at 8192 rows (205). */
+    const uint64_t process_row = 16384u;
+    m.scratch_bytes = (T * (gpu_reserved_row + process_row + hc_dim + 4u) + fixed) * 4u;
     m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
     return m;
 }
@@ -34147,8 +34152,6 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             return 1;
         }
         s->qwen4_graph_ready = true;
-        s->qwen4_reserved_graph_bytes = memory.total_bytes;
-        e->qwen4_session_bytes += memory.total_bytes;
         if (!s->qwen4_graph.owns_scratch) e->qwen4_arena_users++;
         s->qwen4_reserved_graph_bytes = memory.total_bytes;
         e->qwen4_session_bytes += memory.total_bytes;

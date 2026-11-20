@@ -176,23 +176,29 @@ The same runs with buffered reads, the GGUF's pages evicted before each run,
 give the RAM-free figures. They are reported and decide nothing.
 
 Footprint is the engine's planned total at the service's configuration
-(`--ctx 262144 --mtp`, the 0.57 GiB vision projector added): 26.33 GiB before
+(`--ctx 262144 --mtp`, the 0.57 GiB vision projector added): 23.53 GiB before
 the cache on Q4, of which the KV and graph buffers of the 262144-token
-context are 20.01. The process holds about 3 GiB less than the plan, and
-the same at every context length: its footprint (`footprint -p`) is 43.8
-GiB at 2048 tokens and 44.0 GiB from 16K to 254K, plus the 6.3 GiB of locked
-static weights, which macOS counts as clean mapped file rather than
-footprint. The KV and graph buffers are touched in full when they are
-allocated, so a short context leaves nothing to lend the cache; about 3.8
-GiB of the 20.01 GiB graph reserve is never touched at all (change `196`).
-Until change `193` the plan also reserved 2.59 GiB of
-staging, and the table below was measured at those smaller caches.
+context are 17.22. The plan counts what the process holds: at 11,831 slots
+its footprint (`footprint -p`) peaks at 46.8 GiB through a 254K prefill and
+32 MTP tokens (46.4 GiB at 2K), plus the 6.3 GiB of locked static weights,
+which macOS counts as clean mapped file rather than footprint: 0.3 GiB under
+the plan. The KV and graph buffers are touched in full when they are
+allocated, so a short context leaves nothing to lend the cache. Until change
+`205` the graph reserve also planned 3.3 GiB that no path allocates (an
+older conservative row per prefill row, growing with the context) and none
+of the 0.2-0.4 GiB the process holds beyond its buffers once 8192-row
+chunks run; it now plans the graph's own rows plus 64 KiB of process memory
+per row, and the cache gets the rest (`196`, `205`): 1,106 more slots at
+every footprint, which at 54 GiB gave MTP code decode +9.3%, MTP prose
++4.3% and plain +6.3%, at 48 GiB +9.3% and at 60 GiB +5.9% on MTP code. Until change `193` the
+plan also reserved 2.59 GiB of staging. The table after this one was
+measured at the slots before `193`.
 
-| Footprint | Cache slots | Expert cache | Share of Q4's routed experts | Slots before `193` |
-|---|---|---|---|---|
-| 48 GiB | 8,350 | 21.1 GiB | 34% | 7,326 |
-| 54 GiB (development) | 10,725 | 27.1 GiB | 44% | 9,701 |
-| 60 GiB | 13,100 | 33.1 GiB | 53% | 12,076 |
+| Footprint | Cache slots | Expert cache | Share of Q4's routed experts | Slots before `205` | Slots before `193` |
+|---|---|---|---|---|---|
+| 48 GiB | 9,456 | 23.9 GiB | 38% | 8,350 | 7,326 |
+| 54 GiB (development) | 11,831 | 29.9 GiB | 48% | 10,725 | 9,701 |
+| 60 GiB | 14,206 | 35.9 GiB | 58% | 13,100 | 12,076 |
 
 Q4, at the slots before `193`, 3 runs per cell, medians (the runs of a cell agree within 1% with the
 RAM taken). Misses and miss layers (layer calls that miss at least one

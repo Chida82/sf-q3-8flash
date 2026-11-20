@@ -205,6 +205,45 @@ static void attention_query_planning(void) {
     check_attention_query_chunk(UINT32_MAX, 1u, UINT32_MAX);
 }
 
+/* 205: the plan's reserve per prefill row is what qwen4_graph_alloc allocates
+ * per row (its buffer list, tallied here independently), the half operands a
+ * large streamed chunk adds, and the CPU staging; the remainder is fixed. */
+static void graph_row_matches_alloc(void) {
+    const uint64_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc, F = DS4_N_FF_EXP, used = DS4_N_EXPERT_USED;
+    const uint64_t conv = DS4_N_LIN_CONV_DIM, v = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
+    const uint64_t q = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM, kv = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t iq = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM, kb = DS4_N_INDEXER_TOP_K / 4u;
+    const int ctxs[] = {2048, 8192, 262144};
+    const uint32_t chunks[] = {1, 64, 8192};
+    for (size_t c = 0; c < sizeof(ctxs) / sizeof(*ctxs); c++) {
+        const uint64_t blocks = (uint64_t)ctxs[c] / 4u + 1u;
+        uint64_t row = 0;
+        row += hc_dim + hc_dim;                            /* R, xn */
+        row += 2u * DS4_N_HC_LOWRANK;                      /* lo, hc_lo_act */
+        row += 2u * hc * 8u * hc;                          /* inj, inj_alt: DS4_QWEN4_HC_CHUNKS (8) */
+        row += E + E + E + E + E;                          /* mixed, blk, ple_emb, ple_val, sh_out */
+        row += conv + v + v + 2u * DS4_N_LIN_V_HEAD;       /* qkv, z, lin_o, ga, gb */
+        row += hc_dim + hc_dim + hc_dim + hc_dim;          /* ple_key, ple_gated, ple_normed, hc_u */
+        row += 2u * q + q + q + q + kv + kv;               /* qg, q, gate, attn_o, kp, vp */
+        row += iq + iq + DS4_N_INDEXER_HEAD_DIM;           /* iq, iqn, ik */
+        row += blocks + blocks / 8u + 1u;                  /* score, tile_max */
+        row += kb + kb * 4u + 4u + 1u;                     /* sel_blocks, sel_tokens, n_sel */
+        row += 2u * DS4_N_EXPERT + 2u * used;              /* router, moe_lists, selected, weights */
+        row += (used + 1u) * F + (used + 1u) * E + 1u;     /* mid, part, sh_gate_logit */
+        row += 3u * F + 1u;                                /* sh_gate, sh_up, sh_mid, mtp_next */
+        /* plus the half operands, 64 KiB of process memory and the CPU staging */
+        const uint64_t planned_row = row + (E + used * F + 1u) / 2u + 16384u + hc_dim + 4u;
+        uint64_t fixed = 0;
+        for (size_t k = 0; k < sizeof(chunks) / sizeof(*chunks); k++) {
+            const ds4_context_memory m = estimate(ctxs[c], chunks[k]);
+            const uint64_t rows = (uint64_t)m.prefill_cap * planned_row * 4u;
+            assert(m.scratch_bytes > rows);
+            if (k == 0) fixed = m.scratch_bytes - rows;
+            assert(m.scratch_bytes - rows == fixed);
+        }
+    }
+}
+
 int main(void) {
     const ds4_shape saved = g_ds4_shape;
     g_ds4_shape = DS4_SHAPE_QWEN4_EXP;
@@ -213,6 +252,7 @@ int main(void) {
     streaming_budget();
     streaming_staging();
     attention_query_planning();
+    graph_row_matches_alloc();
 
     /* Independent allocation lower bounds for the shipped 49-layer shape:
      * 36 GDN layers, 48 value heads, 128x128 state, three convolution rows;
