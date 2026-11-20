@@ -45,7 +45,7 @@ owner says the change is complete (design D13).
   *| Projected gain | +119% | +273% | +134% | +170% | +52% |*
 
   *Step 0 passes D1 by a wide margin on every prompt, also with `--verify-rows all` (chat Python +137%, C +176%, story +52%). The plain decode of the two engines is close (65.5 against 60.2 t/s), so the gap is the draft. Limits: different weights (ISTA's Q2_0 against this child's pack, whose hyper-connection and indexer tensors Splash does not load); Splash's plain figure is its start-up measurement, not a run; one Mac, 512 tokens. Section 2 waits for the owner's decision.)*
-- [ ] 1.6 Remove the install and the downloads as agreed in 1.1. *(Open at the archive, 2026-11-20: uninstalling Splash and deleting its downloads wait for the owner's word. To remove: `brew uninstall incoai/tap/splash`, `brew untap incoai/tap`, the Hugging Face cache folders `models--ISTA-DASLab--Qwen3.8-Flash-Next-GSQ-RCO-GGUF` (62 GiB) and `models--incoai--Qwen3.8-Flash-Next-DFlash2` (1.1 GiB), and `~/Library/Application Support/Splash`.)*
+- [x] 1.6 Remove the install and the downloads as agreed in 1.1. *(2026-11-20, on the owner's word after the archive: `brew uninstall incoai/tap/splash` (272 MB), `brew untap incoai/tap`, and deleted from the Hugging Face cache `models--ISTA-DASLab--Qwen3.8-Flash-Next-GSQ-RCO-GGUF` (62 GiB) and `models--incoai--Qwen3.8-Flash-Next-DFlash2` (1.1 GiB), each with its own blobs and none in the shared blob store, and `~/Library/Application Support/Splash`. Nothing of Splash is left on the machine.)*
 
 ## 2. Feasibility (design D4; no GPU; only if 1.5 passes)
 
