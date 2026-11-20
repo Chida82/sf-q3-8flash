@@ -167,7 +167,7 @@ model's. `sfctl/` stays generic: no user name or machine path in it
 The one service has three variants, and `start` needs one:
 `sfctl start q3-8flash-q4` (about 70 GiB resident), `sfctl start
 q3-8flash-q2` (about 42 GiB) or `sfctl start q3-8flash-q4s` (Q4 with SSD
-streaming at a fixed 11,831-slot expert cache, about 54 GiB planned, so other
+streaming at a 42 GiB expert cache, about 66 GiB planned, so other
 work keeps the rest of the Mac); `sfctl restart q3-8flash-q2` switches; other
 commands take `q3-8flash` or any variant name. `q4s` gets its streaming
 options from `SF_ARGS_q4s`, a per-variant setting the shared script applies
