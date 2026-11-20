@@ -941,6 +941,12 @@ static void check_pressure(const weights *w, int fd) {
     need(ds4_gpu_stream_expert_cache_configured_count() == size, "pressure: a warning never grows the cache");
 
     ds4_gpu_stream_expert_cache_test_pressure(1u, 0);   /* NORMAL, no quiet period */
+    /* The first regrowth step fails its slab: the cache keeps its size, and the
+     * next due step grows it again. */
+    ds4_gpu_stream_expert_cache_test_fail_slabs(1u);
+    pressure_exact(&hot, t, active_row, "pressure: the normal level is taken");
+    pressure_exact(&hot, t, active_row, "pressure: regrowth with a failed slab");
+    need(ds4_gpu_stream_expert_cache_configured_count() == size, "pressure: a failed slab does not grow the cache");
     uint32_t last = size, steps = 0;
     for (uint32_t i = 0; i < 2 * planned / per_slab && last < planned; i++) {
         lw.table.layer = 26 + i % 8;
@@ -956,7 +962,7 @@ static void check_pressure(const weights *w, int fd) {
     ds4_gpu_stream_expert_cache_test_pressure(1u, 30000);
     need(unsetenv("DS4_METAL_STREAMING_EXPERT_SLAB_MB") == 0, "pressure: default slabs");
     for (unsigned i = 0; i < 4; i++) ds4_gpu_tensor_free(t[i]);
-    printf("PASS Qwen SSD memory pressure: %u fill rows, warning %u, critical %u, regrowth to %u in %u steps, rows exact\n",
+    printf("PASS Qwen SSD memory pressure: %u fill rows, warning %u, critical %u, a failed slab waits, regrowth to %u in %u steps, rows exact\n",
            n_rows, warn, floor, planned, steps);
 }
 

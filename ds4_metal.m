@@ -987,6 +987,7 @@ static uint64_t g_stream_expert_cache_slab_slot_bytes;
  * bounds the configured budget below the plan while the cache is shrunk. */
 static dispatch_source_t g_stream_pressure_source;
 static unsigned g_stream_pressure_events;   /* written by the handler */
+static uint32_t g_stream_pressure_test_fail_slabs;   /* test seam */
 static unsigned g_stream_pressure_level;    /* DISPATCH_MEMORYPRESSURE_* of the last event */
 static unsigned g_stream_pressure_seen;
 static uint32_t g_stream_pressure_planned;
@@ -14380,7 +14381,9 @@ static void ds4_gpu_stream_pressure_regrow(void) {
     const uint64_t slot_bytes = g_stream_expert_cache_slab_slot_bytes;
     uint64_t after = g_stream_pressure_planned;
     if (slot_bytes != 0 && g_stream_expert_cache_slab_total_slots >= before) {
-        if (!ds4_gpu_stream_expert_slab_append(slot_bytes, g_stream_pressure_planned - before)) {
+        const int failed = g_stream_pressure_test_fail_slabs != 0;
+        if (failed) g_stream_pressure_test_fail_slabs--;
+        if (failed || !ds4_gpu_stream_expert_slab_append(slot_bytes, g_stream_pressure_planned - before)) {
             fprintf(stderr, "ds4: memory pressure: expert cache slab allocation failed; regrowth waits for the next quiet period\n");
             return;
         }
@@ -14472,6 +14475,10 @@ static void ds4_gpu_stream_pressure_open(uint32_t planned) {
 void ds4_gpu_stream_expert_cache_test_pressure(unsigned level, uint32_t quiet_ms) {
     g_stream_pressure_quiet_ms = (double)quiet_ms;
     ds4_gpu_stream_pressure_note(level);
+}
+
+void ds4_gpu_stream_expert_cache_test_fail_slabs(uint32_t n) {
+    g_stream_pressure_test_fail_slabs = n;
 }
 
 static int ds4_gpu_stream_expert_cache_is_protected(
