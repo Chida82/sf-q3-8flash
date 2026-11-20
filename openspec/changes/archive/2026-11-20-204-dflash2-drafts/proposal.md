@@ -44,17 +44,33 @@ measurement of Splash itself on this machine, before any engine work.
   (about 1.2 GB plus its 2,048-position window) must fit the plans. The
   design is rewritten with what is found, and the change is updated before
   any build.
-- **S1, only after that.** The draft as an additional speculative mode
-  beside built-in MTP, off by default. MTP stays: it costs no memory and
-  remains the mode for SSD streaming unless a measurement there says
-  otherwise.
+- **S1, in two stages on a branch.** Stage A ports upstream's long exact
+  verify (commit `7e6ab2f`: up to 16 rows, one recurrent snapshot slot per
+  row) and measures what a block of 1 to 8 rows costs. Stage B, only if that
+  projects at least +10% over MTP, adds the draft as a second speculative
+  mode, `--dflash2 FILE`, off by default and resident only. Its greedy
+  output stays byte-identical to plain: the verify is exact per row, as
+  MTP's is. A relaxed verify on the prefill kernels was measured and
+  dropped: it is no faster than the exact rows (design D7). MTP stays as it
+  is and remains the mode for SSD streaming.
+
+## Outcome
+
+Closed on 2026-11-20 after stage A's measurement, with no code landed.
+Splash's draft gives it 1.85 to 4.06 times its own plain decode on this Mac
+against 1.09 to 1.50 for MTP here, but its rows cost about 1.5 ms each on
+kernels this engine does not have. Here an exact verify row costs 3.7 ms
+(Q4, resident, blocks of 4), which projects the draft at +11% to +25% over
+MTP on chat code, +49% on a prose continuation and nothing on a story, in
+resident mode only. The figures are in `tasks.md` (1.3-1.5, 3.0, 3.6) and
+the decisions in `design.md` (D7, D14).
 
 ## Capabilities
 
 ### New Capabilities
 
-None at step 0. If S1 proceeds, `mtp-speculation` gains the draft mode in
-an update of this change.
+None before stage B. Stage B adds the draft mode to `mtp-speculation`
+(task 4.1).
 
 ### Modified Capabilities
 
@@ -64,13 +80,16 @@ None at step 0.
 
 - Step 0: scratch files only (`$SCR/c204/`), a temporary Splash install and
   a model download, both approved by the owner and removed afterwards.
-- If S1 proceeds: `ds4.c` (capture, draft forward, verify, rollback),
-  `ds4_metal.m` and `metal/qwen4.metal` (draft kernels), `ds4_cli.c`,
+- Stage A: `ds4.c`, `ds4_metal.m`, `ds4_gpu.h`, `metal/qwen4.metal`,
+  `tests/test_qwen4_verify_exact.c`, `tests/test_qwen4_kernels.c`.
+- Stage B: `ds4.c` (capture, draft forward, cycle), `ds4_metal.m` and
+  `metal/qwen4.metal` (two or three small kernels), `ds4_cli.c`,
   `ds4_server.c`, `ds4_bench.c` (option), `download.sh` (draft component),
-  tests, `docs/SPECULATIVE_DECODING.md`.
+  tests, `docs/SPECULATIVE_DECODING.md`. About 2 GiB more memory in draft
+  mode.
 - **Product contract.** `AGENTS.md` states "no external support model" and
-  the StarForge registry lists MTP alone for this child. S1 changes both;
-  the owner decides that before S1, not by landing it.
+  the StarForge registry lists MTP alone for this child. The owner accepted
+  an external draft for this mode (task 2.4); both change when S1 lands.
 - Upstream ds4 has no DFlash path: no parity reference for the draft mode
   itself (greedy output must still equal plain), and permanent code with no
   sync counterpart.
