@@ -311,11 +311,20 @@ once, with the GPU idle unless a gate/up pass already runs:
   A perfect prediction of the next layer's misses would hide 26-37% of an
   append, since a layer's GPU time (5 ms at 64 tokens, 36-38 ms at 4096)
   covers most of the next layer's reads (change `202`).
-- **At 64 tokens the reads are a quarter of the append** and two other
-  parts are as large: 67-85 ms more GPU time than resident (the streamed
-  expert kernels at a small row count) and about 80-90 ms of GPU idle that
-  no read explains (the per-layer stop: drain, ids, lists, encode). Change
-  `203` measures and attacks those two.
+- **At 64 tokens the reads are a quarter of the append.** The extra GPU
+  time was the expert pass: below 65 rows a streamed call ran the
+  per-token expert kernels, which read an expert once for every row that
+  chose it, while the resident path runs the grouped ones, which read it
+  once per four such rows (67-70 ms more GPU per 64-token append). Streamed
+  calls of 9 to 64 rows without a shared slot now take the grouped kernels
+  through the cache's address table, bit for bit the same rows (change
+  `203`): at 54 GiB a 64-token append takes 436 -> 364 ms on 8K and 493 ->
+  406 ms on 32K (-16.5%, -17.7%; 3 runs), at 48 GiB 11-13% less and at 60
+  GiB 18% less. Appends of 128 rows and more run the tiled path, which this
+  does not change; their single runs spread by up to 15% with one binary
+  (the GPU time of a read-bound chunk varies from run to run), so judge
+  them on many runs. The per-layer stop's CPU work besides the drain and
+  the reads is 0.13-0.15 ms per layer at 64 tokens and 0.33-0.39 ms at 256.
 
 ### The layer round trip
 

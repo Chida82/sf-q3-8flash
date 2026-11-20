@@ -960,6 +960,48 @@ static void check_pressure(const weights *w, int fd) {
            n_rows, warn, floor, planned, steps);
 }
 
+/* 203: a streamed batch of 9 to 64 rows without a shared slot takes the
+ * grouped kernels through the cache's address table (cached and staged), bit
+ * for bit the resident per-token rows; an expert repeated within a row keeps
+ * the per-token kernels. */
+static uint32_t grouped_calls;
+void ds4_test_qwen4_ssd_grouped(uint32_t n_tokens) { (void)n_tokens; grouped_calls++; }
+static void check_grouped(const weights *w, int fd) {
+    const uint32_t cases[][3] = {{17, 32, 0}, {64, 32, 0}, {17, BUDGET, 0}, {9, 32, 1}};  /* rows, slots, repeat */
+    const uint64_t expert_bytes = 2 * w->table.gate_expert_bytes + w->table.down_expert_bytes;
+    for (unsigned c = 0; c < sizeof(cases) / sizeof(*cases); c++) {
+        const uint32_t T = cases[c][0], repeat = cases[c][2];
+        const uint64_t nm = (uint64_t)T * S * F, np = (uint64_t)T * S * D;
+        int32_t *ids = malloc((size_t)T * S * sizeof(*ids));
+        float *x = malloc((size_t)T * D * sizeof(*x)), *zero = calloc(nm > np ? nm : np, sizeof(float));
+        float *out[2][2] = {{malloc(nm * 4), malloc(np * 4)}, {malloc(nm * 4), malloc(np * 4)}};
+        need(ids && x && zero && out[0][0] && out[0][1] && out[1][0] && out[1][1], "grouped host buffers");
+        for (uint32_t t = 0; t < T; t++)
+            for (uint32_t s = 0; s < S; s++) ids[t * S + s] = repeat ? active[0] : active[(t + s) % 24];
+        for (uint32_t i = 0; i < T * D; i++) x[i] = ((int)(random_u32() % 257) - 128) / 1024.f;
+        ds4_gpu_tensor *t[] = {upload(NULL, nm * 4), upload(NULL, np * 4), upload(x, (uint64_t)T * D * 4),
+                               upload(ids, (uint64_t)T * S * 4)};
+        ds4_gpu_set_streaming_expert_cache_budget(cases[c][1]);
+        ds4_gpu_set_streaming_expert_cache_expert_bytes(expert_bytes);
+        need(ds4_gpu_set_model_fd(fd), "grouped source fd");
+        for (int streamed = 0; streamed < 2; streamed++) {
+            const uint32_t before = grouped_calls;
+            need(ds4_gpu_tensor_write(t[0], 0, zero, nm * 4) && ds4_gpu_tensor_write(t[1], 0, zero, np * 4) &&
+                 ds4_gpu_begin_commands() && project_rows(w, T, S, 0, streamed, t[0], t[1], t[2], t[3]) &&
+                 ds4_gpu_end_commands(), "grouped rows");
+            need(grouped_calls - before == (uint32_t)(streamed && !repeat), "grouped kernels chosen exactly when expected");
+            need(ds4_gpu_tensor_read(t[0], 0, out[streamed][0], nm * 4) &&
+                 ds4_gpu_tensor_read(t[1], 0, out[streamed][1], np * 4), "grouped outputs");
+        }
+        need(memcmp(out[0][0], out[1][0], nm * 4) == 0 && memcmp(out[0][1], out[1][1], np * 4) == 0,
+             "grouped streamed rows equal resident per-token rows");
+        for (unsigned i = 0; i < 4; i++) ds4_gpu_tensor_free(t[i]);
+        for (unsigned i = 0; i < 4; i++) free(out[i / 2][i % 2]);
+        free(ids); free(x); free(zero);
+    }
+    puts("PASS Qwen SSD grouped rows (203): T9-64 without a shared slot exact, cached and staged; repeats keep per-token rows");
+}
+
 static char fixture_path[1024];
 static void remove_fixture(void) { unlink(fixture_path); }
 
@@ -1033,6 +1075,7 @@ int main(void) {
             check_case(w, T, 3, fileno(file), fileno(empty), 0, 0);
         }
     }
+    check_grouped(formats + 1, fileno(file));
     if (uncached_reads) {
         /* The rest injects failures through the probe, which cannot see the
          * uncached descriptor. */

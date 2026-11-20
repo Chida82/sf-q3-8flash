@@ -38314,11 +38314,13 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
         const bool q4_mid = kernel == QWEN4_K_MOE_MID_Q4K || kernel == QWEN4_K_MOE_MID_Q4K_NR1;
         const bool iq2_mid = kernel == QWEN4_K_MOE_MID_IQ2 || kernel == QWEN4_K_MOE_MID_IQ2_NR1;
         const bool q2_down = kernel == QWEN4_K_MOE_DOWN_Q2K;
+        /* The grouped kernels read an expert through qwen4_expert_base too. */
+        const bool grouped = kernel == QWEN4_K_MOE_MID_Q4K_GROUPED || kernel == QWEN4_K_MOE_DOWN_MXFP4_GROUPED;
         id<MTLComputePipelineState> pipeline = nil;
         if (kernel == QWEN4_K_MOE_MID || kernel == QWEN4_K_MOE_DOWN || kernel == QWEN4_K_MOE_DOWN_MXFP4_PF ||
-            kernel == QWEN4_K_MOE_MID_IQ2XXS || kernel == QWEN4_K_MOE_DOWN_REDUCE || q4_mid || iq2_mid || q2_down) {
+            kernel == QWEN4_K_MOE_MID_IQ2XXS || kernel == QWEN4_K_MOE_DOWN_REDUCE || q4_mid || iq2_mid || q2_down || grouped) {
             const qwen4_moe_args *a = args;
-            const bool specialize = !q4_mid && !iq2_mid && !q2_down && qwen4_moe_mv_specialize(a->weight_type);
+            const bool specialize = !q4_mid && !iq2_mid && !q2_down && !grouped && qwen4_moe_mv_specialize(a->weight_type);
             const uint32_t values[] = {a->weight_type, a->shared_type, specialize ? a->in_dim : 0u, specialize ? qwen4_moe_mv_rows(a->weight_type, a->n_tokens) : 0u};
             /* Legacy (and M5) batched MXFP4 shares loads across two rows.
              * Compile it out of single-token decode to retain its occupancy. */
@@ -39781,8 +39783,8 @@ int ds4_gpu_qwen4_moe_mid_grouped_tensor(
                             0u, 0u, 0u, n_total_expert, {0}, 0u, list_cap, 0u };
     qwen4_bind b[7];
     if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || ff_dim == 0 || list_cap == 0 ||
-        !qwen4_bind_weight(&b[0], model_map, model_size, gate_offset, expert_bytes * n_total_expert, "moe gate experts") ||
-        !qwen4_bind_weight(&b[1], model_map, model_size, up_offset, expert_bytes * n_total_expert, "moe up experts") ||
+        !qwen4_bind_experts(&b[0], model_map, model_size, gate_offset, expert_bytes * n_total_expert, "moe gate experts") ||
+        !qwen4_bind_experts(&b[1], model_map, model_size, up_offset, expert_bytes * n_total_expert, "moe up experts") ||
         !qwen4_bind_tensor(&b[2], selected, (uint64_t)n_tokens * n_slots * sizeof(int32_t), "moe selected") ||
         !qwen4_bind_tensor(&b[3], x, (uint64_t)n_tokens * in_dim * sizeof(float), "moe input") ||
         !qwen4_bind_tensor(&b[4], mid, (uint64_t)n_tokens * n_slots * ff_dim * sizeof(float), "moe mid") ||
@@ -39810,7 +39812,7 @@ int ds4_gpu_qwen4_moe_down_grouped_tensor(
                             0u, 0u, 0u, n_total_expert, {0}, 0u, list_cap, 0u };
     qwen4_bind b[6];
     if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || out_dim == 0 || list_cap == 0 ||
-        !qwen4_bind_weight(&b[0], model_map, model_size, down_offset, expert_bytes * n_total_expert, "moe down experts") ||
+        !qwen4_bind_experts(&b[0], model_map, model_size, down_offset, expert_bytes * n_total_expert, "moe down experts") ||
         !qwen4_bind_tensor(&b[1], selected, (uint64_t)n_tokens * n_slots * sizeof(int32_t), "moe selected") ||
         !qwen4_bind_tensor(&b[2], mid, (uint64_t)n_tokens * n_slots * ff_dim * sizeof(float), "moe mid") ||
         !qwen4_bind_tensor(&b[3], part, (uint64_t)n_tokens * n_slots * out_dim * sizeof(float), "moe partial") ||
@@ -40698,6 +40700,7 @@ int ds4_gpu_qwen4_moe_stream_tensor(
             shared_up_offset, shared_down_offset, shared_type, shared_down_type)) return handshake_ok;
     int32_t *ids = malloc((size_t)n_ids * sizeof(*ids));
     if (!ids) return 0;
+    ds4_gpu_tensor *group_lists = NULL, *group_counts = NULL;
     qwen4_moe_half_pass half_pass = {0};
     /* Half shadows avoid repeated activation conversion in large IQ2/Q2
      * and Q4/MXFP4 SSD chunks. Smaller chunks retain float operands without
@@ -40834,6 +40837,24 @@ int ds4_gpu_qwen4_moe_stream_tensor(
         }
     }
     stream.frequency = frequency;
+    /* A batch of 9 to 64 rows (no shared slot) reads each expert once per
+     * four rows that chose it, as the resident path does (203); the lists
+     * hold every pair when no expert repeats within a row. */
+    bool grouped = !mm && !shared && n_tokens > 8u && gate_type == 12u && down_type == 39u &&
+        getenv("DS4_QWEN4_MOE_NO_GROUP") == NULL;
+    for (uint32_t e = 0; grouped && e < table->n_total_expert; e++) grouped = frequency[e] <= n_tokens;
+    if (grouped) {
+        group_lists = ds4_gpu_tensor_alloc((uint64_t)table->n_total_expert * n_tokens * sizeof(int32_t));
+        group_counts = ds4_gpu_tensor_alloc((uint64_t)table->n_total_expert * sizeof(int32_t));
+        ok = group_lists && group_counts && ds4_gpu_qwen4_moe_build_lists_tensor(group_lists, group_counts,
+                selected, n_tokens, n_slots, table->n_total_expert, n_tokens);
+        if (!ok) goto done;
+        [g_transient_buffers addObject:ds4_gpu_tensor_buffer(group_lists)];
+        [g_transient_buffers addObject:ds4_gpu_tensor_buffer(group_counts)];
+#ifdef DS4_TEST_QWEN4_SSD_GROUPED
+        DS4_TEST_QWEN4_SSD_GROUPED(n_tokens);
+#endif
+    }
     g_qwen4_stream_weights = &stream;
     if (mm) {
         if (overlap.split || overlap.missing_mid_submitted) {
@@ -40848,6 +40869,13 @@ int ds4_gpu_qwen4_moe_stream_tensor(
              ds4_gpu_qwen4_moe_mm_down_tensor(part, mid, lists, counts, table->model_map, table->model_size,
                 table->down_offset, down_type, table->n_total_expert,
                 n_tokens, n_slots, n_slots, ff_dim, in_dim, list_cap);
+    } else if (grouped) {
+        ok = ds4_gpu_qwen4_moe_mid_grouped_tensor(mid, x, selected, group_lists, group_counts, n_tokens,
+                table->model_map, table->model_size, table->gate_offset, table->up_offset, gate_type,
+                table->n_total_expert, n_tokens, n_slots, in_dim, ff_dim) &&
+             ds4_gpu_qwen4_moe_down_grouped_tensor(part, mid, selected, group_lists, group_counts, n_tokens,
+                table->model_map, table->model_size, table->down_offset, down_type,
+                table->n_total_expert, n_tokens, n_slots, ff_dim, in_dim);
     } else {
         ok = ds4_gpu_qwen4_moe_mid_tensor(mid, x, selected, table->model_map, table->model_size,
                 table->gate_offset, table->up_offset, gate_type, table->n_total_expert,
@@ -40864,6 +40892,8 @@ done:
         (void)ds4_gpu_synchronize();
     ds4_gpu_tensor_free(overlap.resident_counts);
     ds4_gpu_tensor_free(overlap.missing_counts);
+    ds4_gpu_tensor_free(group_lists);
+    ds4_gpu_tensor_free(group_counts);
     free(ids);
     ok = qwen4_stream_early_commit(ok, had_batch, n_tokens);
     if (!had_batch && g_batch_cb && !ds4_gpu_end_commands()) ok = 0;

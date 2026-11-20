@@ -11,3 +11,5 @@ void ds4_test_qwen4_ssd_mm(uint32_t n_tokens, uint32_t weight_type,
 #define DS4_TEST_QWEN4_SSD_MM ds4_test_qwen4_ssd_mm
 void ds4_test_qwen4_handshake(int ok);
 #define DS4_TEST_QWEN4_HANDSHAKE ds4_test_qwen4_handshake
+void ds4_test_qwen4_ssd_grouped(uint32_t n_tokens);
+#define DS4_TEST_QWEN4_SSD_GROUPED ds4_test_qwen4_ssd_grouped

@@ -3418,7 +3418,8 @@ kernel void kernel_qwen4_moe_mid_q4k_grouped(
     device const int32_t *list = lists + (uint64_t)(uint)expert * args.list_cap;
     const uint count = min((uint)counts[expert], args.list_cap);
     if (count == 0 || (uint)list[0] != pair) return;
-    const uint64_t ebase = (uint64_t)(uint)expert * args.expert_bytes;
+    device const char *gate_e = qwen4_expert_base(gate_base, (uint)expert, args.expert_bytes);
+    device const char *up_e = qwen4_expert_base(up_base, (uint)expert, args.expert_bytes);
     const uint nb = args.in_dim / 256;
     const uint group = tiisg / 4, l = (tiisg % 4) * 8;
     const uint shift = (group & 1u) * 4u;
@@ -3428,10 +3429,10 @@ kernel void kernel_qwen4_moe_mid_q4k_grouped(
     for (uint j0 = 0; j0 < count; j0 += 4u) {
         const uint nj = min(4u, count - j0);
         switch (nj) {
-        case 1u: qwen4_moe_mid_q4k_pass<NR, 1>(args, gate_base, up_base, x, mid, list + j0, ebase, row0, nb, group, l, shift, tiisg); break;
-        case 2u: qwen4_moe_mid_q4k_pass<NR, 2>(args, gate_base, up_base, x, mid, list + j0, ebase, row0, nb, group, l, shift, tiisg); break;
-        case 3u: qwen4_moe_mid_q4k_pass<NR, 3>(args, gate_base, up_base, x, mid, list + j0, ebase, row0, nb, group, l, shift, tiisg); break;
-        default: qwen4_moe_mid_q4k_pass<NR, 4>(args, gate_base, up_base, x, mid, list + j0, ebase, row0, nb, group, l, shift, tiisg); break;
+        case 1u: qwen4_moe_mid_q4k_pass<NR, 1>(args, gate_e, up_e, x, mid, list + j0, 0, row0, nb, group, l, shift, tiisg); break;
+        case 2u: qwen4_moe_mid_q4k_pass<NR, 2>(args, gate_e, up_e, x, mid, list + j0, 0, row0, nb, group, l, shift, tiisg); break;
+        case 3u: qwen4_moe_mid_q4k_pass<NR, 3>(args, gate_e, up_e, x, mid, list + j0, 0, row0, nb, group, l, shift, tiisg); break;
+        default: qwen4_moe_mid_q4k_pass<NR, 4>(args, gate_e, up_e, x, mid, list + j0, 0, row0, nb, group, l, shift, tiisg); break;
         }
     }
 }
@@ -3947,7 +3948,7 @@ kernel void kernel_qwen4_moe_down_mxfp4_grouped(
     device const int32_t *list = lists + (uint64_t)(uint)expert * args.list_cap;
     const uint count = min((uint)counts[expert], args.list_cap);
     if (count == 0 || (uint)list[0] != pair) return;
-    const uint64_t ebase = (uint64_t)(uint)expert * args.expert_bytes;
+    device const char *down_e = qwen4_expert_base(down_base, (uint)expert, args.expert_bytes);
     const uint ix = tiisg / 8, it = tiisg % 8;
     const uint nb = args.in_dim / 32;
     /* Up to four pairs per pass, the count a template constant (see the mid
@@ -3955,10 +3956,10 @@ kernel void kernel_qwen4_moe_down_mxfp4_grouped(
     for (uint j0 = 0; j0 < count; j0 += 4u) {
         const uint nj = min(4u, count - j0);
         switch (nj) {
-        case 1u: qwen4_moe_down_mxfp4_pass<1>(args, down_base, mid, part, list + j0, ebase, row0, nb, ix, it, tiisg); break;
-        case 2u: qwen4_moe_down_mxfp4_pass<2>(args, down_base, mid, part, list + j0, ebase, row0, nb, ix, it, tiisg); break;
-        case 3u: qwen4_moe_down_mxfp4_pass<3>(args, down_base, mid, part, list + j0, ebase, row0, nb, ix, it, tiisg); break;
-        default: qwen4_moe_down_mxfp4_pass<4>(args, down_base, mid, part, list + j0, ebase, row0, nb, ix, it, tiisg); break;
+        case 1u: qwen4_moe_down_mxfp4_pass<1>(args, down_e, mid, part, list + j0, 0, row0, nb, ix, it, tiisg); break;
+        case 2u: qwen4_moe_down_mxfp4_pass<2>(args, down_e, mid, part, list + j0, 0, row0, nb, ix, it, tiisg); break;
+        case 3u: qwen4_moe_down_mxfp4_pass<3>(args, down_e, mid, part, list + j0, 0, row0, nb, ix, it, tiisg); break;
+        default: qwen4_moe_down_mxfp4_pass<4>(args, down_e, mid, part, list + j0, 0, row0, nb, ix, it, tiisg); break;
         }
     }
 }
