@@ -123,6 +123,10 @@ sfctl stop <model>              # any command but start takes either name
   written before variants ran.
 - The agent passes `-m <path>` from `SF_MODEL_<variant>`, so a variant never
   depends on a default model link that `./download.sh` may re-point.
+- An optional `SF_ARGS_<variant>` adds options for that variant alone, after
+  `SF_ARGS` and with the same rules (`@HOME@`, `@VARIANT@`, no `<`, `>`, `&`).
+  Two variants can then share weights and differ in how they run them. A
+  config that sets none writes the same agent as before.
 - `@VARIANT@` in `SF_ARGS` becomes the variant's name, for example
   `--kv-disk-dir @HOME@/kv-@VARIANT@`: weights of different quantization need
   separate disk KV caches. sfctl never moves or deletes an older cache dir.
@@ -198,7 +202,8 @@ A child adds its own service in its own change:
    block at the top describing the service. For several weights add
    `SF_VARIANTS` (names of letters, digits and `_`) and one
    `SF_MODEL_<variant>=component:path` each, passed as `-m` before `SF_ARGS`;
-   `@VARIANT@` in `SF_ARGS` becomes the variant's name. A config without
+   `@VARIANT@` in `SF_ARGS` becomes the variant's name; an optional
+   `SF_ARGS_<variant>` adds options for that variant alone. A config without
    `SF_VARIANTS` writes the same agent as before variants existed;
 3. add `sh tests/test_sfctl.sh` to `make test`; it reads the model, server and
    port from the config.

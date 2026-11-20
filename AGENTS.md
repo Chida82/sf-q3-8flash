@@ -18,7 +18,7 @@ relevant document under `docs/` before changing a subsystem.
 | Binaries | `sf-q3-8flash`, `sf-q3-8flash-server`, `sf-q3-8flash-bench`, `sf-q3-8flash-eval` |
 | Default model | `qwen3.8-flash-next.gguf` |
 | Server port | `8004` |
-| Service | `sfctl`, port `8912`, serve worktree `~/.sf/q3-8flash/serve` at local `main`; variants `q3-8flash-q4` and `q3-8flash-q2` (see "Serving (sfctl)") |
+| Service | `sfctl`, port `8912`, serve worktree `~/.sf/q3-8flash/serve` at local `main`; variants `q3-8flash-q4`, `q3-8flash-q2` and `q3-8flash-q4s` (see "Serving (sfctl)") |
 | Home / lock | `~/.sf/q3-8flash`; `/tmp/sf-q3-8flash.lock` |
 | Vision | Qwen3-VL projector supported |
 | Speculation | Built-in Qwen MTP (`--mtp`); no external support model or DSpark |
@@ -164,13 +164,17 @@ files in every child that has them; only `sfctl/sf-q3-8flash.conf` is this
 model's. `sfctl/` stays generic: no user name or machine path in it
 (`tests/test_sfctl.sh` checks).
 
-The one service has two variants, and `start` needs one:
-`sfctl start q3-8flash-q4` (about 70 GiB resident) or `sfctl start
-q3-8flash-q2` (about 42 GiB); `sfctl restart q3-8flash-q2` switches; other
-commands take `q3-8flash` or either variant name. Each variant passes its own
+The one service has three variants, and `start` needs one:
+`sfctl start q3-8flash-q4` (about 70 GiB resident), `sfctl start
+q3-8flash-q2` (about 42 GiB) or `sfctl start q3-8flash-q4s` (Q4 with SSD
+streaming at a fixed 11,831-slot expert cache, about 54 GiB planned, so other
+work keeps the rest of the Mac); `sfctl restart q3-8flash-q2` switches; other
+commands take `q3-8flash` or any variant name. `q4s` gets its streaming
+options from `SF_ARGS_q4s`, a per-variant setting the shared script applies
+only where a config sets it: other children do not stream. Each variant passes its own
 fixed link `gguf/Qwen3.8-Flash-Next-Q4.gguf` or `-Q2.gguf` with `-m`, never the
 default link `qwen3.8-flash-next.gguf`, and has its own disk KV cache,
-`~/.sf/q3-8flash/kv-q4` or `kv-q2`; the pre-variant `~/.sf/q3-8flash/kv` is no
+`~/.sf/q3-8flash/kv-q4`, `kv-q2` or `kv-q4s`; the pre-variant `~/.sf/q3-8flash/kv` is no
 longer used. `install` and `update` link both models; `start` links nothing.
 
 ## Child and upstream discipline

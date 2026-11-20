@@ -107,6 +107,8 @@ is_variant() {
     return 1
 }
 variant_model() { eval "echo \"\${SF_MODEL_$1:-}\""; }
+# A variant's own arguments, appended to SF_ARGS; empty when the config sets none.
+variant_args() { [ -n "${1:-}" ] || return 0; eval "echo \"\${SF_ARGS_$1:-}\""; }
 variant_names() {
     n=
     for x in $SF_VARIANTS; do n="$n $1-$x"; done
@@ -133,7 +135,7 @@ load_conf() {
     conf="$2/sfctl/sf-$1.conf"
     [ -f "$conf" ] || die "no config for $1: $conf"
     # cv, not v: callers keep their variant in v across this call.
-    for cv in $SF_VARIANTS; do unset "SF_MODEL_$cv"; done
+    for cv in $SF_VARIANTS; do unset "SF_MODEL_$cv" "SF_ARGS_$cv"; done
     SF_PORT= SF_SERVER= SF_COMPONENTS= SF_ARGS= SF_VARIANTS=
     . "$conf"
     [ -n "$SF_PORT" ] && [ -n "$SF_SERVER" ] && [ -n "$SF_ARGS" ] ||
@@ -151,6 +153,9 @@ load_conf() {
         case $cs in
             ?*:?*) ;;
             *) die "$conf: SF_MODEL_$cv must be component:path, without spaces, <, > or &" ;;
+        esac
+        case $(variant_args "$cv") in
+            *[\<\>\&]*) die "$conf: SF_ARGS_$cv must not contain <, > or &" ;;
         esac
     done
 }
@@ -204,7 +209,7 @@ EOF
         echo "    <string>-m</string>"
         echo "    <string>${spec#*:}</string>"
     fi
-    for a in $SF_ARGS; do
+    for a in $SF_ARGS $(variant_args "$v"); do
         case $a in
             *@VARIANT@*) a="${a%%@VARIANT@*}$v${a#*@VARIANT@}" ;;
         esac
@@ -288,7 +293,7 @@ exclusion_check() {
 }
 
 boost_check() {
-    case " $SF_ARGS " in
+    case " $SF_ARGS $(variant_args "${2:-}") " in
         *" --boost"*)
             "$FANBOOST" check || die "$1 asks for boost, and fanboost check failed: install or restart it with ./fanboost/install.sh (see fanboost/README.md)"
             ;;
@@ -310,7 +315,7 @@ cmd_start() {
     fi
     model_check "$1" "$2"
     exclusion_check "$1"
-    boost_check "$1"
+    boost_check "$1" "$2"
     if [ -n "$2" ]; then
         # The agent carries the variant's arguments: reload it with this one.
         ! loaded "$1" || launchctl bootout "$(target "$1")"

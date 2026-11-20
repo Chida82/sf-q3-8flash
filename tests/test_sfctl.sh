@@ -95,6 +95,7 @@ SF_VARIANTS="q4 q2"
 SF_MODEL_q4=q4:gguf/T-Q4.gguf
 SF_MODEL_q2=q2:gguf/T-Q2.gguf
 SF_ARGS='--ctx 4096 --kv-disk-dir @HOME@/kv-@VARIANT@ --kv-disk-space-mb 1024'
+SF_ARGS_q2='--tokens 128 --kv-note @HOME@/n-@VARIANT@'
 EOF
 cat >"$tmp/bin/launchctl" <<'EOF'
 #!/bin/sh
@@ -165,6 +166,22 @@ for v in q4 q2; do
     check "t2-flash-$v plist is a valid property list" fx_lints "t2-flash-$v"
 done
 check "plist <model> is the first variant's" fx_has t2-flash "<string>$H/.sf/t2-flash/kv-q4</string>"
+variant_args_after() {
+    out=$(fx plist t2-flash-q2) &&
+        printf '%s\n' "$out" | grep -A1 -F '<string>1024</string>' | grep -qF '<string>--tokens</string>' &&
+        printf '%s\n' "$out" | grep -qF "<string>$H/.sf/t2-flash/n-q2</string>"
+}
+check "SF_ARGS_<variant> follows SF_ARGS, with @HOME@ and @VARIANT@" variant_args_after
+no_variant_args() { ! fx plist t2-flash-q4 | grep -qF -- '--tokens'; }
+check "SF_ARGS_<variant> reaches only its variant" no_variant_args
+bad_variant_args() {
+    c="$H/.sf/t2-flash/serve/sfctl/sf-t2-flash.conf"
+    cp "$c" "$tmp/t2.conf" && printf "SF_ARGS_q4='--x a<b'\n" >>"$c"
+    out=$(fx plist t2-flash-q4 2>&1); rc=$?
+    cp "$tmp/t2.conf" "$c"
+    [ $rc -eq 1 ] && printf '%s\n' "$out" | grep -qF "SF_ARGS_q4 must not contain <, > or &"
+}
+check "SF_ARGS_<variant> with a forbidden character refused" bad_variant_args
 
 # start, through the stubs: the fixture is "installed" by its agent file.
 mkdir -p "$H/Library/LaunchAgents"
